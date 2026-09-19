@@ -133,18 +133,6 @@ local SUIPresets = {}
 
 local BUILTIN_PRESETS = {
     {
-        id = "builtin_at_a_glance",
-        name = _("At a Glance"),
-        desc = _("Currently Reading") .. ", " .. _("Recent Books"),
-        layout = { pages = { { id = 1, modules = { "currently", "recent" } } } },
-        settings = {
-            -- Both "currently" and "recent" are deliberately left unconfigured
-            -- here — they render with whatever sui_config.lua's
-            -- applyFirstRunDefaults() (or the user's own customization, if
-            -- any) currently defines.
-        }
-    },
-    {
         id   = "builtin_reading_nook",
         name = _("Reading Nook"),
         desc = _("Clock") .. ", " .. _("Cover Deck") .. ", " .. _("Reading Stats") .. ", " .. _("Quote of the Day"),
@@ -172,6 +160,18 @@ local BUILTIN_PRESETS = {
 
             -- Quote
             simpleui_hs_simpleui_quote_source = "mixed",
+        }
+    },
+    {
+        id = "builtin_at_a_glance",
+        name = _("At a Glance"),
+        desc = _("Currently Reading") .. ", " .. _("Recent Books"),
+        layout = { pages = { { id = 1, modules = { "currently", "recent" } } } },
+        settings = {
+            -- Both "currently" and "recent" are deliberately left unconfigured
+            -- here — they render with whatever sui_config.lua's
+            -- applyFirstRunDefaults() (or the user's own customization, if
+            -- any) currently defines.
         }
     },
     {
