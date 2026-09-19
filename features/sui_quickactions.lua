@@ -418,10 +418,24 @@ end
 
 -- showBookmarkBrowserSourceDialog: source-picker for the bookmark browser.
 -- Uses _Bottombar().setTempTabActive to manage the bar indicator.
+-- On KOReader builds without ui/widget/bookmarkbrowser (pre ~2026.03), fall
+-- back to the current book's native bookmark list when the reader is open;
+-- otherwise toast that an update is required.
 local function _showBookmarkBrowserSourceDialog(bb_ui)
     local ok_bb, BookmarkBrowser = pcall(require, "ui/widget/bookmarkbrowser")
-    if not ok_bb then
-        _unavailToast(_("Bookmark browser not available."))
+    if not ok_bb or not BookmarkBrowser then
+        local reader = bb_ui
+        if not (reader and reader.bookmark and reader.bookmark.onShowBookmark) then
+            local ok_rui, ReaderUI = pcall(require, "apps/reader/readerui")
+            if ok_rui and ReaderUI and ReaderUI.instance then
+                reader = ReaderUI.instance
+            end
+        end
+        if reader and reader.bookmark and reader.bookmark.onShowBookmark then
+            reader.bookmark:onShowBookmark()
+            return
+        end
+        _unavailToast(_("Bookmark browser requires a newer KOReader. Please update."))
         return
     end
     local FM         = package.loaded["apps/filemanager/filemanager"]

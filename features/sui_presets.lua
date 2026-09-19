@@ -688,6 +688,7 @@ function SUIPresets.makeMenuItems(opts)
     local unlock_overlay = opts.unlock_overlay or function() end
 
     local UIManager   = require("ui/uimanager")
+    local UI          = require("infra/sui_core")
     local function ConfirmBox()   return require("ui/widget/confirmbox")   end
     local function InputDialog()  return require("ui/widget/inputdialog")  end
     local T = require("ffi/util").template

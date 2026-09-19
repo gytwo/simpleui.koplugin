@@ -181,14 +181,31 @@ local function _showHSCold(plugin_ref, HS_ref, prev_action)
 end
 
 -- Close all non-fullscreen widgets on the stack except the FM.
--- Used before restoring the homescreen so orphaned toasts/toasters are gone.
+-- True only for auto-dismissing notices (InfoMessage toasts, loading flashes).
+-- A real dialog may carry a timeout for auto-close *and* still be interactive
+-- (buttons, input). Require a positive timeout and no interactive chrome so
+-- Tools → plugin screens (achievements, Frotz, ConfirmBox, …) are never swept
+-- by the homescreen-restore path.
+local function _isTransientToast(w)
+    if not w then return false end
+    local t = w.timeout
+    if type(t) ~= "number" or t <= 0 then return false end
+    -- Interactive surfaces: button rows, movable input, or an explicit buttons table.
+    if w.buttons or w.button_table or w.movable then return false end
+    if w.textinput or w.input or w.input_dialog then return false end
+    return true
+end
+
+-- Used before restoring the homescreen so orphaned toasts are gone.
+-- Only auto-dismissing notices are swept; real dialogs stay on the stack.
 local function _closeOrphanedPopups(fm_ref, hs_inst)
     local stack    = UI.getWindowStack()
     local to_close = {}
     for _, entry in ipairs(stack) do
         local w = entry.widget
         if w and w ~= fm_ref and not w.covers_fullscreen
-                and not (hs_inst and w == hs_inst) then
+                and not (hs_inst and w == hs_inst)
+                and _isTransientToast(w) then
             to_close[#to_close + 1] = w
         end
     end
@@ -2398,19 +2415,27 @@ function M.patchUIManagerClose(plugin)
         -- call and this execution (e.g. coll_list opened by onReturn).
         local fm_mod   = package.loaded["apps/filemanager/filemanager"]
         local live_fm2 = fm_mod and fm_mod.instance
+        local current_fm = live_fm2 or fm
         for _, entry in ipairs(UI.getWindowStack()) do
             local w = entry.widget
-            if w and w ~= (live_fm2 or fm) and w.covers_fullscreen then return end
+            if w and w ~= current_fm then
+                if w.covers_fullscreen then return end
+                -- Non-fullscreen dialog still open (plugin achievement detail,
+                -- Frotz resume UI, ConfirmBox, …). The Tools/TouchMenu close
+                -- path schedules this callback after the dialog is already on
+                -- the stack — reopening the homescreen would cover or, with
+                -- the old orphan sweep, destroy that dialog.
+                if not _isTransientToast(w) then return end
+            end
         end
 
         -- Skip if an external caller navigated the FM to a folder.
-        local current_fm = live_fm2 or fm
         if current_fm and current_fm._sui_show_folder_pending then
             current_fm._sui_show_folder_pending = nil
             return
         end
 
-        -- Close any orphaned non-fullscreen widgets before showing the HS.
+        -- Close leftover auto-dismissing toasts only.
         _closeOrphanedPopups(fm, nil)
 
         local prev_action = plugin_ref.active_action
