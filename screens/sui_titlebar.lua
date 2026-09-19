@@ -73,6 +73,7 @@ local _SIZE_SCALE = { compact = 0.75, default = 1.0, large = 1.3 }
 
 local _VIS_DEFAULTS = {
     fm_menu       = true,
+    fm_home       = true, 
     fm_back       = true,
     fm_title      = true,
     fm_search     = true,
@@ -84,8 +85,8 @@ local _VIS_DEFAULTS = {
 
 -- Default side/order configs for FM and injected widgets.
 local _FM_DEFAULTS = {
-    side        = { fm_menu = "right", fm_back = "left", fm_search = "left", fm_browse = "right" },
-    order_left  = { "fm_back", "fm_search" },
+    side        = { fm_menu = "right", fm_back = "left", fm_home = "left", fm_search = "left", fm_browse = "right" },
+    order_left  = { "fm_back", "fm_home", "fm_search" },
     order_right = { "fm_browse", "fm_menu" },
 }
 local _SUB_DEFAULTS = {
@@ -100,6 +101,7 @@ local _SUB_DEFAULTS = {
 
 M.ITEMS = {
     { id = "fm_menu",       label = function() return _("Menu")              end, ctx = "fm"  },
+    { id = "fm_home",       label = function() return _("Home")              end, ctx = "fm"  },
     { id = "fm_back",       label = function() return _("Back")              end, ctx = "fm"  },
     { id = "fm_search",     label = function() return _("Search")            end, ctx = "fm"  },
     { id = "fm_browse",     label = function() return _("Browse")            end, ctx = "fm"  },
@@ -507,6 +509,7 @@ function M.apply(fm_self)
 
     -- Read all visibility settings once.
     local show_menu   = M.isItemVisible("fm_menu")
+    local show_home   = M.isItemVisible("fm_home")   
     local show_up     = M.isItemVisible("fm_back")
     local show_search = M.isItemVisible("fm_search")
     local show_browse = M.isItemVisible("fm_browse") and (function()
@@ -519,6 +522,7 @@ function M.apply(fm_self)
     local cfg     = M.getFMConfig()
     local visible = {}
     if show_menu   then visible["fm_menu"]   = true end
+    if show_home   then visible["fm_home"]   = true end
     if show_up     then visible["fm_back"]     = true end
     if show_search then visible["fm_search"] = true end
     if show_browse then visible["fm_browse"] = true end
@@ -654,6 +658,8 @@ function M.apply(fm_self)
                                     widget = fm_self._titlebar_search_btn
                                 elseif id == "fm_browse" then
                                     widget = fm_self._titlebar_browse_btn
+                                elseif id == "fm_home" then
+                                    widget = fm_self._titlebar_home_btn
                                 end
                                 if widget then
                                     list[#list + 1] = {
@@ -884,6 +890,48 @@ function M.apply(fm_self)
         end -- if ok_ib
     end -- if show_up
 
+    -- Home button ------------------------------------------------------------
+    if show_home then
+        local ok_ib, IconButton = pcall(require, "ui/widget/iconbutton")
+        if ok_ib and IconButton then
+            local s = slot_map["fm_home"]
+            if s then
+                local btn_padding = tb.button_padding or require("device").screen:scaleBySize(11)
+                local home_btn = IconButton:new{
+                    icon        = "home",
+                    width       = iw,
+                    height      = iw,
+                    padding     = btn_padding,
+                    show_parent = tb.show_parent or fm_self,
+                    callback = function()
+                        local home = G_reader_settings:readSetting("home_dir")
+                        if home and fm_self.file_chooser then
+                            fm_self._navbar_suppress_path_change = true
+                            fm_self.file_chooser:changeToPath(home)
+                            fm_self._navbar_suppress_path_change = nil
+                            if fm_self.updateTitleBarPath then
+                                pcall(function() fm_self:updateTitleBarPath(home, true) end)
+                            end
+                        end
+                    end,
+                }
+                _resizeAndStrip(home_btn, iw)
+                home_btn.overlap_align  = nil
+                home_btn.overlap_offset = { _buttonX(s.side, s.slot, iw, pad, gap, sw), 0 }
+                table.insert(tb, home_btn)
+                fm_self._titlebar_home_btn = home_btn
+                if s.side == "left" then
+                    local up_slot_h  = slot_map["fm_back"] and slot_map["fm_back"].slot or 0
+                    local dslot_h    = s.slot > up_slot_h and s.slot - 1 or s.slot
+                    local compact_x_h = _buttonX("left", dslot_h, iw, pad, gap, sw)
+                    if (not show_up) or _isAtRoot(fm_self.file_chooser) then
+                        home_btn.overlap_offset = { compact_x_h, 0 }
+                    end
+                end
+            end
+        end
+    end
+    
     -- Search button ----------------------------------------------------------
     -- Injected directly into the TitleBar OverlapGroup.
     -- All paddings (including top) are zeroed to align with the other buttons.
@@ -1112,7 +1160,7 @@ function M.restore(fm_self)
     fm_self._titlebar_lb = nil
 
     -- Remove injected up, search and browse buttons from the TitleBar OverlapGroup.
-    for _, key in ipairs({ "_titlebar_up_btn", "_titlebar_search_btn", "_titlebar_browse_btn" }) do
+    for _, key in ipairs({ "_titlebar_home_btn", "_titlebar_up_btn", "_titlebar_search_btn", "_titlebar_browse_btn" }) do
         local btn = fm_self[key]
         if btn then
             -- Free the C/FFI image memory
@@ -1285,7 +1333,7 @@ function M.applyToSub(widget)
             rb.hold_callback  = function() end
         end
     end
-
+    
     -- Left button (back / pagination)
     if show_back then
         local ok_ib, IconButton = pcall(require, "ui/widget/iconbutton")
