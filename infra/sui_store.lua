@@ -150,6 +150,15 @@ end
 --- Absent keys (nil) return true — use this for "enabled unless explicitly disabled".
 function SUISettings:nilOrTrue(key)
     local v = _getStore():readSetting(key)
+    -- These three keys default to OFF when never configured. nilOrTrue()
+    -- normally treats nil as true; override that for these specific keys.
+    if v == nil and (
+        key == "simpleui_bar_enabled"          or
+        key == "simpleui_quicksettings_enabled" or
+        key == "simpleui_library_enabled"
+    ) then
+        return false
+    end
     return v ~= false
 end
 
