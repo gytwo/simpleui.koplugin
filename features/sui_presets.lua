@@ -154,12 +154,21 @@ local BUILTIN_PRESETS = {
             }
         },
         settings = {
+            -- Topbar
+            simpleui_statusbar_transparent = true,
+            
+            -- Clock
+            simpleui_hs_clock_date = true,
+            
             -- Cover Deck
             simpleui_hs_coverdeck_title_pos  = "above",
             simpleui_hs_coverdeck_scale      = 140,
             simpleui_hs_coverdeck_show_title = false,
             simpleui_hs_coverdeck_show_stats = false,
             simpleui_hs_coverdeck_main_order = { "covers", "progress", "stats", "title", "author" },
+
+            -- Reading Stats
+            simpleui_hs_reading_stats_type = "cards_transparent",
 
             -- Quote
             simpleui_hs_simpleui_quote_source = "mixed",
