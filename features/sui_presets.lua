@@ -145,6 +145,27 @@ local BUILTIN_PRESETS = {
         }
     },
     {
+        id   = "builtin_reading_nook",
+        name = _("Reading Nook"),
+        desc = _("Clock") .. ", " .. _("Cover Deck") .. ", " .. _("Reading Stats") .. ", " .. _("Quote of the Day"),
+        layout = {
+            pages = {
+                { id = 1, modules = { "clock", "coverdeck", "reading_stats", "quote" } },
+            }
+        },
+        settings = {
+            -- Cover Deck
+            simpleui_hs_coverdeck_title_pos  = "above",
+            simpleui_hs_coverdeck_scale      = 140,
+            simpleui_hs_coverdeck_show_title = false,
+            simpleui_hs_coverdeck_show_stats = false,
+            simpleui_hs_coverdeck_main_order = { "covers", "progress", "stats", "title", "author" },
+
+            -- Quote
+            simpleui_hs_simpleui_quote_source = "mixed",
+        }
+    },
+    {
         id = "builtin_mindful_reading",
         name = _("Mindful Reading"),
         desc = _("Clock") .. ", " .. _("Currently Reading") .. ", " .. _("Quote of the Day"),
