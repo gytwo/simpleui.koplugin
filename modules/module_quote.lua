@@ -27,6 +27,8 @@ local LeftContainer   = require("ui/widget/container/leftcontainer")
 local RightContainer  = require("ui/widget/container/rightcontainer")
 
 local GestureRange   = require("ui/gesturerange")
+local util = require("util")
+local TextWidget = require("ui/widget/textwidget")
 
 -- ConfirmBox is only needed when the user taps a highlight to open its book.
 -- Lazy-loaded at that point to avoid the cost at module-load time.
@@ -878,11 +880,34 @@ end
 
 -- ---------------------------------------------------------------------------
 
-
-
 local function buildWidget(inner_w, text_str, attr_str, face_quote, face_attr, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+    -- 先修掉坏字符
+    text_str = util.fixUtf8(text_str or "", "")
+    attr_str = attr_str and util.fixUtf8(attr_str, "") or attr_str
 
- local function makeTBW(text, face, fgcolor, bold)
+    local clr_main = clr_quote or SUIStyle.COLOR.text_primary
+    local has_attr = attr_str and attr_str ~= ""
+
+    -- 正文 + 署名合计 3 行
+    local total_max_lines = _FIXED_LINES          -- 3
+    local text_max_lines  = total_max_lines - (has_attr and 1 or 0)
+
+    -- ★ 用 TextBoxWidget 量真实行高
+    local function lineHeight(face)
+        local probe = TextBoxWidget:new{
+            text  = "Ag",
+            face  = face,
+            width = inner_w,
+        }
+        local h = probe:getLineHeight()
+        probe:free()
+        return h
+    end
+
+    local q_line_h = lineHeight(face_quote)
+    local a_line_h = lineHeight(face_attr)
+
+    local function makeLimitedTBW(text, face, fgcolor, bold, max_lines, line_h)
         local args = {
             text      = text,
             face      = face,
@@ -890,29 +915,35 @@ local function buildWidget(inner_w, text_str, attr_str, face_quote, face_attr, v
             width     = inner_w,
             alignment = alignment or "center",
             fgcolor   = fgcolor,
+            -- ★ 高度 = 真实行高 × 行数
+            height     = line_h * max_lines,
+            height_overflow_show_ellipsis = true,
         }
-
         if has_wallpaper then
-                local ok_tbx, tbx = pcall(UI.makeAlphaTextBox, args)
-                if ok_tbx then
-                    return tbx
-                else
-                    logger.warn("simpleui: module_quote: makeAlphaTextBox failed, falling back: " .. tostring(tbx))
-                    return TextBoxWidget:new(args)
-                end
+            local ok_tbx, tbx = pcall(UI.makeAlphaTextBox, args)
+            if ok_tbx then
+                return tbx
             else
+                logger.warn("simpleui: module_quote: makeAlphaTextBox failed: " .. tostring(tbx))
                 return TextBoxWidget:new(args)
             end
+        else
+            return TextBoxWidget:new(args)
+        end
     end
 
     local vg = VerticalGroup:new{ align = "center" }
-    vg[#vg+1] = makeTBW(text_str, face_quote, clr_quote or SUIStyle.COLOR.text_primary, nil)
-    if attr_str and attr_str ~= "" then
-        vg[#vg+1] = vspan_gap
-        vg[#vg+1] = makeTBW(attr_str, face_attr,  clr_attr  or CLR_TEXT_SUB,    true)
-    end
-    return vg
 
+    -- 正文
+    vg[#vg+1] = makeLimitedTBW(text_str, face_quote, clr_main, nil, text_max_lines, q_line_h)
+
+    -- 署名
+    if has_attr then
+        vg[#vg+1] = vspan_gap
+        vg[#vg+1] = makeLimitedTBW(attr_str, face_attr, clr_attr or CLR_TEXT_SUB, true, 1, a_line_h)
+    end
+
+    return vg
 end
 
 
