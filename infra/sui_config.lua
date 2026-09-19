@@ -2153,7 +2153,7 @@ function M.applyFirstRunDefaults()
     end
 
     -- Navbar
-    def("simpleui_bar_enabled",  true)
+    def("simpleui_bar_enabled",  false)
     def("simpleui_topbar_enabled", true)
     def("simpleui_bar_mode",     "both")
     def("simpleui_bar_tabs",     { "home", "sui_settings", "homescreen", "history", "power" })
@@ -2237,7 +2237,7 @@ function M.applyFirstRunDefaults()
     def("simpleui_reading_goals_show_daily",   false)
 
     -- Folder covers / browse meta
-    def("simpleui_fc_enabled",          true)
+    def("simpleui_fc_enabled",          false)
     def("simpleui_fc_folder_style",     "auto")
     def("simpleui_fc_cover_mode",       "2_3")
     def("simpleui_fc_subfolder_cover",  true)
@@ -2255,7 +2255,7 @@ function M.applyFirstRunDefaults()
     end
 
     -- Quick Settings bar
-    def("simpleui_qs_bar_enabled",          true)
+    def("simpleui_qs_bar_enabled",          false)
     def("simpleui_qs_bar_frontlight",       false)
     def("simpleui_qs_bar_warmth",           false)
     def("simpleui_qs_bar_shape",            "round")
