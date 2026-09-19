@@ -122,7 +122,6 @@ M.ALL_ACTIONS = {
     { id = "random_document",  label = _("Random"),           icon = M.ICON.random      },
     { id = "favorites",        label = _("Favorites"),        icon = M.ICON.ko_star     },
     { id = "bookmark_browser", label = _("Bookmarks"),        icon = M.ICON.ko_bookmark },
-    { id = "search_library",   label = _("Search"),           icon = M.ICON.ko_search   },
     { id = "wifi_toggle",      label = _("Wi-Fi"),            icon = M.ICON.ko_wifi     },
     { id = "frontlight",       label = _("Brightness"),       icon = M.ICON.frontlight  },
     { id = "night_mode",       label = _("Night Mode"),       icon = M.ICON.night       },
@@ -2133,10 +2132,6 @@ function M.migrateOldCustomSlots()
         end
     end
     SUISettings:set("simpleui_qa_migrated_v1", true)
-    local legacy_enabled = SUISettings:get("simpleui_bar_enabled")
-    if legacy_enabled ~= nil and SUISettings:get("simpleui_enabled") == nil then
-        SUISettings:set("simpleui_enabled", legacy_enabled)
-    end
 end
 
 -- First-run defaults. Idempotent: each setting is only written when absent,
@@ -2153,7 +2148,7 @@ function M.applyFirstRunDefaults()
     end
 
     -- Navbar
-    def("simpleui_bar_enabled",  false)
+    def("simpleui_bar_enabled", false)
     def("simpleui_topbar_enabled", true)
     def("simpleui_bar_mode",     "both")
     def("simpleui_bar_tabs",     { "home", "sui_settings", "homescreen", "history", "power" })
@@ -2245,11 +2240,12 @@ function M.applyFirstRunDefaults()
 
     -- Titlebar: search visible, browse visible left of menu
     def("simpleui_tb_item_fm_search", true)
+    def("simpleui_tb_item_fm_home", true)
     def("simpleui_tb_item_fm_browse", true)
     if SUISettings:get("simpleui_tb_fm_cfg") == nil then
         SUISettings:set("simpleui_tb_fm_cfg", {
-            side        = { fm_menu = "right", fm_back = "left", fm_search = "left", fm_browse = "right" },
-            order_left  = { "fm_back", "fm_search" },
+            side        = { fm_menu = "right",fm_home = "left", fm_back = "left", fm_search = "left", fm_browse = "right" },
+            order_left  = { "fm_back", "fm_home", "fm_search" },
             order_right = { "fm_browse", "fm_menu" },
         })
     end
