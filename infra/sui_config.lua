@@ -2146,7 +2146,10 @@ function M.applyFirstRunDefaults()
             G_reader_settings:saveSetting(k, v)
         end
     end
-
+    
+    -- wallpaper
+    def("simpleui_style_wallpaper_opacity", 85)
+    
     -- Navbar
     def("simpleui_bar_enabled", false)
     def("simpleui_topbar_enabled", true)
