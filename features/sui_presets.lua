@@ -162,7 +162,7 @@ local BUILTIN_PRESETS = {
             
             -- Cover Deck
             simpleui_hs_coverdeck_title_pos  = "above",
-            simpleui_hs_coverdeck_scale      = 140,
+            simpleui_hs_coverdeck_scale      = 130,
             simpleui_hs_coverdeck_show_title = false,
             simpleui_hs_coverdeck_show_stats = false,
             simpleui_hs_coverdeck_main_order = { "covers", "progress", "stats", "title", "author" },
