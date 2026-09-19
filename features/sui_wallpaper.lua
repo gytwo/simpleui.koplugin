@@ -78,7 +78,7 @@ end
 local function _wpStretch()     return SUISettings:isTrue("simpleui_style_wallpaper_stretch")        end
 local function _wpAutoRotate()  return SUISettings:nilOrTrue("simpleui_style_wallpaper_autorotate")  end
 local function _wpInvertNight() return SUISettings:isTrue("simpleui_style_wallpaper_invert_night")   end
-local function _wpOpacity()     return SUISettings:readSetting("simpleui_style_wallpaper_opacity", 0) end
+local function _wpOpacity()     return SUISettings:readSetting("simpleui_style_wallpaper_opacity", 85) end
 
 -- Returns DataStorage/simpleui/sui_wallpapers/, creating it if needed.
 local function _styleWallpapersDir()
