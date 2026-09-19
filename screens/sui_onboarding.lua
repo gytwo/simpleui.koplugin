@@ -33,7 +33,7 @@ local Onboarding = {}
 
 function Onboarding.show(on_finish)
     local st = {
-        selected_preset = SUISettings:get("simpleui_hs_active_preset") or "builtin_at_a_glance"
+        selected_preset = SUISettings:get("simpleui_hs_active_preset") or "builtin_reading_nook"
     }
 
     local win
