@@ -79,7 +79,7 @@ local _VIS_DEFAULTS = {
     fm_search     = true,
     fm_browse     = false,
     sub_menu      = true,
-    sub_close     = false,
+    sub_close     = true,
     sub_back      = true,
 }
 
