@@ -2217,7 +2217,10 @@ function M.applyFirstRunDefaults()
     def(PFX .. "recent_show_finished",          true)
 
     -- Updater
-    def("simpleui_updater_auto_check",          true)
+    def("simpleui_updater_auto_check",          false)
+
+    -- Closing book notice
+    def("simpleui_hs_closing_notice_mode",      "never")
 
     -- Quick Actions Row instances (three stable ids that won't clash with
     -- runtime-generated ones, which use os.time() as suffix).
