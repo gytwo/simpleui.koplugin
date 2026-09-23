@@ -376,13 +376,7 @@ end
 
 function M.getContentHeight()
     local topbar_on = SUISettings:nilOrTrue("simpleui_topbar_enabled")
-    local simpleui_bar_h = _BB().TOTAL_H()
-    local quickui_bar_h = 0
-    if _G.__QUICKUI_BAR_HEIGHT and type(_G.__QUICKUI_BAR_HEIGHT) == "number" then
-        quickui_bar_h = _G.__QUICKUI_BAR_HEIGHT
-    end
-    local total_bar_h = simpleui_bar_h + quickui_bar_h    
-    return Screen:getHeight() - total_bar_h - (topbar_on and _TB().TOTAL_TOP_H() or 0)
+    return Screen:getHeight() - _BB().TOTAL_H() - (topbar_on and _TB().TOTAL_TOP_H() or 0)
 end
 
 function M.getContentTop()
@@ -441,24 +435,12 @@ function M.wrapWithNavbar(inner_widget, active_action_id, tabs, force_no_arrows)
     -- Callers must NOT call buildTopbarWidget() again after wrapWithNavbar returns.
     local topbar = topbar_on and Topbar.buildTopbarWidget() or nil
 
-    -- 历史记录界面quickui导航栏被simpleui状态栏往下挤出屏幕的问题
-    if inner_widget._bottombar_container then
-        local og = inner_widget._bottombar_container
-        if og and og[1] then
-            local content = og[1]
-            content.overlap_offset = { 0, topbar_top }
-            if content.dimen then
-                content.dimen.h = content.dimen.h - topbar_top
-            end
-        end
+    inner_widget.overlap_offset = { 0, topbar_top }
+    if inner_widget.dimen then
+        inner_widget.dimen.h = content_h
+        inner_widget.dimen.w = screen_w
     else
-        inner_widget.overlap_offset = { 0, topbar_top }
-        if inner_widget.dimen then
-            inner_widget.dimen.h = content_h
-            inner_widget.dimen.w = screen_w
-        else
-            inner_widget.dimen = Geom():new{ w = screen_w, h = content_h }
-        end
+        inner_widget.dimen = Geom():new{ w = screen_w, h = content_h }
     end
 
     local bar_idx
