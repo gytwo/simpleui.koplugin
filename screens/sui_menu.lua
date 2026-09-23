@@ -153,7 +153,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
     -- goes through QA.allIds()/QA.getEntry() instead, so externally
     -- registered actions (Custom Screens) are included. See the QA require
     -- above.
-    local TOPBAR_ITEMS        = Config.TOPBAR_ITEMS
+    local TOPBAR_ITEMS        = Config.getAvailableTopbarItems()
     local TOPBAR_ITEM_LABEL   = Config.TOPBAR_ITEM_LABEL
     local MAX_CUSTOM_QA       = Config.MAX_CUSTOM_QA
     local CUSTOM_ICON         = Config.CUSTOM_ICON
@@ -775,7 +775,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
         }
 
         local sorted_keys = {}
-        for _i, k in ipairs(TOPBAR_ITEMS) do sorted_keys[#sorted_keys + 1] = k end
+        for _i, k in ipairs(Config.getAvailableTopbarItems()) do sorted_keys[#sorted_keys + 1] = k end
         table.sort(sorted_keys, function(a, b) return TOPBAR_ITEM_LABEL(a):lower() < TOPBAR_ITEM_LABEL(b):lower() end)
 
         for _i, key in ipairs(sorted_keys) do
@@ -978,7 +978,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
                                 footer_text = _("Add Item"),
                                 footer_enabled = function()
                                     local cfg2 = Config.getTopbarConfigCached()
-                                    for _, k in ipairs(Config.TOPBAR_ITEMS) do
+                                    for _, k in ipairs(Config.getAvailableTopbarItems()) do
                                         if (cfg2.side[k] or "hidden") == "hidden" then return true end
                                     end
                                     return false
@@ -986,7 +986,7 @@ SimpleUIPlugin.addToMainMenu = function(self, menu_items)
                                 footer_action = function(ctx2)
                                     local cfg2 = Config.getTopbarConfig()
                                     local picker_items = {}
-                                    for _, k in ipairs(Config.TOPBAR_ITEMS) do
+                                    for _, k in ipairs(Config.getAvailableTopbarItems()) do
                                         if (cfg2.side[k] or "hidden") == "hidden" then
                                             local _k = k
                                             local _label = Config.TOPBAR_ITEM_LABEL(k)

@@ -95,6 +95,23 @@ local SimpleUIPlugin = WidgetContainer:new{
 -- ---------------------------------------------------------------------------
 
 function SimpleUIPlugin:init()
+    -- Conflicting plugins/patches: disable or block before UI setup.
+    do
+        local ok_cc, compat = pcall(require, "infra/sui_compat_check")
+        if ok_cc and type(compat) == "function" then
+            local stop = false
+            local ok_run, result = pcall(compat)
+            if ok_run then
+                stop = result and true or false
+            else
+                logger.err("simpleui: compatibility check failed:", tostring(result))
+            end
+            if stop then
+                return
+            end
+        end
+    end
+
     -- Re-register the "open custom screen" Quick Action for every persisted
     -- Custom Screen. QA.register() only writes to an in-memory table inside
     -- features/sui_quickactions.lua, so it does not survive a KOReader

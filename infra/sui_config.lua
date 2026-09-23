@@ -157,7 +157,30 @@ function M.nextCustomQAId()          return _QA_lazy().nextCustomQAId()         
 -- 3. Topbar & Tab Configurations
 -- ===========================================================================
 
-M.TOPBAR_ITEMS = { "clock", "wifi", "brightness", "battery", "disk", "ram", "custom_text" }
+M.TOPBAR_ITEMS = { "clock", "wifi", "bluetooth", "brightness", "battery", "disk", "ram", "custom_text" }
+
+-- TOPBAR_ITEMS filtered to what this device can actually display.
+function M.getAvailableTopbarItems()
+    local list = {}
+    local bt_ok = nil
+    for _, k in ipairs(M.TOPBAR_ITEMS) do
+        if k == "bluetooth" then
+            if bt_ok == nil then
+                local ok, Topbar = pcall(require, "screens/sui_topbar")
+                bt_ok = ok and Topbar and Topbar.isBluetoothAvailable
+                    and Topbar.isBluetoothAvailable() or false
+            end
+            if not bt_ok then
+                -- skip: no Bluetooth backend on this device
+            else
+                list[#list + 1] = k
+            end
+        else
+            list[#list + 1] = k
+        end
+    end
+    return list
+end
 
 local _topbar_item_labels = nil
 function M.TOPBAR_ITEM_LABEL(k)
@@ -165,6 +188,7 @@ function M.TOPBAR_ITEM_LABEL(k)
         _topbar_item_labels = {
             clock       = _("Clock"),
             wifi        = _("WiFi"),
+            bluetooth   = _("Bluetooth"),
             brightness  = _("Brightness"),
             battery     = _("Battery"),
             disk        = _("Disk Usage"),
