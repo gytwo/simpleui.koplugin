@@ -701,12 +701,11 @@ local function _installFileDialogButton(BookInfoManager)
         end
     )
 
-    -- "Create collection" — series-group folders only; visible in all view modes.
-    FileManager:addFileDialogButtons("simpleui_fc_series_collection",
+    -- "Create collection" — series groups (snapshot) or real folders (connected).
+    FileManager:addFileDialogButtons("simpleui_fc_create_collection",
         function(file, is_file, _book_props)
             if is_file then return nil end
             if not M.isEnabled() then return nil end
-            if not M.getSeriesGrouping() then return nil end
 
             local fc         = FileManager.instance and FileManager.instance.file_chooser
             local item_entry = nil
@@ -719,15 +718,41 @@ local function _installFileDialogButton(BookInfoManager)
             local SG = _seriesGrouping()
             local is_virtual_series = (item_entry and item_entry.is_series_group)
                                    or (SG and SG.hasGroup(file))
-            if not is_virtual_series then return nil end
+            local is_virtual_meta   = item_entry and item_entry.is_virtual_meta_leaf
 
-            local series_name = (item_entry and item_entry.text) or ""
+            -- Virtual author/series/tag leaves use the library-browse hold path.
+            if is_virtual_meta then return nil end
+
+            if is_virtual_series then
+                if not M.getSeriesGrouping() then return nil end
+                local series_name = (item_entry and item_entry.text) or ""
+                return {{
+                    text = _("Create collection"),
+                    callback = function()
+                        local UIManager = require("ui/uimanager")
+                        if fc and fc.file_dialog then UIManager:close(fc.file_dialog) end
+                        if SG then SG.createCollection(file, series_name) end
+                    end,
+                }}
+            end
+
+            -- Real filesystem folder: create a collection linked to this path so
+            -- KOReader rescans it (same model as Collections → Connect folders).
+            local folder_name = (item_entry and item_entry.text)
+                or file:match("([^/]+)/?$")
+                or file
             return {{
                 text = _("Create collection"),
                 callback = function()
                     local UIManager = require("ui/uimanager")
                     if fc and fc.file_dialog then UIManager:close(fc.file_dialog) end
-                    if SG then SG.createCollection(file, series_name) end
+                    GroupActions.createCollection{
+                        suggested_name         = folder_name,
+                        connect_folder         = file,
+                        connect_subfolders     = M.getRecursiveCover(),
+                        connect_scan_on_show   = true,
+                        empty_message          = _("No books found in this folder."),
+                    }
                 end,
             }}
         end
@@ -738,6 +763,8 @@ local function _uninstallFileDialogButton()
     local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
     if not ok_fm or not FileManager then return end
     FileManager:removeFileDialogButtons("simpleui_fc_cover")
+    FileManager:removeFileDialogButtons("simpleui_fc_create_collection")
+    -- Legacy id from earlier builds.
     FileManager:removeFileDialogButtons("simpleui_fc_series_collection")
 end
 
@@ -1836,7 +1863,7 @@ function M.install()
                     local cell_min = math.min(self.width or fw, self.height or fh)
                     local dark = M.getBadgeColorSeries() == "dark"
                     local new_wg = CoverWidgets.buildRectBadgeWidget(
-                        "#" .. bi.series_index, false, cell_min, dark, false)
+                        "#" .. bi.series_index, false, cell_min, dark, false, M.getBadgeScale())
                     if new_wg then self._fc_series_widget = new_wg; wg = new_wg end
                 end
             end
