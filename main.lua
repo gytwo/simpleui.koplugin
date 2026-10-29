@@ -8,7 +8,7 @@ local Dispatcher      = require("dispatcher")
 
 -- Each simpleui module captures its own local translation proxy from sui_i18n.
 -- The native package.loaded["gettext"] is never wrapped or replaced, which
--- prevents state-mutation conflicts with other plugins (e.g. zlibrary).
+-- prevents state-mutation conflicts with other plugins.
 local I18n = require("infra/sui_i18n")
 local _    = I18n.translate
 
@@ -18,7 +18,14 @@ local Bottombar    = require("screens/sui_bottombar")
 local Topbar       = require("screens/sui_topbar")
 local QSBar        = require("screens/sui_quicksettings_bar")
 local Patches      = require("infra/sui_patches")
+local WindowHooks  = require("infra/sui_window_hooks")
+local Memory       = require("infra/sui_memory")
+local Text         = require("infra/sui_text")
 local SUISettings  = require("infra/sui_store")
+
+-- Installer of the main menu entries, loaded on first access by addToMainMenu
+-- and dropped on teardown so a hot update loads the new one.
+local _menu_installer
 
 -- ---------------------------------------------------------------------------
 -- ReaderStatistics class-table accessor
@@ -73,13 +80,6 @@ local SimpleUIPlugin = WidgetContainer:new{
     _topbar_timer             = nil,
     _power_dialog             = nil,
 
-    _orig_uimanager_show      = nil,
-    _orig_uimanager_close     = nil,
-    _orig_booklist_new        = nil,
-    _orig_menu_new            = nil,
-    _orig_fmcoll_show         = nil,
-    _orig_rc_remove           = nil,
-    _orig_rc_rename           = nil,
     _orig_fc_init             = nil,
 
     _makeNavbarMenu           = nil,
@@ -198,696 +198,16 @@ function SimpleUIPlugin:init()
                         ), 6)
                 end)
             end
-            SUISettings:set("simpleui_loaded_version", current_version)
+            if prev_version ~= current_version then
+                SUISettings:set("simpleui_loaded_version", current_version)
+            end
         end
 
-        -- -------------------------------------------------------------------
-        -- User-data migration (runs once per install / once after upgrade).
-        --
-        -- v1: move user files out of the plugin folder into DataStorage so
-        --     they survive plugin updates, and normalise all settings keys to
-        --     the simpleui_ / navbar_ namespace.
-        -- -------------------------------------------------------------------
-        if not G_reader_settings:isTrue("simpleui_userdata_migrated_v1") then
-            pcall(function()
-                local ok_ds, DataStorage = pcall(require, "datastorage")
-                local ok_lfs, lfs        = pcall(require, "libs/libkoreader-lfs")
-                local ok_ffi, ffiutil    = pcall(require, "ffi/util")
-                if not (ok_ds and ok_lfs and ok_ffi) then return end
-
-                local data_dir = DataStorage:getSettingsDir() .. "/simpleui"
-
-                -- ── 1. Migrate user files (copy, never overwrite) ─────────
-                -- Directory structure is guaranteed by the startup block above.
-                -- Resolve plugin root from this file's path.
-                local src_info   = debug.getinfo(1, "S").source or ""
-                local plugin_root = src_info:sub(1,1) == "@"
-                    and src_info:sub(2):match("^(.*)/[^/]+$") or nil
-                if plugin_root and plugin_root:sub(1,1) ~= "/" then
-                    local ok_lfs2, lfs2 = pcall(require, "libs/libkoreader-lfs")
-                    local cwd = ok_lfs2 and lfs2 and lfs2.currentdir()
-                    if cwd then plugin_root = cwd .. "/" .. plugin_root end
-                end
-
-                if plugin_root then
-                    -- Copy files from src/ to dst/ (never overwrite existing).
-                    local function copyDirContents(src, dst)
-                        if lfs.attributes(src, "mode") ~= "directory" then return end
-                        for fname in lfs.dir(src) do
-                            if fname ~= "." and fname ~= ".." then
-                                local src_f = src .. "/" .. fname
-                                local dst_f = dst .. "/" .. fname
-                                if lfs.attributes(src_f, "mode") == "file"
-                                    and lfs.attributes(dst_f, "mode") ~= "file" then
-                                    ffiutil.copyFile(src_f, dst_f)
-                                end
-                            end
-                        end
-                    end
-
-                    -- Removes all plain files inside dir, then the dir itself.
-                    -- Skips silently if dir doesn't exist or still has subdirs.
-                    local function removeDirIfEmpty(dir)
-                        if lfs.attributes(dir, "mode") ~= "directory" then return end
-                        for fname in lfs.dir(dir) do
-                            if fname ~= "." and fname ~= ".." then
-                                local p = dir .. "/" .. fname
-                                if lfs.attributes(p, "mode") == "file" then
-                                    os.remove(p)
-                                end
-                            end
-                        end
-                        lfs.rmdir(dir)  -- only succeeds when empty
-                    end
-
-                    -- icons/custom → DataStorage/simpleui/sui_icons/
-                    -- then remove the now-redundant in-plugin directory.
-                    copyDirContents(plugin_root .. "/icons/custom",
-                                    data_dir    .. "/sui_icons")
-                    removeDirIfEmpty(plugin_root .. "/icons/custom")
-
-                    -- modules/custom_quotes → DataStorage/simpleui/sui_quotes/
-                    -- then remove the now-redundant in-plugin directory.
-                    copyDirContents(plugin_root .. "/modules/custom_quotes",
-                                    data_dir    .. "/sui_quotes")
-                    removeDirIfEmpty(plugin_root .. "/modules/custom_quotes")
-                end
-
-                -- ── 2. Migrate renamed settings keys ──────────────────────
-                -- Each entry: { old_key, new_key }
-                local key_renames = {
-                    { "sui_tbr_list",             "simpleui_tbr_list"                    },
-                    { "quote_deck_order",          "simpleui_quote_deck_order"            },
-                    { "quote_deck_pos",            "simpleui_quote_deck_pos"              },
-                    { "quote_deck_count",          "simpleui_quote_deck_count"            },
-                    { "quote_hl_deck_order",       "simpleui_quote_hl_deck_order"         },
-                    { "quote_hl_deck_pos",         "simpleui_quote_hl_deck_pos"           },
-                    { "quote_hl_deck_count",       "simpleui_quote_hl_deck_count"         },
-                    { "quote_custom_deck_order",   "simpleui_quote_custom_deck_order"     },
-                    { "quote_custom_deck_pos",     "simpleui_quote_custom_deck_pos"       },
-                    { "quote_custom_deck_count",   "simpleui_quote_custom_deck_count"     },
-                    { "quote_custom_deck_file",    "simpleui_quote_custom_deck_file"      },
-                    -- quote_source and quote_custom_file are per-instance (prefixed
-                    -- with navbar_homescreen_ at runtime); migrate all known slots.
-                    { "navbar_homescreen_quote_source",      "navbar_homescreen_simpleui_quote_source"      },
-                    { "navbar_homescreen_quote_custom_file", "navbar_homescreen_simpleui_quote_custom_file" },
-                }
-                for _, pair in ipairs(key_renames) do
-                    local old_key, new_key = pair[1], pair[2]
-                    local val = G_reader_settings:readSetting(old_key)
-                    if val ~= nil and G_reader_settings:readSetting(new_key) == nil then
-                        G_reader_settings:saveSetting(new_key, val)
-                    end
-                    G_reader_settings:delSetting(old_key)
-                end
-
-                logger.info("simpleui: userdata migration v1 complete")
-            end)
-            G_reader_settings:saveSetting("simpleui_userdata_migrated_v1", true)
+        -- One-time migrations: the module is loaded only while a flag is missing.
+        if not G_reader_settings:isTrue("simpleui_userdata_migrated_v1")
+                or not SUISettings:isTrue("simpleui_settings_migrated_v14") then
+            require("infra/sui_migrations").run()
         end
-        -- -------------------------------------------------------------------
-        -- Settings migration v2: move all navbar_* and simpleui_* keys from
-        -- G_reader_settings into SUISettings (the dedicated per-plugin store).
-        --
-        -- This runs once on first boot after the Phase-3 refactor.  It is safe
-        -- to re-run if interrupted: keys that already exist in SUISettings are
-        -- not overwritten; keys successfully copied are removed from
-        -- G_reader_settings.
-        -- -------------------------------------------------------------------
-        if not SUISettings:isTrue("simpleui_settings_migrated_v2") then
-            pcall(function()
-                -- Enumerate every key currently stored in G_reader_settings
-                -- and migrate the ones owned by SimpleUI.
-                local raw = G_reader_settings.data  -- LuaSettings exposes .data
-                if type(raw) ~= "table" then return end
-
-                -- Collect owned keys first; deleting from raw while iterating
-                -- it with pairs() has undefined behaviour in Lua and can cause
-                -- entries to be skipped.
-                local to_migrate = {}
-                for k, v in pairs(raw) do
-                    local owned = (type(k) == "string")
-                        and (k:sub(1, 7) == "navbar_" or k:sub(1, 9) == "simpleui_")
-                        -- Keep the v1 and v2 migration flags in G_reader_settings
-                        -- so they survive a factory reset of sui_settings.lua.
-                        and k ~= "simpleui_userdata_migrated_v1"
-                    if owned then
-                        to_migrate[#to_migrate + 1] = { k = k, v = v }
-                    end
-                end
-
-                local migrated = 0
-                for _, entry in ipairs(to_migrate) do
-                    local k, v = entry.k, entry.v
-                    -- Only copy if SUISettings does not already have the key
-                    -- (e.g. the user already made changes after the code update).
-                    if SUISettings:get(k) == nil then
-                        SUISettings:set(k, v)
-                    end
-                    G_reader_settings:delSetting(k)
-                    migrated = migrated + 1
-                end
-
-                SUISettings:flush()
-                logger.info("simpleui: settings migration v2 complete —", migrated, "keys moved to SUISettings")
-            end)
-            SUISettings:set("simpleui_settings_migrated_v2", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
-        -- Settings migration v3: rename all navbar_* keys inside SUISettings
-        -- to the canonical simpleui_* namespace.
-        --
-        -- Two passes:
-        --   1. Fixed renames  — explicit old → new map (fast, readable).
-        --   2. Dynamic prefix — bulk rename of per-slot / per-id keys that are
-        --      built at runtime via string concatenation.
-        --
-        -- Rules:
-        --   • Only copies when the destination key is absent (never overwrites).
-        --   • Old key is always deleted, even when the copy is skipped.
-        --   • The whole block runs inside pcall — a crash must never prevent
-        --     the plugin from loading on a resource-constrained e-reader.
-        --   • Guarded by simpleui_settings_migrated_v3 so it runs at most once.
-        -- -------------------------------------------------------------------
-        if not SUISettings:isTrue("simpleui_settings_migrated_v3") then
-            pcall(function()
-                -- ── 1. Fixed renames ─────────────────────────────────────────
-                local fixed_renames = {
-                    -- Bottom bar — general
-                    { "navbar_enabled",                      "simpleui_bar_enabled"                   },
-                    { "navbar_mode",                         "simpleui_bar_mode"                      },
-                    { "navbar_bar_size",                     "simpleui_bar_size"                      },
-                    { "navbar_bar_size_pct",                 "simpleui_bar_size_pct"                  },
-                    { "navbar_hide_separator",               "simpleui_bar_hide_separator"            },
-                    { "navbar_bottom_margin_pct",            "simpleui_bar_bottom_margin_pct"         },
-                    { "navbar_icon_scale_pct",               "simpleui_bar_icon_scale_pct"            },
-                    { "navbar_label_scale_pct",              "simpleui_bar_label_scale_pct"           },
-                    { "navbar_rs_text_scale_pct",            "simpleui_bar_rs_text_scale_pct"         },
-                    -- Bottom bar — pagination / pager
-                    { "navbar_pagination_visible",           "simpleui_bar_pagination_visible"        },
-                    { "navbar_pagination_size",              "simpleui_bar_pagination_size"           },
-                    { "navbar_pagination_show_subtitle",     "simpleui_bar_pagination_show_subtitle"  },
-                    { "navbar_navpager_enabled",             "simpleui_bar_navpager_enabled"          },
-                    { "navbar_dotpager_always",              "simpleui_bar_dotpager_always"           },
-                    -- Bottom bar — tabs & settings
-                    { "navbar_tabs",                         "simpleui_bar_tabs"                      },
-                    { "navbar_bottombar_settings_on_hold",   "simpleui_bar_settings_on_hold"          },
-                    -- Top bar
-                    { "navbar_topbar_enabled",               "simpleui_topbar_enabled"                },
-                    { "navbar_topbar_config",                "simpleui_topbar_config"                 },
-                    { "navbar_topbar_custom_text",           "simpleui_topbar_custom_text"            },
-                    { "navbar_topbar_settings_on_hold",      "simpleui_topbar_settings_on_hold"       },
-                    { "navbar_topbar_swipe_indicator",       "simpleui_topbar_swipe_indicator"        },
-                    { "navbar_topbar_wifi_hide_when_off",    "simpleui_topbar_wifi_hide_when_off"     },
-                    { "navbar_topbar_size_pct",              "simpleui_topbar_size_pct"               },
-                    -- Homescreen bar — fixed keys
-                    { "navbar_homescreen_pagination_hidden", "simpleui_hs_pagination_hidden"          },
-                    { "navbar_homescreen_settings_on_hold",  "simpleui_hs_settings_on_hold"           },
-                    { "navbar_homescreen_overflow_warn",     "simpleui_hs_overflow_warn"              },
-                    { "navbar_hs_return_to_book_folder",     "simpleui_hs_return_to_book_folder"      },
-                    { "navbar_homescreen_module_scale",      "simpleui_hs_module_scale"               },
-                    { "navbar_homescreen_label_scale",       "simpleui_hs_label_scale"                },
-                    { "navbar_homescreen_scale_linked",      "simpleui_hs_scale_linked"               },
-                    -- Reading goal
-                    { "navbar_reading_goal",                 "simpleui_reading_goal"                  },
-                    { "navbar_reading_goal_physical",        "simpleui_reading_goal_physical"         },
-                    { "navbar_daily_reading_goal_secs",      "simpleui_daily_reading_goal_secs"       },
-                    -- Reading goals module display
-                    { "navbar_reading_goals_show_annual",    "simpleui_reading_goals_show_annual"     },
-                    { "navbar_reading_goals_show_daily",     "simpleui_reading_goals_show_daily"      },
-                    { "navbar_reading_goals_layout",         "simpleui_reading_goals_layout"          },
-                    -- Collections module
-                    { "navbar_collections_list",             "simpleui_collections_list"              },
-                    { "navbar_collections_covers",           "simpleui_collections_covers"            },
-                    { "navbar_collections_badge_position",   "simpleui_collections_badge_position"    },
-                    { "navbar_collections_badge_color",      "simpleui_collections_badge_color"       },
-                    { "navbar_collections_badge_hidden",     "simpleui_collections_badge_hidden"      },
-                    -- Custom quick actions — list & migration flag
-                    { "navbar_custom_qa_list",               "simpleui_cqa_list"                      },
-                    { "navbar_custom_qa_migrated_v1",        "simpleui_cqa_migrated_v1"               },
-                }
-
-                local migrated = 0
-
-                for _, pair in ipairs(fixed_renames) do
-                    local old_k, new_k = pair[1], pair[2]
-                    local val = SUISettings:get(old_k)
-                    if val ~= nil then
-                        if SUISettings:get(new_k) == nil then
-                            SUISettings:set(new_k, val)
-                        end
-                        SUISettings:del(old_k)
-                        migrated = migrated + 1
-                    end
-                end
-
-                -- ── 2. Dynamic-prefix renames ─────────────────────────────────
-                -- Keys built at runtime via string concatenation:
-                --   simpleui_hs_*        (was navbar_homescreen_*)
-                --   navbar_cqa_*         →  simpleui_cqa_*
-                --   navbar_action_*      →  simpleui_action_*
-                --   navbar_custom_*      →  simpleui_custom_*
-                --
-                -- We collect all renames first, then apply — modifying a table
-                -- while iterating it is undefined behaviour in Lua 5.1/5.2.
-                local dynamic_prefixes = {
-                    { old = "navbar_homescreen_",  new = "simpleui_hs_"     },
-                    { old = "navbar_cqa_",         new = "simpleui_cqa_"    },
-                    { old = "navbar_action_",      new = "simpleui_action_" },
-                    { old = "navbar_custom_",      new = "simpleui_custom_" },
-                }
-
-                local pending = {}
-                for k, v in SUISettings:iterateKeys() do
-                    for _, pfx in ipairs(dynamic_prefixes) do
-                        local plen = #pfx.old
-                        if k:sub(1, plen) == pfx.old then
-                            local new_k = pfx.new .. k:sub(plen + 1)
-                            pending[#pending + 1] = { old_k = k, new_k = new_k, val = v }
-                            break
-                        end
-                    end
-                end
-
-                for _, entry in ipairs(pending) do
-                    if SUISettings:get(entry.new_k) == nil then
-                        SUISettings:set(entry.new_k, entry.val)
-                    end
-                    SUISettings:del(entry.old_k)
-                    migrated = migrated + 1
-                end
-
-                SUISettings:flush()
-                logger.info("simpleui: settings migration v3 complete —", migrated, "navbar_* keys renamed to simpleui_*")
-            end)
-            SUISettings:set("simpleui_settings_migrated_v3", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
-        -- Settings migration v4: rename icon pack keys to integrated sui_ scheme.
-        -- -------------------------------------------------------------------
-        if not SUISettings:isTrue("simpleui_settings_migrated_v4") then
-            pcall(function()
-                local icon_renames = {
-                    { "simpleui_sysicon_bm_normal",     "simpleui_sysicon_sui_browse_normal" },
-                    { "simpleui_sysicon_bm_author",     "simpleui_sysicon_sui_browse_author" },
-                    { "simpleui_sysicon_bm_series",     "simpleui_sysicon_sui_browse_series" },
-                    { "simpleui_sysicon_bm_tags",       "simpleui_sysicon_sui_browse_tags" },
-                    { "simpleui_sysicon_pg_chev_left",  "simpleui_sysicon_sui_pager_prev" },
-                    { "simpleui_sysicon_pg_chev_right", "simpleui_sysicon_sui_pager_next" },
-                    { "simpleui_sysicon_pg_chev_first", "simpleui_sysicon_sui_pager_first" },
-                    { "simpleui_sysicon_pg_chev_last",  "simpleui_sysicon_sui_pager_last" },
-                    { "simpleui_sysicon_coll_back",     "simpleui_sysicon_sui_coll_back" },
-                }
-                local migrated = 0
-                for _, pair in ipairs(icon_renames) do
-                    local old_k, new_k = pair[1], pair[2]
-                    local val = SUISettings:get(old_k)
-                    if val ~= nil then
-                        if SUISettings:get(new_k) == nil then
-                            SUISettings:set(new_k, val)
-                        end
-                        SUISettings:del(old_k)
-                        migrated = migrated + 1
-                    end
-                end
-                local icon_presets = SUISettings:get("simpleui_icon_presets")
-                if type(icon_presets) == "table" then
-                    local changed = false
-                    for _, preset in pairs(icon_presets) do
-                        if type(preset._scalar) == "table" then
-                            for _, pair in ipairs(icon_renames) do
-                                local old_k, new_k = pair[1], pair[2]
-                                if preset._scalar[old_k] ~= nil then
-                                    if preset._scalar[new_k] == nil then
-                                        preset._scalar[new_k] = preset._scalar[old_k]
-                                    end
-                                    preset._scalar[old_k] = nil
-                                    changed = true
-                                end
-                            end
-                        end
-                    end
-                    if changed then SUISettings:set("simpleui_icon_presets", icon_presets) end
-                end
-                SUISettings:flush()
-                logger.info("simpleui: settings migration v4 complete —", migrated, "icon keys renamed")
-            end)
-            SUISettings:set("simpleui_settings_migrated_v4", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
-        -- Settings migration v5: standardize titlebar button nomenclature
-        -- -------------------------------------------------------------------
-        if not SUISettings:isTrue("simpleui_settings_migrated_v5") then
-            pcall(function()
-                local renames = {
-                    { "simpleui_tb_item_menu_button",     "simpleui_tb_item_fm_menu" },
-                    { "simpleui_tb_item_up_button",       "simpleui_tb_item_fm_back" },
-                    { "simpleui_tb_item_search_button",   "simpleui_tb_item_fm_search" },
-                    { "simpleui_tb_item_browse_button",   "simpleui_tb_item_fm_browse" },
-                    { "simpleui_tb_item_title",           "simpleui_tb_item_fm_title" },
-                    { "simpleui_tb_item_inj_back",        "simpleui_tb_item_sub_menu" },
-                    { "simpleui_tb_item_inj_right",       "simpleui_tb_item_sub_close" },
-                    { "simpleui_tb_item_inj_menubutton",  "simpleui_tb_item_sub_menu" },
-                    { "simpleui_tb_item_inj_closebutton", "simpleui_tb_item_sub_close" },
-                    { "simpleui_tb_inj_cfg",              "simpleui_tb_sub_cfg" },
-                }
-                local migrated = 0
-                for _, pair in ipairs(renames) do
-                    local old_k, new_k = pair[1], pair[2]
-                    local val = SUISettings:get(old_k)
-                    if val ~= nil then
-                        if SUISettings:get(new_k) == nil then
-                            SUISettings:set(new_k, val)
-                        end
-                        SUISettings:del(old_k)
-                        migrated = migrated + 1
-                    end
-                end
-
-                local function map_cfg(cfg_key, mapping)
-                    local cfg = SUISettings:get(cfg_key)
-                    if type(cfg) == "table" then
-                        local changed = false
-                        local function map_arr(arr)
-                            for i, v in ipairs(arr) do
-                                if mapping[v] then arr[i] = mapping[v]; changed = true end
-                            end
-                        end
-                        if type(cfg.side) == "table" then
-                            for old_btn, new_btn in pairs(mapping) do
-                                if cfg.side[old_btn] ~= nil then
-                                    cfg.side[new_btn] = cfg.side[old_btn]
-                                    cfg.side[old_btn] = nil
-                                    changed = true
-                                end
-                            end
-                        end
-                        if type(cfg.order_left) == "table" then map_arr(cfg.order_left) end
-                        if type(cfg.order_right) == "table" then map_arr(cfg.order_right) end
-                        if changed then
-                            SUISettings:set(cfg_key, cfg)
-                            migrated = migrated + 1
-                        end
-                    end
-                end
-
-                local fm_map = {
-                    menu_button   = "fm_menu",
-                    up_button     = "fm_back",
-                    search_button = "fm_search",
-                    browse_button = "fm_browse",
-                    title         = "fm_title"
-                }
-                local sub_map = {
-                    inj_back         = "sub_menu",
-                    inj_right        = "sub_close",
-                    inj_menubutton   = "sub_menu",
-                    inj_closebutton  = "sub_close"
-                }
-                map_cfg("simpleui_tb_fm_cfg", fm_map)
-                map_cfg("simpleui_tb_sub_cfg", sub_map)
-
-                logger.info("simpleui: settings migration v5 complete —", migrated, "titlebar keys renamed")
-            end)
-            SUISettings:set("simpleui_settings_migrated_v5", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
-        -- Settings migration v6: namespace clean-up and key standardisation.
-        --
-        -- Changes applied:
-        --   1. Module enabled_key unification — bare module IDs (e.g. "currently",
-        --      "recent", "coverdeck", "tbr", "new_books", "collections",
-        --      "reading_goals") gain an explicit "_enabled" suffix to match the
-        --      convention already used by clock, reading_stats, action_list, etc.
-        --
-        --   2. module_coverdeck "flow_" prefix → "coverdeck_" prefix — the old
-        --      keys had no "simpleui_" namespace and risked collisions in the
-        --      shared G_reader_settings / SUISettings store.
-        --
-        --   3. simpleui_cqa_* → simpleui_qa_* — "cqa" was undocumented jargon;
-        --      "qa" matches the term used throughout the UI.  Also covers the
-        --      per-slot dynamic keys simpleui_cqa_{id} → simpleui_qa_{id}.
-        --
-        --   4. simpleui_collections_* → simpleui_coll_* — shorter, consistent
-        --      with the "fc_" brevity used by foldercovers.
-        --
-        --   5. simpleui_titlebar_custom → simpleui_tb_custom — aligns with the
-        --      tb_ alias used by all other titlebar keys.
-        --
-        --   6. simpleui_tb_size → simpleui_tb_size_pct — consistent with the
-        --      other size percentage keys (_bar_size_pct, _topbar_size_pct).
-        --
-        --   7. simpleui_bar_size (legacy enum "default"|"large") removed — this
-        --      key was only written by first-run defaults v1 and was never read
-        --      by any code path; the canonical value is simpleui_bar_size_pct.
-        --
-        -- Rules (identical to all previous migrations):
-        --   • Copy only when destination key is absent (never overwrite).
-        --   • Always delete the source key, even when copy is skipped.
-        --   • Whole block in pcall — a crash must not prevent plugin load.
-        --   • Guarded by simpleui_settings_migrated_v6.
-        -- -------------------------------------------------------------------
-        if not SUISettings:isTrue("simpleui_settings_migrated_v6") then
-            pcall(function()
-                local migrated = 0
-
-                -- ── Helper: rename a single key ───────────────────────────
-                local function _rename(old_k, new_k)
-                    local val = SUISettings:get(old_k)
-                    if val ~= nil then
-                        if SUISettings:get(new_k) == nil then
-                            SUISettings:set(new_k, val)
-                        end
-                        SUISettings:del(old_k)
-                        migrated = migrated + 1
-                    end
-                end
-
-                -- ── 1. Module enabled_key: add _enabled suffix ────────────
-                -- For each preset prefix that exists in SUISettings, rename
-                -- the bare module-id keys to module-id_enabled.
-                -- The only guaranteed preset prefix is "simpleui_hs_" but
-                -- user presets can have arbitrary prefixes — we scan all keys.
-                local bare_mods = {
-                    "currently", "recent", "coverdeck",
-                    "tbr", "new_books", "collections", "reading_goals",
-                }
-                -- Collect all unique prefixes that have at least one of the
-                -- bare keys so we don't have to hardcode "simpleui_hs_".
-                local prefixes_seen = {}
-                for k, _ in SUISettings:iterateKeys() do
-                    if type(k) == "string" then
-                        for _, mod_id in ipairs(bare_mods) do
-                            -- key must end exactly with the bare mod_id
-                            -- (no trailing chars) to avoid false matches
-                            local sfx = mod_id
-                            local klen, slen = #k, #sfx
-                            if klen > slen and k:sub(klen - slen + 1) == sfx
-                                    and k:sub(klen - slen) == "_" then
-                                local pfx = k:sub(1, klen - slen)
-                                prefixes_seen[pfx] = true
-                            end
-                        end
-                    end
-                end
-                for pfx in pairs(prefixes_seen) do
-                    for _, mod_id in ipairs(bare_mods) do
-                        _rename(pfx .. mod_id, pfx .. mod_id .. "_enabled")
-                    end
-                end
-
-                -- ── 2. module_coverdeck: flow_ → coverdeck_ ───────────────
-                -- These keys are prefixed with a homescreen preset prefix
-                -- (e.g. "simpleui_hs_") at runtime, so we scan all keys.
-                local flow_suffixes = {
-                    "flow_recent_source",
-                    "flow_stats_order",
-                    -- flow_show_{elem} keys are boolean per-element toggles;
-                    -- we catch them with the dynamic scan below.
-                }
-                local flow_pending = {}
-                for k, v in SUISettings:iterateKeys() do
-                    if type(k) == "string" then
-                        -- Fixed suffixes
-                        for _, sfx in ipairs(flow_suffixes) do
-                            if k:sub(- #sfx) == sfx then
-                                local pfx = k:sub(1, #k - #sfx)
-                                local new_sfx = sfx
-                                    :gsub("^flow_recent_source$", "coverdeck_source")
-                                    :gsub("^flow_stats_order$",   "coverdeck_stats_order")
-                                flow_pending[#flow_pending + 1] = {
-                                    old_k = k, new_k = pfx .. new_sfx, val = v
-                                }
-                                break
-                            end
-                        end
-                        -- Dynamic: flow_show_{anything} → coverdeck_show_{anything}
-                        local tail = k:match("_flow_show_(.+)$")
-                        if tail then
-                            local pfx = k:sub(1, #k - #("flow_show_" .. tail))
-                            flow_pending[#flow_pending + 1] = {
-                                old_k = k,
-                                new_k = pfx .. "coverdeck_show_" .. tail,
-                                val   = v,
-                            }
-                        end
-                    end
-                end
-                for _, e in ipairs(flow_pending) do
-                    if SUISettings:get(e.new_k) == nil then
-                        SUISettings:set(e.new_k, e.val)
-                    end
-                    SUISettings:del(e.old_k)
-                    migrated = migrated + 1
-                end
-
-                -- ── 3. simpleui_cqa_* → simpleui_qa_* ────────────────────
-                -- Covers: simpleui_cqa_list, simpleui_cqa_migrated_v1,
-                --         simpleui_cqa_custom_qa_{n}, simpleui_cqa_{id}
-                -- The migration-v3 target was "simpleui_cqa_*"; we now move
-                -- those to "simpleui_qa_*".
-                local cqa_pending = {}
-                for k, v in SUISettings:iterateKeys() do
-                    if type(k) == "string" and k:sub(1, 13) == "simpleui_cqa_" then
-                        cqa_pending[#cqa_pending + 1] = {
-                            old_k = k,
-                            new_k = "simpleui_qa_" .. k:sub(14),
-                            val   = v,
-                        }
-                    end
-                end
-                for _, e in ipairs(cqa_pending) do
-                    if SUISettings:get(e.new_k) == nil then
-                        SUISettings:set(e.new_k, e.val)
-                    end
-                    SUISettings:del(e.old_k)
-                    migrated = migrated + 1
-                end
-                -- Also fix the migration guard written by migrateOldCustomSlots.
-                _rename("simpleui_cqa_migrated_v1", "simpleui_qa_migrated_v1")
-
-                -- ── 4. simpleui_collections_* → simpleui_coll_* ──────────
-                local coll_renames = {
-                    { "simpleui_collections_list",           "simpleui_coll_list"           },
-                    { "simpleui_collections_covers",         "simpleui_coll_covers"         },
-                    { "simpleui_collections_badge_position", "simpleui_coll_badge_position" },
-                    { "simpleui_collections_badge_color",    "simpleui_coll_badge_color"    },
-                    { "simpleui_collections_badge_hidden",   "simpleui_coll_badge_hidden"   },
-                }
-                for _, pair in ipairs(coll_renames) do
-                    _rename(pair[1], pair[2])
-                end
-
-                -- ── 5. simpleui_titlebar_custom → simpleui_tb_custom ──────
-                _rename("simpleui_titlebar_custom", "simpleui_tb_custom")
-
-                -- ── 6. simpleui_tb_size → simpleui_tb_size_pct ───────────
-                _rename("simpleui_tb_size", "simpleui_tb_size_pct")
-
-                -- ── 7. Remove legacy simpleui_bar_size enum ───────────────
-                -- Never read by any code; only written by first-run defaults v1.
-                -- The canonical value is simpleui_bar_size_pct.
-                SUISettings:del("simpleui_bar_size")
-
-                SUISettings:flush()
-                logger.info("simpleui: settings migration v6 complete —", migrated, "keys renamed/removed")
-            end)
-            SUISettings:set("simpleui_settings_migrated_v6", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
-
-        -- Settings migration v7:
-        -- 1. Restore coverdeck_show_title when written as false by the
-        --    "Momentum" preset but never explicitly toggled by the user.
-        --    Detects the exact Momentum signature (title=false, author=false,
-        --    progress=true, percent=true, book_days=true) and resets to true.
-        -- 2. Enable recent_show_finished when it has never been set, so users
-        --    upgrading from 1.5.x (where the filter did not exist) don't find
-        --    Recent Books / Cover Deck empty because all their books are at 100%.
-        -- 3. Enable the automatic update check when it has never been set,
-        --    making auto-check opt-out instead of opt-in.
-        if not SUISettings:isTrue("simpleui_settings_migrated_v7") then
-            pcall(function()
-                local PFX       = "simpleui_hs_"
-                -- 1. coverdeck_show_title
-                local title     = SUISettings:get(PFX .. "coverdeck_show_title")
-                local author    = SUISettings:get(PFX .. "coverdeck_show_author")
-                local progress  = SUISettings:get(PFX .. "coverdeck_show_progress")
-                local percent   = SUISettings:get(PFX .. "coverdeck_show_percent")
-                local book_days = SUISettings:get(PFX .. "coverdeck_show_book_days")
-                if title == false and author == false
-                        and progress == true and percent == true
-                        and book_days == true then
-                    SUISettings:set(PFX .. "coverdeck_show_title", true)
-                    logger.info("simpleui: migration v7 — restored coverdeck_show_title to true")
-                end
-                -- 2. recent_show_finished
-                if SUISettings:get(PFX .. "recent_show_finished") == nil then
-                    SUISettings:set(PFX .. "recent_show_finished", true)
-                    logger.info("simpleui: migration v7 — enabled recent_show_finished")
-                end
-                -- 3. auto update check
-                if SUISettings:get("simpleui_updater_auto_check") == nil then
-                    SUISettings:set("simpleui_updater_auto_check", true)
-                    logger.info("simpleui: migration v7 — enabled simpleui_updater_auto_check")
-                end
-            end)
-            SUISettings:set("simpleui_settings_migrated_v7", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
-
-        -- Settings migration v8:
-        -- Introduces the unified Cover Deck arrange list (coverdeck_main_order),
-        -- replacing the old coverdeck_title_pos above/below/hidden radio and
-        -- the separate "Show status bar" toggle for the progress bar.
-        --   1. Legacy title_pos == "hidden" had no dedicated key of its own;
-        --      fold it into coverdeck_show_title so upgrading users keep the
-        --      title hidden instead of it reappearing under the new model.
-        --   2. coverdeck_main_order is seeded from title_pos ("above"/"below")
-        --      so existing layouts render identically the first time they're
-        --      opened under the new arrange list, instead of silently
-        --      reverting to the "below" default.
-        if not SUISettings:isTrue("simpleui_settings_migrated_v8") then
-            pcall(function()
-                local PFX       = "simpleui_hs_"
-                local title_pos = SUISettings:get(PFX .. "coverdeck_title_pos")
-                if title_pos == "hidden" and SUISettings:get(PFX .. "coverdeck_show_title") == nil then
-                    SUISettings:set(PFX .. "coverdeck_show_title", false)
-                    logger.info("simpleui: migration v8 — folded coverdeck_title_pos=hidden into coverdeck_show_title=false")
-                end
-                if SUISettings:get(PFX .. "coverdeck_main_order") == nil then
-                    local order = (title_pos == "above")
-                        and { "title", "author", "covers", "progress", "stats" }
-                        or  { "covers", "title", "author", "progress", "stats" }
-                    SUISettings:set(PFX .. "coverdeck_main_order", order)
-                    logger.info("simpleui: migration v8 — seeded coverdeck_main_order from legacy title_pos")
-                end
-            end)
-            SUISettings:set("simpleui_settings_migrated_v8", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
-
-        -- Settings migration v9:
-        -- Selects the tabs title bar style when no style was ever chosen.
-        -- An explicit choice, including classic, is kept.
-        if not SUISettings:isTrue("simpleui_settings_migrated_v9") then
-            pcall(function()
-                if SUISettings:get("simpleui_tb_style") == nil then
-                    SUISettings:set("simpleui_tb_style", "tabs")
-                    logger.info("simpleui: migration v9 — title bar style set to tabs")
-                end
-            end)
-            SUISettings:set("simpleui_settings_migrated_v9", true)
-            SUISettings:flush()
-        end
-        -- -------------------------------------------------------------------
 
         Config.applyFirstRunDefaults()
         Config.migrateOldCustomSlots()
@@ -971,7 +291,7 @@ function SimpleUIPlugin:init()
 
         if SUISettings:nilOrTrue("simpleui_enabled") then
             Patches.installAll(self)
-            
+
             pcall(function() QSBar.install() end)
             -- Register the TBR button in the Library hold dialog (single book).
             -- addFileDialogButtons is the official KOReader API for this.
@@ -1097,23 +417,21 @@ function SimpleUIPlugin:init()
                     if not is_file then return nil end
                     if not BM.isEnabled() then return nil end
 
-                    local authors_raw = book_props and book_props.authors
-                    if not authors_raw or authors_raw == "" then return nil end
-                    -- Multi-author: newline-delimited.  Navigate to the first
-                    -- author only; a picker would be over-engineering for v1.
-                    local author = authors_raw:match("^([^\n]+)") or authors_raw
-                    author = author:match("^%s*(.-)%s*$") -- trim whitespace
+                    -- Multi-author: navigates to the first author only.
+                    local author = Text.firstLine(book_props and book_props.authors)
+                    if not author then return nil end
 
                     local fc2 = FM2.instance and FM2.instance.file_chooser
                     local count = BM.getAuthorBookCount(fc2, author)
                     if count < 2 then return nil end
 
                     return {{
-                        text = string.format(_("More by %s (%d)"), author, count),
+                        text     = string.format(_("More by %s (%d)"), author, count),
+                        sui_icon = "author",
                         callback = function()
                             if close_cb then close_cb() end
                             local fm2 = FM2.instance
-                            if fm2 then BM.navigateToAuthorLeaf(fm2, author, file) end
+                            if fm2 then BM.navigateToLeaf(fm2, "author", author, { origin_file = file }) end
                         end,
                     }}
                 end
@@ -1160,14 +478,11 @@ function SimpleUIPlugin:init()
                         or (ok_bl and BL and BL.hasBookBeenOpened(file))
                     if not is_book then return nil end
                     return {{
-                        text = _("Book statistics"),
+                        text     = _("Book statistics"),
+                        sui_icon = "chart",
                         callback = function()
                             if close_cb then close_cb() end
-                            local ok_sw, SW = pcall(require, "screens/sui_stats_windows")
-                            if ok_sw and SW then
-                                if SW.showLoadingNotice then SW.showLoadingNotice() end
-                                SW.showBookStatsFromFile(file)
-                            end
+                            require("screens/sui_stats_launcher").open("book", { filepath = file })
                         end,
                     }}
                 end
@@ -1241,44 +556,6 @@ function SimpleUIPlugin:init()
     end)
     if not ok then logger.err("simpleui: init failed:", tostring(err)) end
 end
-
--- ---------------------------------------------------------------------------
--- List of all plugin-owned Lua modules that must be evicted from
--- package.loaded on teardown so that a hot plugin update (replacing files
--- without restarting KOReader) always loads fresh code.
--- ---------------------------------------------------------------------------
-local _PLUGIN_MODULES = {
-    "infra/sui_i18n", "infra/sui_config", "infra/sui_core", "screens/sui_bottombar", "screens/sui_topbar",
-    "infra/sui_patches", "screens/sui_menu", "screens/sui_titlebar", "features/sui_quickactions",
-    "screens/sui_homescreen", "features/library/sui_foldercovers", "features/library/sui_library_browse", "infra/sui_updater",
-    "features/library/sui_series_grouping", "features/library/sui_cover_widgets",
-    "features/library/sui_filter_state", "features/library/sui_virtual_path",
-    "features/library/sui_metadata_source", "features/library/sui_cover_overrides",
-    "features/library/sui_group_actions", "features/library/sui_cover_finder",
-    "features/library/sui_metadata_providers",
-    "infra/sui_store", "features/sui_presets", "features/sui_style",
-    "screens/sui_settings_window",
-    "screens/sui_quicksettings_bar",
-    "modules/moduleregistry",
-    "modules/module_books_shared",
-    "modules/module_clock",
-    "modules/module_collections",
-    "modules/module_currently",
-    "modules/module_quick_actions",
-    "modules/module_quote",
-    "modules/module_reading_goals",
-    "modules/module_reading_stats",
-    "modules/module_stats_provider",
-    "engines/sui_book_grid",
-    "modules/module_recent",
-    "modules/module_new_books",
-    "modules/module_tbr",
-    "modules/module_feat_coll",
-    "modules/quotes",
-    "infra/sui_custom_screens",
-    "engines/sui_screen_engine",
-    "features/sui_wallpaper",
-}
 
 -- ---------------------------------------------------------------------------
 -- Dispatcher gesture handlers
@@ -1375,7 +652,7 @@ end
 --
 -- We close every currently live screen, EXCEPT one that is currently
 -- soft-parked (see ScreenWidget:onShowingReader / ScreenEngine.
--- SOFT_PARK_ENABLED in engines/sui_screen_engine.lua) — closing it here
+-- isSoftParkEnabled in engines/sui_screen_engine.lua) — closing it here
 -- would immediately undo what onShowingReader just decided to keep alive
 -- for a warm reader-return. By construction there is never more than one
 -- parked screen at a time (onShowingReader only parks when it is the sole
@@ -1439,6 +716,12 @@ function SimpleUIPlugin:onRestart()
 end
 
 function SimpleUIPlugin:onCloseWidget()
+    -- The host UI is closing: stop this instance's clock, which would
+    -- otherwise keep rescheduling itself and keep the instance alive.
+    if self._topbar_timer then
+        UIManager:unschedule(self._topbar_timer)
+        self._topbar_timer = nil
+    end
     local ScreenEngine = package.loaded["engines/sui_screen_engine"]
     if not ScreenEngine then return end
     local exiting = UIManager._simpleui_exiting or UIManager._exit_code ~= nil
@@ -1452,6 +735,25 @@ function SimpleUIPlugin:onCloseWidget()
     end
 end
 
+-- Removes the file-dialog button `id` from the file manager and from the
+-- file searcher's shared button table, keeping that table's index consistent.
+local function _removeFileDialogButton(id, FM, FS)
+    if FM and FM.instance and FM.instance.removeFileDialogButtons then
+        pcall(function() FM.instance:removeFileDialogButtons(id) end)
+    end
+    local buttons = FS and FS.file_dialog_added_buttons
+    local idx = buttons and buttons.index and buttons.index[id]
+    if not idx then return end
+    pcall(function()
+        table.remove(buttons, idx)
+        buttons.index[id] = nil
+        for other, i in pairs(buttons.index) do
+            if i > idx then buttons.index[other] = i - 1 end
+        end
+        if #buttons == 0 then FS.file_dialog_added_buttons = nil end
+    end)
+end
+
 function SimpleUIPlugin:onTeardown()
     -- Flush the plugin settings store so any in-memory writes are persisted
     -- before the plugin is unloaded or KOReader exits.
@@ -1461,107 +763,29 @@ function SimpleUIPlugin:onTeardown()
         self._topbar_timer = nil
     end
     Patches.teardownAll(self)
+    -- Hand the UI font slots back to the system font before the module cache
+    -- is cleared.
+    local style = package.loaded["features/sui_style"]
+    if style and style.restoreUIFont then pcall(style.restoreUIFont) end
     pcall(function() QSBar.uninstall() end)
     I18n.uninstall()
-    -- Give modules with internal upvalue caches a chance to nil them before
-    -- their package.loaded entry is cleared — ensures the GC can collect the
-    -- old tables immediately rather than waiting for the upvalue to be rebound.
-    local mod_recent = package.loaded["modules/module_recent"]
-    if mod_recent and type(mod_recent.reset) == "function" then pcall(mod_recent.reset) end
-    local mod_new_books = package.loaded["modules/module_new_books"]
-    if mod_new_books and type(mod_new_books.reset) == "function" then pcall(mod_new_books.reset) end
-    local mod_tbr = package.loaded["modules/module_tbr"]
-    if mod_tbr and type(mod_tbr.reset) == "function" then
-        pcall(mod_tbr.reset)
-    end
-    -- Remove the TBR button from the Library browser dialog and search results.
+    -- Give modules with internal caches and scheduled work a chance to
+    -- release them before their package.loaded entry is cleared, so the GC
+    -- can collect the old tables right away.
+    Memory.reset()
     local FM = package.loaded["apps/filemanager/filemanager"]
-    if FM and FM.instance and FM.instance.removeFileDialogButtons then
-        pcall(function() FM.instance:removeFileDialogButtons("sui_tbr") end)
-    end
-    -- Remove the TBR button from the FileSearcher table and restore the original onMenuHold.
     local FS = package.loaded["apps/filemanager/filemanagerfilesearcher"]
-    if FS then
-        -- Restore the original onMenuHold if it was replaced.
-        if FS._sui_onMenuHold_patched and FS._sui_orig_onMenuHold then
+    -- Restore the FileSearcher's original onMenuHold if it was replaced. When
+    -- the original was captured in the patch's closure, only the flag is cleared.
+    if FS and FS._sui_onMenuHold_patched then
+        if FS._sui_orig_onMenuHold then
             FS.onMenuHold = FS._sui_orig_onMenuHold
             FS._sui_orig_onMenuHold = nil
-            FS._sui_onMenuHold_patched = nil
-        elseif FS._sui_onMenuHold_patched then
-            -- Patch was installed but orig was not saved separately
-            -- (captured in the closure); just clear the flag and TBR entry.
-            FS._sui_onMenuHold_patched = nil
         end
-        if FS.file_dialog_added_buttons then
-            local idx = FS.file_dialog_added_buttons.index
-                and FS.file_dialog_added_buttons.index["sui_tbr"]
-            if idx then
-                pcall(function()
-                    table.remove(FS.file_dialog_added_buttons, idx)
-                    FS.file_dialog_added_buttons.index["sui_tbr"] = nil
-                    for id, i in pairs(FS.file_dialog_added_buttons.index) do
-                        if i > idx then
-                            FS.file_dialog_added_buttons.index[id] = i - 1
-                        end
-                    end
-                    if #FS.file_dialog_added_buttons == 0 then
-                        FS.file_dialog_added_buttons = nil
-                    end
-                end)
-            end
-        end
+        FS._sui_onMenuHold_patched = nil
     end
-    -- Remove the "More by <Author>" button from the Library browser and FileSearcher.
-    if FM and FM.instance and FM.instance.removeFileDialogButtons then
-        pcall(function() FM.instance:removeFileDialogButtons("sui_browse_author") end)
-    end
-    if FS and FS.file_dialog_added_buttons then
-        local idx2 = FS.file_dialog_added_buttons.index
-            and FS.file_dialog_added_buttons.index["sui_browse_author"]
-        if idx2 then
-            pcall(function()
-                table.remove(FS.file_dialog_added_buttons, idx2)
-                FS.file_dialog_added_buttons.index["sui_browse_author"] = nil
-                for id, i in pairs(FS.file_dialog_added_buttons.index) do
-                    if i > idx2 then
-                        FS.file_dialog_added_buttons.index[id] = i - 1
-                    end
-                end
-                if #FS.file_dialog_added_buttons == 0 then
-                    FS.file_dialog_added_buttons = nil
-                end
-            end)
-        end
-    end
-    local mod_rg = package.loaded["modules/module_reading_goals"]
-    if mod_rg and type(mod_rg.reset) == "function" then
-        pcall(mod_rg.reset)
-    end
-    -- Remove the "Book statistics" button from the Library browser and FileSearcher.
-    if FM and FM.instance and FM.instance.removeFileDialogButtons then
-        pcall(function() FM.instance:removeFileDialogButtons("sui_book_stats") end)
-    end
-    if FS and FS.file_dialog_added_buttons then
-        local idx = FS.file_dialog_added_buttons.index
-            and FS.file_dialog_added_buttons.index["sui_book_stats"]
-        if idx then
-            pcall(function()
-                table.remove(FS.file_dialog_added_buttons, idx)
-                FS.file_dialog_added_buttons.index["sui_book_stats"] = nil
-                for id, i in pairs(FS.file_dialog_added_buttons.index) do
-                    if i > idx then
-                        FS.file_dialog_added_buttons.index[id] = i - 1
-                    end
-                end
-                if #FS.file_dialog_added_buttons == 0 then
-                    FS.file_dialog_added_buttons = nil
-                end
-            end)
-        end
-    end
-    local mod_bm = package.loaded["features/library/sui_library_browse"]
-    if mod_bm and type(mod_bm.reset) == "function" then
-        pcall(mod_bm.reset)
+    for _, button_id in ipairs({ "sui_tbr", "sui_browse_author", "sui_book_stats" }) do
+        _removeFileDialogButton(button_id, FM, FS)
     end
     -- Evict all plugin modules from the Lua module cache so that a hot update
     -- (files replaced on disk without restarting KOReader) picks up new code
@@ -1581,9 +805,10 @@ function SimpleUIPlugin:onTeardown()
     if ok_cfg and Cfg and Cfg.endStatsSyncGuard then
         Cfg.endStatsSyncGuard()
     end
-    for _, mod in ipairs(_PLUGIN_MODULES) do
-        package.loaded[mod] = nil
-    end
+    require("infra/sui_paths").unloadModules()
+    -- Reclaim the unloaded plugin's heap and native buffers before the reader
+    -- starts allocating.
+    collectgarbage("collect")
 end
 
 -- ---------------------------------------------------------------------------
@@ -1658,6 +883,9 @@ end
 
 function SimpleUIPlugin:onSuspend()
     self._simpleui_suspended = true
+    self._suspended_at = os.time()
+    -- Windows opened over a screen do not outlive the suspend.
+    pcall(function() require("engines/sui_window").closeAll() end)
     -- Snapshot whether the reader was open at the moment of suspend.
     -- We cannot rely on RUI.instance being intact by the time onResume fires
     -- (e.g. autosuspend can race with a reader teardown on some Kobo builds),
@@ -1680,6 +908,12 @@ end
 
 function SimpleUIPlugin:onResume()
     self._simpleui_suspended = false
+    -- Time asleep is not reading time.
+    local session = self._critter_session
+    if session and self._suspended_at then
+        session.paused = (session.paused or 0) + math.max(0, os.time() - self._suspended_at)
+    end
+    self._suspended_at = nil
     if SUISettings:nilOrTrue("simpleui_topbar_enabled") then
         -- Small delay to let the wakeup transition finish before refreshing
         -- the topbar. Avoids a race with ScreenWidget:onResume() and
@@ -1756,7 +990,26 @@ function SimpleUIPlugin:onResume()
     end
 end
 
+-- Reading session of a book that is being reloaded, handed to the reader that replaces it.
+local _carried_session
+
 function SimpleUIPlugin:onReaderReady()
+    -- Start of the reading session, which the critter reacts to when the book closes;
+    -- a reload of the same book continues the session it interrupted.
+    local doc_settings = self.ui and self.ui.doc_settings
+    local book_summary = doc_settings and doc_settings:readSetting("summary")
+    local file = self.ui and self.ui.document and self.ui.document.file
+    local carried = _carried_session
+    _carried_session = nil
+    if carried and file and carried.file == file then
+        self._critter_session = carried
+    else
+        self._critter_session = {
+            at = os.time(), file = file, paused = 0,
+            status = book_summary and book_summary.status or nil,
+        }
+    end
+
     -- Warm the sidecar cache for the opened book from the reader's own
     -- in-memory settings, so that onCloseDocument has access to its
     -- pre-session summary state even if the file browser didn't scan it
@@ -1779,6 +1032,31 @@ function SimpleUIPlugin:onReaderReady()
     })
 end
 
+-- Makes the critter react to what the reading session that ends now left behind:
+-- a book finished and the session itself, and notes the session for the day's
+-- challenge. Does nothing without a session.
+function SimpleUIPlugin:_recordCritterReactions()
+    local session = self._critter_session
+    self._critter_session = nil
+    local doc_settings = self.ui and self.ui.doc_settings
+    if not (session and doc_settings) then return end
+    local summary = doc_settings:readSetting("summary")
+    local props = doc_settings:readSetting("doc_props")
+    local ok, err = pcall(function()
+        local Reactions = require("modules/critter/reactions")
+        for _i, reaction in ipairs(Reactions.closeReactions(
+                session, summary and summary.status, props and props.title, os.time())) do
+            Reactions.record(reaction.kind, reaction.data)
+        end
+        -- A session started in time may meet a deadline challenge.
+        local Challenge = require("modules/critter/challenge")
+        local state = Challenge.read()
+        local updated = Challenge.sessionStarted(state, session.at)
+        if updated ~= state then Challenge.write(updated) end
+    end)
+    if not ok then logger.warn("simpleui: critter reactions failed: " .. tostring(err)) end
+end
+
 function SimpleUIPlugin:onCloseDocument()
     -- Consume _closing_via_gesture unconditionally before any early return,
     -- so the flag never leaks to a subsequent close if this handler bails out
@@ -1798,9 +1076,16 @@ function SimpleUIPlugin:onCloseDocument()
     local is_reload = self._suppress_closing_notice
     self._suppress_closing_notice = nil
 
+    if is_reload then
+        _carried_session = self._critter_session
+    end
     if self._simpleui_suspended then return end
+    if not is_reload then self:_recordCritterReactions() end
     local ScreenEngine = package.loaded["engines/sui_screen_engine"]
     if not ScreenEngine then return end
+
+    local Perf = require("infra/sui_perf")
+    if not is_reload then Perf.begin("onCloseDocument") end
 
     -- Filepath of the book that just closed. readhistory.hist[1] is still the
     -- closing book at this point (the reader has not yet handed control back
@@ -1820,9 +1105,8 @@ function SimpleUIPlugin:onCloseDocument()
     -- silently falls through to the ordinary text notice further down.
     local cover_shown = false
     if not is_reload then
-        local Patches = package.loaded["infra/sui_patches"]
         if Patches and Patches.CoverTransition and Patches.CoverTransition.isCloseEnabled() then
-            local orig_show = UIManager._simpleui_show_orig or UIManager.show
+            local orig_show = WindowHooks.origShow()
             local live_doc  = self.ui and self.ui.document
             local ok_ct, shown = pcall(Patches.CoverTransition.show, closed_fp, orig_show, live_doc)
             cover_shown = ok_ct and shown
@@ -1930,10 +1214,8 @@ function SimpleUIPlugin:onCloseDocument()
     -- once per screen here, then reused by every block below instead of each
     -- block re-deciding activity against a single hardcoded pfx.
     local mod_rg   = Registry.get("reading_goals")
-    local mod_rs   = Registry.get("reading_stats")
     local mod_cr   = Registry.get("currently")
     local mod_cd   = Registry.get("coverdeck")
-    local all_mods = Registry.list()
 
     local stats_active_for     = {}
     local currently_active_for = {}
@@ -1946,15 +1228,7 @@ function SimpleUIPlugin:onCloseDocument()
         local pfx = ScreenEngine.getPfx(id)
 
         local s_active = (mod_rg and Registry.isEnabled(mod_rg, pfx))
-            or (mod_rs and mod_rs.isEnabled and mod_rs.isEnabled(pfx))
-        if not s_active then
-            for _, mod in ipairs(all_mods) do
-                if mod.needs and mod.needs.stats and Registry.isEnabled(mod, pfx) then
-                    s_active = true
-                    break
-                end
-            end
-        end
+            or Registry.wantsData(pfx, "stats")
         stats_active_for[id] = s_active
         any_stats_active = any_stats_active or s_active
 
@@ -1972,22 +1246,17 @@ function SimpleUIPlugin:onCloseDocument()
     local any_needs_refresh = false
 
     -- Invalidate the shared stats provider when any known screen has a stats
-    -- module active. One SP.invalidate() covers both reading_goals and
+    -- module active. One invalidation covers both reading_goals and
     -- reading_stats — they both read ctx.stats which is populated from
     -- StatsProvider.get(). StatsProvider is a single provider shared by every
     -- screen (not per-screen state), so this whole block still runs at most
     -- once per close, regardless of how many screens use it.
     --
-    -- Optimisation: SP contains two parts — DB time-series (always stale after
-    -- a reading session) and books_year/books_total (sidecar scan, expensive).
-    -- The sidecar-derived counts only change when the closed book's
-    -- summary.status transitions to or from "complete". We detect this by
-    -- comparing the cached pre-session status (from SH._cacheGet, still valid
-    -- at this point) with the on-disk status (one DS.open on the closed book).
-    -- If neither was "complete" and neither is now, the counts are unchanged
-    -- and we can spare the full SP.invalidate() — instead we call
-    -- SP.invalidateTimeSeries() which discards only the DB-derived fields,
-    -- leaving books_year/books_total intact in the cache.
+    -- A reading session always changes the DB-derived time series. The
+    -- finished-book counts come from the provider's ledger, which is synced
+    -- from the closed book's live settings — they stay valid until
+    -- UIManager:close() → onCloseWidget, which runs after this handler — and
+    -- are recounted only when that sync changed the ledger.
     if any_stats_active then
         local SP = package.loaded["modules/module_stats_provider"]
         -- Fall back to pcall require: the module may not be in package.loaded yet
@@ -1998,152 +1267,10 @@ function SimpleUIPlugin:onCloseDocument()
             if ok_sp then SP = m end
         end
         if SP then
-            local status_changed = true  -- default: full invalidation (safe)
-            -- True when the cached library status counts were adjusted for the
-            -- closed book and need no recount.
-            local status_counts_patched = false
-            if closed_fp and SP.invalidateTimeSeries then
-                local SH = package.loaded["modules/module_books_shared"]
-                -- Pre-session status: read from sidecar cache (no I/O).
-                -- The cache entry is still valid here — SH.invalidateSidecarCache
-                -- for closed_fp runs later in this function, after this block.
-                --
-                -- cache_hit: true only when _cacheGetRaw found a real entry.
-                -- A miss (book outside the prefetch window) means we cannot
-                -- determine the pre-session status from the cache, so we must
-                -- not assume the book just became complete — it may have been
-                -- complete for years.
-                local pre_status, pre_percent
-                local cache_hit = false
-                if SH and (SH._cacheGetRaw or SH._cacheGet) then
-                    local cached = (SH._cacheGetRaw or SH._cacheGet)(closed_fp)
-                    if cached then
-                        cache_hit = true
-                        local s = cached.summary
-                        pre_status  = type(s) == "table" and s.status or nil
-                        pre_percent = cached.percent
-                    end
-                end
-                -- Post-session status and progress: read from the live reader.
-                -- The status comes from the in-memory doc_settings; the progress
-                -- from the footer, which tracks the current page (doc_settings
-                -- only receives it when the settings are saved). Both stay valid
-                -- until UIManager:close() → onCloseWidget, which runs after this
-                -- handler, so no DS.open is needed.
-                local post_status, post_percent
-                local RUI = package.loaded["apps/reader/readerui"]
-                if RUI and RUI.instance and type(RUI.instance.doc_settings) == "table" then
-                    local s = RUI.instance.doc_settings:readSetting("summary")
-                    post_status  = type(s) == "table" and s.status or nil
-                    local footer = RUI.instance.view and RUI.instance.view.footer
-                    post_percent = footer and footer.percent_finished
-                        or RUI.instance.doc_settings:readSetting("percent_finished")
-                end
-                local pre_complete  = pre_status  == "complete"
-                local post_complete = post_status == "complete"
-                -- status_changed: a genuine complete/not-complete transition.
-                -- Only trust the transition when we had a real cache hit; on a
-                -- cache miss we cannot distinguish "was already complete" from
-                -- "first seen as complete", so fall back to safe full invalidation
-                -- (status_changed = true) without writing date_finished.
-                if cache_hit then
-                    status_changed = pre_complete ~= post_complete
-                    -- Keep the library-wide status counts current by moving
-                    -- this one book between buckets instead of recounting.
-                    if SP.applyStatusChange then
-                        SP.applyStatusChange(closed_fp, pre_percent, pre_status,
-                                             post_percent, post_status)
-                        status_counts_patched = true
-                    end
-                else
-                    -- Cache miss: assume counts may have changed (safe default).
-                    -- pre_complete is unknown, so treat it as equal to post_complete
-                    -- to avoid spurious date_finished writes below.
-                    status_changed = true
-                    pre_complete   = post_complete  -- suppress the date_finished today-fallback
-                end
-
-                -- Auto-populate date_finished if missing for a completed book.
-                -- Sources tried in priority order:
-                --   1. pre_s.date_finished (already a SimpleUI string) — ONLY
-                --        trusted when the book was already complete before this
-                --        session (pre_complete), i.e. it genuinely describes a
-                --        prior completion.
-                --   2. pre_s.modified      (the sidecar's pre-session modified)
-                --        — ONLY trusted under the same pre_complete condition.
-                --        IMPORTANT: filemanagerutil.saveSummary (and
-                --        readerstatus.lua) overwrite summary.modified with
-                --        today's date on EVERY status change, not just on
-                --        completion — tapping "Reading" the day the book was
-                --        started stamps that same date into `modified`. If we
-                --        used pre_s.modified regardless of pre_complete, a
-                --        *genuine new* completion would pick up that stale
-                --        status-change date instead of today, making
-                --        date_finished collapse onto date_started. So this
-                --        source is gated on pre_complete exactly like #1.
-                --   3. Today's date        — used whenever this is a genuine
-                --        new completion (cache_hit AND not pre_complete).
-                --        Never written on a cache miss, because we cannot
-                --        distinguish a genuine new completion from an
-                --        already-complete book outside the prefetch window.
-                if post_complete and closed_fp then
-                    if RUI and RUI.instance and type(RUI.instance.doc_settings) == "table" then
-                        local s = RUI.instance.doc_settings:readSetting("summary") or {}
-                        if not s.date_finished then
-                            local finished_date
-                            if cache_hit then
-                                if pre_complete then
-                                    local cached = SH and (SH._cacheGetRaw or SH._cacheGet) and
-                                                   (SH._cacheGetRaw or SH._cacheGet)(closed_fp)
-                                    local pre_s  = cached and cached.summary
-                                    if type(pre_s) == "table" then
-                                        if type(pre_s.date_finished) == "string" then
-                                            finished_date = pre_s.date_finished
-                                        elseif type(pre_s.modified) == "string" then
-                                            -- filemanagerutil.saveSummary writes modified as
-                                            -- "YYYY-MM-DD" when the user taps a status button.
-                                            -- Safe here because pre_complete confirms the book
-                                            -- was already "complete" before this session, so
-                                            -- this modified date genuinely was the completion
-                                            -- date (books marked complete before SimpleUI).
-                                            finished_date = pre_s.modified
-                                        elseif type(pre_s.modified) == "number" then
-                                            finished_date = os.date("%Y-%m-%d", pre_s.modified)
-                                        elseif type(pre_s.modified) == "table" and pre_s.modified.year then
-                                            finished_date = string.format("%04d-%02d-%02d",
-                                                pre_s.modified.year, pre_s.modified.month, pre_s.modified.day)
-                                        end
-                                    end
-                                end
-                                -- Genuine new completion this session: pre_s.date_finished/
-                                -- modified (if any) describe an unrelated earlier status
-                                -- change, not this completion — always use today instead.
-                                if not finished_date and not pre_complete then
-                                    finished_date = os.date("%Y-%m-%d")
-                                end
-                            end
-                            -- cache_hit = false → finished_date stays nil → nothing written.
-                            -- The book keeps no date_finished until the next screen open
-                            -- warms the sidecar cache, after which the next close will
-                            -- succeed via the cache-hit path above.
-                            if finished_date then
-                                s.date_finished = finished_date
-                                RUI.instance.doc_settings:saveSetting("summary", s)
-                                RUI.instance.doc_settings:flush()
-                            end
-                        end
-                    end
-                end
-            end
-
-            if status_changed then
-                SP.invalidate(status_counts_patched)
-            elseif SP.invalidateTimeSeries then
-                -- Counts unchanged: only discard DB-derived fields (time, pages,
-                -- streak). books_year/books_total survive in the cache intact.
+            if closed_fp then
+                SP.syncClosedBook(closed_fp)
                 SP.invalidateTimeSeries()
             else
-                -- SP.invalidateTimeSeries not available (older version): fall back.
                 SP.invalidate()
             end
             for _, id in ipairs(screen_ids) do
@@ -2288,6 +1415,7 @@ function SimpleUIPlugin:onCloseDocument()
         end
     end
 
+    Perf.mark("onCloseDocument invalidation done")
     if not any_needs_refresh then return end
 
     -- Invalidate the sidecar mtime-cache entry for the closed book once, if
@@ -2500,8 +1628,6 @@ function SimpleUIPlugin:_updateFMHomeIcon() end
 -- ---------------------------------------------------------------------------
 -- Main menu entry (sui_menu is lazy-loaded on first access)
 -- ---------------------------------------------------------------------------
-
-local _menu_installer = nil
 
 function SimpleUIPlugin:addToMainMenu(menu_items)
     local _ = require("infra/sui_i18n").translate

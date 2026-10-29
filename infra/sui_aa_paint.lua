@@ -14,12 +14,17 @@
 -- Also draws rounded fills and borders straight onto a target buffer
 -- (fillRoundedRect / strokeRoundedRect), used by the shared backdrop painter.
 --
+-- Shapes that repeat across paints are rasterised once into an 8-bit coverage
+-- mask (buildMask) and kept in the shared raster cache; painting is then a
+-- single colorblitFromRGB32.
+--
 -- Used by modules/module_clock.lua (analogue clock face),
 -- modules/module_reading_goals.lua (goal progress rings),
--- engines/sui_quickactions_render.lua (quick-action tile background/border),
+-- infra/sui_backdrop.lua (rounded backdrops and frames),
 -- and features/library/sui_cover_widgets.lua (progress pentagon badge).
 
-local Blitbuffer = require("ffi/blitbuffer")
+local Blitbuffer  = require("ffi/blitbuffer")
+local RasterCache = require("infra/sui_raster_cache")
 
 local M = {}
 
@@ -34,6 +39,18 @@ function M.blendPixel(bb, px, py, cov, x0, y0, x1, y1)
     if cov > 1 then cov = 1 end
     local g = bb:getPixel(px, py):getColor8().a
     bb:setPixel(px, py, Blitbuffer.Color8(math.floor(g * (1 - cov) + 0.5)))
+end
+
+-- Rasterises a shape into a new w x h 8-bit coverage mask. `paint` receives
+-- the white-filled buffer and draws the shape in black ink with the primitives
+-- below; the buffer is then inverted so that ink becomes coverage. Composite
+-- the mask with colorblitFromRGB32. The caller owns the returned buffer.
+function M.buildMask(w, h, paint)
+    local mask = Blitbuffer.new(w, h, Blitbuffer.TYPE_BB8)
+    mask:fill(Blitbuffer.COLOR_WHITE)
+    paint(mask)
+    mask:invertRect(0, 0, w, h)
+    return mask
 end
 
 -- Paints an anti-aliased capsule (a straight stroke of full width `width`,
@@ -116,6 +133,8 @@ function M.paintRoundedRectStroke(bb, x, y, w, h, radius, thickness, x0, y0, x1,
     end
 end
 
+local _DEFAULT_TRACK_COV = 0.32
+
 -- Paints a progress ring (hollow arc) centred at (cx, cy).
 --
 -- outer_r    : outer radius of the ring in pixels
@@ -125,17 +144,16 @@ end
 --              track reads lighter than the progress arc after alpha-mask
 --              recolouring. Pass 0 to omit the track.
 --
--- Angle convention matches bookends' radial bars and the analogue clock:
--- 0 at 12 o'clock, increasing clockwise. Progress fills from 12 o'clock.
+-- Angle convention matches the analogue clock: 0 at 12 o'clock, increasing
+-- clockwise. Progress fills from 12 o'clock.
 --
 -- Drawn in BLACK (or partial grey via track_cov) into an offscreen 8-bit
--- buffer for compositing via UI.paintWithAlphaMask — same pipeline as the
--- analogue clock face.
+-- buffer; see ringMask for the cached, ready-to-blit form.
 function M.paintRingProgress(bb, cx, cy, outer_r, thickness, fraction, x0, y0, x1, y1, track_cov)
     if outer_r < 1 or thickness < 1 then return end
     fraction = fraction or 0
     if fraction < 0 then fraction = 0 elseif fraction > 1 then fraction = 1 end
-    if track_cov == nil then track_cov = 0.32 end
+    if track_cov == nil then track_cov = _DEFAULT_TRACK_COV end
     if track_cov < 0 then track_cov = 0 elseif track_cov > 1 then track_cov = 1 end
 
     local inner_r = outer_r - thickness
@@ -174,7 +192,7 @@ function M.paintRingProgress(bb, cx, cy, outer_r, thickness, fraction, x0, y0, x
         end
     end
 
-    -- Rounded caps on the progress arc (matches BetterStats-style rings).
+    -- Rounded caps on the progress arc.
     -- Cap centres sit on the ring midline; radius = half the stroke width.
     if fraction > 0 then
         local mid_r = (outer_r + inner_r) / 2
@@ -201,6 +219,24 @@ function M.paintRingProgress(bb, cx, cy, outer_r, thickness, fraction, x0, y0, x
             paintCap(fraction * two_pi)
         end
     end
+end
+
+local function _buildRingMask(d, thickness, fraction, track_cov)
+    return { bb = M.buildMask(d, d, function(mask)
+        M.paintRingProgress(mask, d / 2, d / 2, d / 2 - 0.5, thickness, fraction,
+            0, 0, d - 1, d - 1, track_cov)
+    end) }
+end
+
+-- Returns the cached d x d coverage mask of a progress ring that fills the
+-- square of diameter `d`. The arguments are those of paintRingProgress; the
+-- fraction is part of the cache key as an exact value, so every distinct
+-- progress renders pixel-identically to a direct paint. The entry is valid
+-- until the next raster cache lookup.
+function M.ringMask(d, thickness, fraction, track_cov)
+    track_cov = track_cov or _DEFAULT_TRACK_COV
+    local key = string.format("%.17g:%.17g:%.17g:%.17g", d, thickness, fraction, track_cov)
+    return RasterCache.get("ring", key, _buildRingMask, d, thickness, fraction, track_cov).bb
 end
 
 -- Signed distance from (px,py) to the edge of a downward-pointing pentagon
@@ -270,40 +306,19 @@ end
 -- the size of the shape.
 -- ---------------------------------------------------------------------------
 
-local _CORNER_CACHE_MAX = 16
-local _corner_cache     = {}
-local _corner_cache_n   = 0
-
 -- Cache keys: fill masks are keyed by (radius, alpha), stroke masks by
--- (radius, thickness); the low bit tells the two kinds apart.
-local function _maskKey(is_stroke, radius, param)
-    return (radius * 256 + param) * 2 + (is_stroke and 1 or 0)
-end
-
-local function _cachedMask(key, build)
-    local mask = _corner_cache[key]
-    if mask then return mask end
-    if _corner_cache_n >= _CORNER_CACHE_MAX then
-        for k, m in pairs(_corner_cache) do
-            m:free()
-            _corner_cache[k] = nil
-        end
-        _corner_cache_n = 0
-    end
-    mask = build()
-    _corner_cache[key] = mask
-    _corner_cache_n = _corner_cache_n + 1
-    return mask
+-- (radius, thickness); the two kinds live in separate cache groups.
+local function _maskKey(radius, param)
+    return radius * 256 + param
 end
 
 -- Returns a 2r x 2r coverage mask (grey = coverage) of a circle of radius r,
 -- scaled by alpha/255.
 local function _buildFillMask(radius, alpha)
     local size = radius * 2
-    local mask = Blitbuffer.new(size, size, Blitbuffer.TYPE_BB8)
-    mask:fill(Blitbuffer.COLOR_WHITE)
-    M.paintRoundedRectFill(mask, 0, 0, size, size, radius, 0, 0, size - 1, size - 1)
-    mask:invertRect(0, 0, size, size)
+    local mask = M.buildMask(size, size, function(bb)
+        M.paintRoundedRectFill(bb, 0, 0, size, size, radius, 0, 0, size - 1, size - 1)
+    end)
     if alpha < 255 then
         local scale = alpha / 255
         for py = 0, size - 1 do
@@ -315,7 +330,7 @@ local function _buildFillMask(radius, alpha)
             end
         end
     end
-    return mask
+    return { bb = mask }
 end
 
 -- Returns a 2r x 2r coverage mask of a ring of outer radius r and the given
@@ -323,12 +338,10 @@ end
 local function _buildStrokeMask(radius, thickness)
     local size = radius * 2
     local half = thickness / 2
-    local mask = Blitbuffer.new(size, size, Blitbuffer.TYPE_BB8)
-    mask:fill(Blitbuffer.COLOR_WHITE)
-    M.paintRoundedRectStroke(mask, half, half, size - thickness, size - thickness,
-        radius - half, thickness, 0, 0, size - 1, size - 1)
-    mask:invertRect(0, 0, size, size)
-    return mask
+    return { bb = M.buildMask(size, size, function(bb)
+        M.paintRoundedRectStroke(bb, half, half, size - thickness, size - thickness,
+            radius - half, thickness, 0, 0, size - 1, size - 1)
+    end) }
 end
 
 -- Blits the four r x r quadrants of `mask` onto the corners of (x, y, w, h).
@@ -371,9 +384,7 @@ function M.fillRoundedRect(bb, x, y, w, h, radius, color, alpha)
         M.fillRect(bb, x, y, w, h, color, alpha)
         return true
     end
-    local mask = _cachedMask(_maskKey(false, r, alpha), function()
-        return _buildFillMask(r, alpha)
-    end)
+    local mask = RasterCache.get("corner_fill", _maskKey(r, alpha), _buildFillMask, r, alpha).bb
     if not _blitCorners(bb, mask, x, y, w, h, r, color) then return false end
     M.fillRect(bb, x + r, y,         w - 2 * r, r,         color, alpha)
     M.fillRect(bb, x + r, y + h - r, w - 2 * r, r,         color, alpha)
@@ -381,15 +392,45 @@ function M.fillRoundedRect(bb, x, y, w, h, radius, color, alpha)
     return true
 end
 
+-- Fills a pill (fully rounded ends along its longer side) of w x h with
+-- `color` at `alpha` (0-255). Falls back to a plain rectangle when the
+-- rounded ends cannot be drawn.
+function M.fillPill(bb, x, y, w, h, color, alpha)
+    if not M.fillRoundedRect(bb, x, y, w, h, math.min(w, h) / 2, color, alpha) then
+        M.fillRect(bb, x, y, w, h, color, alpha)
+    end
+end
+
+-- Border for a corner radius that does not exceed the thickness. Each corner
+-- square then lies entirely inside the border band, so the corners are plain
+-- fill-mask quadrants and the inner edge is square. The band is covered
+-- without overlap: strips between the corners, full-width rows down to the
+-- inner edge, and the two side bands.
+local function _strokeThickBorder(bb, x, y, w, h, r, thickness, color)
+    if w < 2 * thickness or h < 2 * thickness then return false end
+    if r > 0 then
+        local mask = RasterCache.get("corner_fill", _maskKey(r, 255), _buildFillMask, r, 255).bb
+        if not _blitCorners(bb, mask, x, y, w, h, r, color) then return false end
+    end
+    local band = thickness - r
+    M.fillRect(bb, x + r, y,         w - 2 * r, r,                  color, 255)
+    M.fillRect(bb, x + r, y + h - r, w - 2 * r, r,                  color, 255)
+    M.fillRect(bb, x,     y + r,     w,         band,               color, 255)
+    M.fillRect(bb, x,     y + h - thickness, w, band,               color, 255)
+    M.fillRect(bb, x,                 y + thickness, thickness, h - 2 * thickness, color, 255)
+    M.fillRect(bb, x + w - thickness, y + thickness, thickness, h - 2 * thickness, color, 255)
+    return true
+end
+
 -- Draws an opaque rounded border of `thickness` inside (x, y, w, h) with
 -- anti-aliased corners. Returns false, leaving `bb` untouched, when the
--- radius is too small for the corner masks or the corners cannot be drawn.
+-- rectangle is too small for the border or the corners cannot be drawn.
 function M.strokeRoundedRect(bb, x, y, w, h, radius, thickness, color)
     local r = _fitRadius(radius, w, h)
-    if r <= thickness then return false end
-    local mask = _cachedMask(_maskKey(true, r, thickness), function()
-        return _buildStrokeMask(r, thickness)
-    end)
+    if r <= thickness then
+        return _strokeThickBorder(bb, x, y, w, h, r, thickness, color)
+    end
+    local mask = RasterCache.get("corner_stroke", _maskKey(r, thickness), _buildStrokeMask, r, thickness).bb
     if not _blitCorners(bb, mask, x, y, w, h, r, color) then return false end
     local edge_w, edge_h = w - 2 * r, h - 2 * r
     M.fillRect(bb, x + r,             y,                 edge_w,    thickness, color, 255)

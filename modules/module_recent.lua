@@ -9,39 +9,35 @@ local _ = require("infra/sui_i18n").translate
 
 local SUISettings  = require("infra/sui_store")
 local GridRenderer = require("engines/sui_book_grid")
+local Sources      = require("engines/sui_book_sources")
+
+-- Maps this module's setting onto the "recent" source params. The Currently
+-- Reading book is left out according to the screen-wide setting, which the
+-- source reads itself.
+local source = Sources.bind("recent", function(ctx)
+    return { show_finished = SUISettings:readSetting((ctx.pfx or "") .. "recent_show_finished") == true }
+end)
 
 local recent_module = GridRenderer.makeModule{
     id          = "recent",
     name        = _("Recent Books"),
-    label       = _("Recent Books"),
+    category    = "books",
+    label       = Sources.label("recent"),
     default_on  = false,
     is_book_mod = true,   -- suppresses empty-state when active
     max_items   = 5,
     -- Lets the user pick 4 or 5 visible covers (see GridRenderer.makeModule's
-    -- doc comment). ctx.recent_fps is prefetched with max_recent=15 (see
-    -- sui_screen_engine.lua), well above either choice, so no change
-    -- needed there.
+    -- doc comment). The prefetch requested through `needs` is well above
+    -- either choice.
     cols_choice = true,
 
-    getFileList = function(ctx) return ctx.recent_fps end,
+    needs       = Sources.get("recent").needs,
 
-    -- Filters finished books (unless "Show finished books") and optionally
-    -- the Currently Reading book (default ON via recent_exclude_currently).
-    filterItem = function(fp, ctx)
-        local pfx = ctx.pfx or ""
-        local excl = SUISettings:readSetting(pfx .. "recent_exclude_currently")
-        if excl == nil then excl = true end
-        if excl and ctx.current_fp and fp == ctx.current_fp then
-            return false
-        end
-        if SUISettings:readSetting(pfx .. "recent_show_finished") == true then return true end
-        local pd  = ctx.prefetched and ctx.prefetched[fp]
-        local pct = pd and pd.percent or 0
-        local is_done = (pct >= 1.0) or
-                        (type(pd) == "table" and type(pd.summary) == "table"
-                         and pd.summary.status == "complete")
-        return not is_done
-    end,
+    -- Finished books are filtered unless "Show finished books" is on, and
+    -- so is the Currently Reading book (unless the screen-wide setting says
+    -- otherwise).
+    getFileList = source.getFileList,
+    filterItem  = source.filterItem,
 
     progress_style = { default = "bar_text" },
 
@@ -55,34 +51,7 @@ local recent_module = GridRenderer.makeModule{
     },
 
     -- Only listed when Currently Reading is enabled on this screen.
-    extra_menu_items_after = function(ctx_menu)
-        local pfx = ctx_menu.pfx or ""
-        local Registry = require("modules/moduleregistry")
-        local currently = Registry.get("currently")
-        if not (currently and Registry.isEnabled(currently, pfx)) then
-            return {}
-        end
-        local skey = pfx .. "recent_exclude_currently"
-        local refresh = ctx_menu.refresh
-        local _lc = ctx_menu._
-        return {
-            {
-                text = _lc("Hide Currently Reading book"),
-                checked_func = function()
-                    local v = SUISettings:readSetting(skey)
-                    if v == nil then return true end
-                    return v == true
-                end,
-                keep_menu_open = true,
-                callback = function()
-                    local cur = SUISettings:readSetting(skey)
-                    if cur == nil then cur = true end
-                    SUISettings:saveSetting(skey, not cur)
-                    refresh()
-                end,
-            },
-        }
-    end,
+    extra_menu_items_after = Sources.get("recent").menu_items,
 
     reset = function() GridRenderer.reset() end,
 }

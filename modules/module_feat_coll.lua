@@ -14,12 +14,6 @@
 --
 -- Exposes M.instanciable = true and M.makeInstance(id) for the registry.
 -- Instances persist in "simpleui_coll_row_instances" (M.instances_key).
---
--- IMPORTANT NOTE (moduleregistry / sui_settings_window):
--- the base id deliberately ends in "_row" — Registry.createInstance generates
--- ids like "coll_row_a1b2c3", which contain the substring "_row_" used in
--- sui_settings_window.lua to distinguish instances from singleton modules.
--- See the note in moduleregistry.lua if this pattern is ever changed.
 
 local _  = require("infra/sui_i18n").translate
 
@@ -27,30 +21,18 @@ local CenterContainer = require("ui/widget/container/centercontainer")
 local Font            = require("ui/font")
 local Geom            = require("ui/geometry")
 
+local Config      = require("infra/sui_config")
 local SUISettings = require("infra/sui_store")
 local SUIStyle    = require("features/sui_style")
+local Chrome       = require("features/sui_module_chrome")
 local UI          = require("infra/sui_core")
 local GridRenderer = require("engines/sui_book_grid")
+local Sources = require("engines/sui_book_sources")
+local SourceMenu = require("features/sui_source_menu")
 
 local PAD = UI.PAD
 
 local MAX_ITEMS = 5
-
--- ---------------------------------------------------------------------------
--- ReadCollection accessor (lazy, same pattern as module_tbr.lua)
--- ---------------------------------------------------------------------------
-local function getRC()
-    local ok, rc = pcall(require, "readcollection")
-    return ok and rc or nil
-end
-
--- Name of the TBR collection (module_tbr.lua) — excluded from this module's
--- collection picker, since TBR already has its own dedicated instance/module and
--- it wouldn't make sense to be selectable here too.
-local function getTBRCollName()
-    local ok, TBR = pcall(require, "modules/module_tbr")
-    return ok and TBR and TBR.TBR_COLL_NAME or nil
-end
 
 -- ---------------------------------------------------------------------------
 -- Instance factory
@@ -67,29 +49,17 @@ local function makeInstance(inst_id)
 
     local SORT_STATE_KEY = inst_id .. "_sort_state"
 
-    -- Name to show when the target collection no longer exists (deleted outside
-    -- SimpleUI) or hasn't been chosen yet.
+    -- Section label: the chosen collection (flagged when it no longer exists)
+    -- or a configuration hint when none has been chosen yet.
     local function displayName(pfx)
         local name = getCollName(pfx)
         if not name then return _("Featured Collection — tap to configure") end
-        local RC = getRC()
-        if RC then
-            -- Not calling RC:_read() — it destructively reloads rc.coll from
-            -- disk and can wipe an in-memory-only collection the native
-            -- Collections UI hasn't flushed to disk yet. The singleton is
-            -- already live in-process.
-            if not (RC.coll and RC.coll[name]) then
-                return name .. "  " .. _("(collection not found)")
-            end
-        end
-        return name
+        return Sources.label("collection", { coll = name })
     end
 
-    local function getFileList(pfx)
-        local name = getCollName(pfx)
-        if not name then return {} end
-        return GridRenderer.getCollectionFileList(name)
-    end
+    local source = Sources.bind("collection", function(ctx)
+        return { coll = getCollName(ctx.pfx) }
+    end)
 
     -- ── Featured Collection-specific menu items: collection picker,
     --    Sort and Arrange. Prepended to the generic items (Scale/Frame/...)
@@ -98,218 +68,37 @@ local function makeInstance(inst_id)
         local _lc         = ctx_menu._
         local refresh      = ctx_menu.refresh
         local pfx          = ctx_menu.pfx
-        local SortWidget   = ctx_menu.SortWidget
-        local _UIManager   = ctx_menu.UIManager
         local items = {}
 
         -- Choosing the target collection (single-select, radio). Implemented as
-        -- sub_item_table_func (not item_picker) because it works
-        -- identically in KOReader's native menu and in SUIWindow, without
-        -- depending on a nested navigation context (push/pop).
-        items[#items + 1] = {
-            text_func = function()
-                local name = getCollName(pfx)
-                return name and (_lc("Collection: ") .. name) or _lc("Collection: (none)")
-            end,
-            separator = true,
-            sub_item_table_func = function()
-                local tbr_name = getTBRCollName()
-                local exclude  = tbr_name and { [tbr_name] = true } or nil
-                local all = GridRenderer.listAllCollectionNames(exclude)
-                local sub = {}
-                if #all == 0 then
-                    sub[#sub + 1] = { text = _lc("No collections found."), enabled = false }
-                    return sub
+        -- a submenu (not item_picker) because it works identically in
+        -- KOReader's native menu and in SUIWindow, without depending on a
+        -- nested navigation context (push/pop). The collection list is read
+        -- only when the submenu opens; the row value is the stored name.
+        items[#items + 1] = Config.makeRadioSubmenuItem{
+            text          = _lc("Collection"),
+            separator     = true,
+            options       = function()
+                local options = {}
+                for _i, name in ipairs(Sources.listCollectionNames()) do
+                    options[#options + 1] = { value = name, label = name }
                 end
-                for _, name in ipairs(all) do
-                    local _n = name
-                    sub[#sub + 1] = {
-                        text           = _n,
-                        radio          = true,
-                        checked_func   = function() return getCollName(pfx) == _n end,
-                        keep_menu_open = true,
-                        callback       = function()
-                            setCollName(pfx, _n)
-                            refresh()
-                        end,
-                    }
-                end
-                return sub
+                return options
             end,
+            empty_text    = _lc("No collections found."),
+            current_label = function() return getCollName(pfx) end,
+            get           = function() return getCollName(pfx) end,
+            set           = function(name) setCollName(pfx, name) end,
+            refresh       = refresh,
         }
 
         -- Sort (rewrites the persisted order; manual Arrange remains
-        -- available on top of the result).
-        items[#items + 1] = GridRenderer.makeSortMenuItem({
-            _lc         = _lc,
-            refresh     = refresh,
-            state_key   = pfx .. SORT_STATE_KEY,
-            getCollName = function() return getCollName(pfx) end,
-            getCount    = function() return #getFileList(pfx) end,
-        })
-
-        -- Arrange (reorder the chosen collection).
-        items[#items + 1] = {
-            text = _lc("Arrange"),
-            enabled_func = function() return getCollName(pfx) ~= nil end,
-            sub_item_table_func = function()
-                local sub_items = {}
-                local name = getCollName(pfx)
-                local list = getFileList(pfx)
-
-                sub_items[#sub_items + 1] = {
-                    text         = _lc("Arrange Collection"),
-                    enabled_func = function() return #list > 1 end,
-                    keep_menu_open = true,
-                    callback = function()
-                        if #list < 2 then
-                            UI.Notify.toast(_lc("Add at least 2 books to arrange."), 2)
-                            return
-                        end
-                        local sort_items = {}
-                        for _, fp in ipairs(list) do
-                            sort_items[#sort_items + 1] = {
-                                text      = GridRenderer.getBookTitle(fp),
-                                filepath  = fp,
-                                mandatory = "",
-                            }
-                        end
-                        local function on_save()
-                            local new_list = {}
-                            for _, item in ipairs(sort_items) do
-                                if item.filepath then new_list[#new_list + 1] = item.filepath end
-                            end
-                            local RC = getRC()
-                            if RC and RC.coll[name] then
-                                local ordered = {}
-                                for _, fp in ipairs(new_list) do
-                                    local entry = RC.coll[name][fp]
-                                    if entry then ordered[#ordered + 1] = entry end
-                                end
-                                RC:updateCollectionOrder(name, ordered)
-                                RC:write({ [name] = true })
-                            end
-                            refresh()
-                        end
-                        _UIManager:show(SortWidget:new{
-                            title = _lc("Arrange Collection"),
-                            item_table = sort_items,
-                            covers_fullscreen = true,
-                            callback = on_save,
-                        })
-                    end,
-                }
-
-                sub_items[#sub_items + 1] = { text = _lc("Books"), enabled = false, separator = true }
-
-                if #list == 0 then
-                    sub_items[#sub_items + 1] = { text = _lc("No books in this collection."), enabled = false }
-                else
-                    for _, fp in ipairs(list) do
-                        local _fp    = fp
-                        local _title = GridRenderer.getBookTitle(fp)
-                        sub_items[#sub_items + 1] = {
-                            text           = _title,
-                            keep_menu_open = true,
-                            callback       = function()
-                                local RC = getRC()
-                                if RC then RC:removeItem(_fp, name) end
-                                refresh()
-                            end,
-                        }
-                    end
-                end
-                return sub_items
-            end,
-            sui_build = ctx_menu.is_sui and function(ctx, _item)
-                local SUIWindow = require("engines/sui_window")
-                return SUIWindow.ListRow{
-                    title        = _lc("Arrange"),
-                    subtitle     = function()
-                        local list = getFileList(pfx)
-                        if #list == 0 then return _lc("No books in this collection.") end
-                        local names = {}
-                        for _, fp in ipairs(list) do names[#names + 1] = GridRenderer.getBookTitle(fp) end
-                        return table.concat(names, "  ·  ")
-                    end,
-                    inner_w      = ctx.inner_w,
-                    show_chevron = true,
-                    enabled      = getCollName(pfx) ~= nil,
-                    on_tap       = function()
-                        local name = getCollName(pfx)
-                        local list = getFileList(pfx)
-                        local sort_items = {}
-                        for _, fp in ipairs(list) do
-                            sort_items[#sort_items + 1] = { text = GridRenderer.getBookTitle(fp), orig_item = fp }
-                        end
-                        ctx.push("nested_menu", {
-                            title = _lc("Arrange"),
-                            items_func = function()
-                                return {
-                                    {
-                                        text = "Items List",
-                                        sui_build = function(ctx2)
-                                            local SUIWindow2 = require("engines/sui_window")
-                                            local function save_order(items_to_save)
-                                                local new_list = {}
-                                                for _, it in ipairs(items_to_save) do
-                                                    new_list[#new_list + 1] = it.orig_item
-                                                end
-                                                local RC2 = getRC()
-                                                if RC2 and RC2.coll[name] then
-                                                    local ordered = {}
-                                                    for _, fp in ipairs(new_list) do
-                                                        local entry = RC2.coll[name][fp]
-                                                        if entry then ordered[#ordered + 1] = entry end
-                                                    end
-                                                    RC2:updateCollectionOrder(name, ordered)
-                                                    RC2:write({ [name] = true })
-                                                end
-                                            end
-                                            local cards = {}
-                                            for i, item in ipairs(sort_items) do
-                                                local _i  = i
-                                                local _fp = item.orig_item
-                                                cards[#cards + 1] = SUIWindow2.ArrangeCard{
-                                                    inner_w   = ctx2.inner_w,
-                                                    title     = item.text,
-                                                    on_delete = function()
-                                                        table.remove(sort_items, _i)
-                                                        local RC3 = getRC()
-                                                        if RC3 then RC3:removeItem(_fp, name) end
-                                                        ctx_menu.refresh()
-                                                        ctx2.repaint()
-                                                    end,
-                                                    on_move_up = (_i > 1) and function()
-                                                        sort_items[_i], sort_items[_i-1] = sort_items[_i-1], sort_items[_i]
-                                                        save_order(sort_items)
-                                                        ctx_menu.refresh()
-                                                        ctx2.repaint()
-                                                    end or nil,
-                                                    on_move_down = (_i < #sort_items) and function()
-                                                        sort_items[_i], sort_items[_i+1] = sort_items[_i+1], sort_items[_i]
-                                                        save_order(sort_items)
-                                                        ctx_menu.refresh()
-                                                        ctx2.repaint()
-                                                    end or nil,
-                                                }
-                                            end
-                                            if #cards == 0 then
-                                                cards[#cards + 1] = SUIWindow2.ListRow{
-                                                    title   = _lc("No books in this collection."),
-                                                    inner_w = ctx2.inner_w,
-                                                }
-                                            end
-                                            return cards
-                                        end,
-                                    },
-                                }
-                            end,
-                        })
-                    end,
-                }
-            end or nil,
-        }
+        -- available on top of the result) and Arrange.
+        for _i, item in ipairs(SourceMenu.collectionItems(ctx_menu, "collection",
+            function() return { coll = getCollName(pfx) } end,
+            { sort = SourceMenu.keyedState(pfx .. SORT_STATE_KEY) })) do
+            items[#items + 1] = item
+        end
 
         return items
     end
@@ -322,7 +111,7 @@ local function makeInstance(inst_id)
         max_items   = MAX_ITEMS,
         paged       = true,
         label_fn    = displayName,
-        getFileList = function(ctx) return getFileList(ctx.pfx) end,
+        getFileList = source.getFileList,
         extra_menu_items_before = extraMenuItemsBefore,
 
         -- Library-style corner badges (see engines/sui_book_grid.lua's
@@ -359,6 +148,7 @@ local function makeInstance(inst_id)
             UI.makeColoredText{
                 text    = ph_text,
                 face    = Font:getFace(SUIStyle.FACE_REGULAR, SUIStyle.FS_BODY),
+                fgcolor = (ctx.ink or Chrome.PLAIN_INK).sub,
                 width   = w - PAD * 2,
             },
         }
@@ -373,8 +163,16 @@ end
 local M = {}
 M.id            = "coll_row"
 M.name          = _("Featured Collection")
+M.category      = "books"
 M.instanciable  = true
 M.instances_key = "simpleui_coll_row_instances"
 M.makeInstance  = makeInstance
+
+-- Layout-editor summary of an instance: the collection it features.
+function M.getSummary(inst_id, pfx)
+    local name = SUISettings:readSetting(pfx .. inst_id .. "_coll_name")
+    if name and name ~= "" then return name end
+    return _("No collection selected")
+end
 
 return M

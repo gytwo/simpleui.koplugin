@@ -105,6 +105,34 @@ function M.computeCurrentDayStreak(active_dates, opts)
     return streak
 end
 
+-- ---------------------------------------------------------------------------
+-- M.computeLongestDayStreak(active_dates, opts) → integer
+--
+-- Longest run of consecutive active days anywhere in the history (0 when
+-- there are none). Same inputs as computeCurrentDayStreak, so a frozen day
+-- counts for continuity here exactly as it does there and the longest run is
+-- never shorter than the current one.
+-- ---------------------------------------------------------------------------
+function M.computeLongestDayStreak(active_dates, opts)
+    opts = opts or {}
+
+    local set, days = {}, {}
+    local function add(d)
+        if not set[d] then set[d] = true; days[#days + 1] = d end
+    end
+    for _, d in ipairs(active_dates or {}) do add(d) end
+    for _, d in ipairs(opts.frozen_dates or {}) do add(d) end
+    table.sort(days)
+
+    local longest, run, prev = 0, 0, nil
+    for _, d in ipairs(days) do
+        run = (prev and _prevDay(d) == prev) and run + 1 or 1
+        if run > longest then longest = run end
+        prev = d
+    end
+    return longest
+end
+
 -- ============================================================================
 -- Part 2 — Streak "Freeze" mechanic (formerly sui_streak_freeze.lua)
 -- ============================================================================
@@ -282,7 +310,9 @@ function M.addFreezeTimeProgress(secs)
         progress = progress - FREEZE_TIME_THRESHOLD_SECS
         granted = granted + 1
     end
-    SUISettings:set(KEY_TIME_PROGRESS, progress)
+    -- Progress and baseline stay in memory; they reach disk on suspend or with
+    -- the next flushing write (a grant below flushes immediately).
+    SUISettings:setNoFlush(KEY_TIME_PROGRESS, progress)
     if granted > 0 then M.addFreezes(granted) end
     return granted
 end
@@ -311,7 +341,7 @@ function M.advanceFreezeTimeFromTotalSecs(total_secs)
 
     local last = SUISettings:get(KEY_LAST_TOTAL_SECS)
     if last == nil then
-        SUISettings:set(KEY_LAST_TOTAL_SECS, total_secs)
+        SUISettings:setNoFlush(KEY_LAST_TOTAL_SECS, total_secs)
         return 0
     end
 
@@ -319,13 +349,13 @@ function M.advanceFreezeTimeFromTotalSecs(total_secs)
         -- No new reading time (or an upstream hiccup reported a lower value
         -- than before) — just re-baseline, add nothing.
         if total_secs < last then
-            SUISettings:set(KEY_LAST_TOTAL_SECS, total_secs)
+            SUISettings:setNoFlush(KEY_LAST_TOTAL_SECS, total_secs)
         end
         return 0
     end
 
     local delta = total_secs - last
-    SUISettings:set(KEY_LAST_TOTAL_SECS, total_secs)
+    SUISettings:setNoFlush(KEY_LAST_TOTAL_SECS, total_secs)
     return M.addFreezeTimeProgress(delta)
 end
 

@@ -25,10 +25,6 @@ local CenterContainer = require("ui/widget/container/centercontainer")
 
 local GestureRange   = require("ui/gesturerange")
 
--- ConfirmBox is only needed when the user taps a highlight to open its book.
--- Lazy-loaded at that point to avoid the cost at module-load time.
--- local ConfirmBox = require("ui/widget/confirmbox")  ← moved to usage site
-
 local InputContainer   = require("ui/widget/container/inputcontainer")
 
 local RenderText       = require("ui/rendertext")
@@ -49,17 +45,18 @@ local logger         = require("logger")
 
 local Config       = require("infra/sui_config")
 
-local UIManager       = require("ui/uimanager")
 
 local UI           = require("infra/sui_core")
 local SUISettings  = require("infra/sui_store")
 local SUIStyle     = require("features/sui_style")
+local Text         = require("infra/sui_text")
 
 local PAD          = UI.PAD
 
 local PAD2         = UI.PAD2
 
 local CLR_TEXT_SUB = UI.CLR_TEXT_SUB
+local Chrome       = require("features/sui_module_chrome")
 
 
 
@@ -106,24 +103,10 @@ local SETTING_FIXED_H     = "simpleui_quote_fixed_height"
 local _FIXED_LINES = 3  -- number of quote-body lines when fixed height is active
 
 -- ---------------------------------------------------------------------------
--- Alignment setting helpers  (mirrors module_action_list)
+-- Alignment setting
 -- ---------------------------------------------------------------------------
-local _ALIGN_VALUES = { "left", "center", "right" }
-
 local function getAlignment(pfx)
-    local v = SUISettings:readSetting((pfx or "") .. SETTING_ALIGN)
-    for _, a in ipairs(_ALIGN_VALUES) do if a == v then return v end end
-    return "center"  -- default
-end
-
-local function setAlignment(pfx, val)
-    SUISettings:saveSetting((pfx or "") .. SETTING_ALIGN, val)
-end
-
-local function alignLabel(align)
-    if align == "left"  then return _("Left")  end
-    if align == "right" then return _("Right") end
-    return _("Center")
+    return Config.getAlignment((pfx or "") .. SETTING_ALIGN)
 end
 
 -- ---------------------------------------------------------------------------
@@ -554,7 +537,7 @@ local function _collectFromSidecar(fp, DocSettings, pool, remaining)
 
         if type(props.authors) == "string" and props.authors ~= "" then
 
-            authors = props.authors:match("^[^\n]+") or props.authors
+            authors = Text.firstLine(props.authors)
 
         end
 
@@ -745,8 +728,6 @@ local function getPool()
 
         _hl_pool = _buildPool()
 
-        _last_hl_idx = nil
-
     end
 
     return _hl_pool
@@ -933,33 +914,21 @@ local function controlLineBreaks(text, face, max_w)
     return bind(text)
 end
 
-local function buildWidget(inner_w, text_str, attr_str, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+local function buildWidget(inner_w, text_str, attr_str, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
     
     -- 防乱码：先修掉非法 UTF-8，再做测宽 / 换行控制
     text_str = util.fixUtf8(text_str or "", "")
     attr_str = attr_str and util.fixUtf8(attr_str, "") or attr_str
 
- local function makeTBW(text, face, fgcolor, bold)
-        local args = {
+    local function makeTBW(text, face, fgcolor, bold)
+        return UI.makeTextBox({
             text      = controlLineBreaks(text, face, inner_w),
             face      = face,
             bold      = bold,
             width     = inner_w,
             alignment = alignment or "center",
             fgcolor   = fgcolor,
-        }
-
-        if has_wallpaper then
-                local ok_tbx, tbx = pcall(UI.makeAlphaTextBox, args)
-                if ok_tbx then
-                    return tbx
-                else
-                    logger.warn("simpleui: module_quote: makeAlphaTextBox failed, falling back: " .. tostring(tbx))
-                    return TextBoxWidget:new(args)
-                end
-            else
-                return TextBoxWidget:new(args)
-            end
+        }, text_alpha)
     end
 
     local vg = VerticalGroup:new{ align = "center" }
@@ -974,13 +943,13 @@ end
 
 
 
-local function buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, has_wallpaper, clr_quote, clr_attr, alignment)
+local function buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, text_alpha, clr_quote, clr_attr, alignment)
 
     local q = pickCustomQuote(pfx)
 
     if not q then
 
-        return TextBoxWidget:new{
+        return UI.makeTextBox({
 
             text    = _("No custom quotes found. Add a .lua file to the plugin's sui_quotes/ folder and select it in Settings."),
 
@@ -990,13 +959,8 @@ local function buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, has_wallpape
 
             fgcolor = clr_attr or CLR_TEXT_SUB,
 
-            bgcolor = nil,
-
             width   = inner_w,
-
-            alpha   = true,
-
-        }
+        }, text_alpha)
 
     end
 
@@ -1004,19 +968,19 @@ local function buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, has_wallpape
 
     if q.b and q.b ~= "" then attr = attr .. (attr ~= "" and ",  " or "") .. q.b end
 
-    return buildWidget(inner_w, "“" .. q.q .. "”", attr, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+    return buildWidget(inner_w, "“" .. q.q .. "”", attr, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
 end
 
 
 
-local function buildFromQuote(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+local function buildFromQuote(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
     local q = pickQuote()
 
     if not q then
 
-        return TextBoxWidget:new{
+        return UI.makeTextBox({
 
             text    = _("No quotes found."),
 
@@ -1026,13 +990,8 @@ local function buildFromQuote(inner_w, fonts, vspan_gap, has_wallpaper, clr_quot
 
             fgcolor = clr_attr or CLR_TEXT_SUB,
 
-            bgcolor = nil,
-
             width   = inner_w,
-
-            alpha   = true,
-
-        }
+        }, text_alpha)
 
     end
 
@@ -1040,13 +999,13 @@ local function buildFromQuote(inner_w, fonts, vspan_gap, has_wallpaper, clr_quot
 
     if q.b and q.b ~= "" then attr = attr .. (attr ~= "" and ",  " or "") .. q.b end
 
-    return buildWidget(inner_w, "\u{201C}" .. q.q .. "\u{201D}", attr, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+    return buildWidget(inner_w, "\u{201C}" .. q.q .. "\u{201D}", attr, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
 end
 
 
 
-local function buildFromHighlight(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+local function buildFromHighlight(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
     local h = pickHighlight()
 
@@ -1062,7 +1021,7 @@ local function buildFromHighlight(inner_w, fonts, vspan_gap, has_wallpaper, clr_
 
             _("Your highlights"),
 
-            fonts, vspan_gap, has_wallpaper
+            fonts, vspan_gap, text_alpha
 
         ), nil
 
@@ -1087,14 +1046,14 @@ local function buildFromHighlight(inner_w, fonts, vspan_gap, has_wallpaper, clr_
     local TRAILING_QUOTES = '["\'\u{201D}\u{2019}\u{201E}\u{201A}\u{00BB}\u{203A}%s]+$'
     local text = h.text:gsub(LEADING_QUOTES, ''):gsub(TRAILING_QUOTES, '')
     text = text:gsub('^[\u{2014}\u{2013}]%s*', '')
-    return buildWidget(inner_w, "\u{201C}" .. text .. "\u{201D}", attr, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment),
+    return buildWidget(inner_w, "\u{201C}" .. text .. "\u{201D}", attr, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment),
            h.filepath, h.title, h.pos0, h.page
 
 end
 
 
 
-local function buildFromMixed(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+local function buildFromMixed(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
     local has_highlights = #getPool() > 0
 
@@ -1104,21 +1063,21 @@ local function buildFromMixed(inner_w, fonts, vspan_gap, has_wallpaper, clr_quot
 
         if math.random(2) == 1 then
 
-            return buildFromHighlight(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+            return buildFromHighlight(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
         else
 
-            return buildFromQuote(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment), nil, nil, nil, nil
+            return buildFromQuote(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment), nil, nil, nil, nil
 
         end
 
     elseif has_highlights then
 
-        return buildFromHighlight(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+        return buildFromHighlight(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
     else
 
-        return buildFromQuote(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment), nil, nil, nil, nil
+        return buildFromQuote(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment), nil, nil, nil, nil
 
     end
 
@@ -1128,7 +1087,7 @@ end
 
 -- Same as buildFromMixed, but pairs the user's highlights with the selected
 -- custom quotes file instead of the built-in quotes.lua pool.
-local function buildFromCustomMixed(inner_w, fonts, vspan_gap, pfx, has_wallpaper, clr_quote, clr_attr, alignment)
+local function buildFromCustomMixed(inner_w, fonts, vspan_gap, pfx, text_alpha, clr_quote, clr_attr, alignment)
 
     local has_highlights = #getPool() > 0
 
@@ -1139,21 +1098,21 @@ local function buildFromCustomMixed(inner_w, fonts, vspan_gap, pfx, has_wallpape
 
         if math.random(2) == 1 then
 
-            return buildFromHighlight(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+            return buildFromHighlight(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
         else
 
-            return buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, has_wallpaper, clr_quote, clr_attr, alignment), nil, nil, nil, nil
+            return buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, text_alpha, clr_quote, clr_attr, alignment), nil, nil, nil, nil
 
         end
 
     elseif has_highlights then
 
-        return buildFromHighlight(inner_w, fonts, vspan_gap, has_wallpaper, clr_quote, clr_attr, alignment)
+        return buildFromHighlight(inner_w, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
 
     else
 
-        return buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, has_wallpaper, clr_quote, clr_attr, alignment), nil, nil, nil, nil
+        return buildFromCustomQuote(inner_w, fonts, vspan_gap, pfx, text_alpha, clr_quote, clr_attr, alignment), nil, nil, nil, nil
 
     end
 
@@ -1176,6 +1135,7 @@ local M = {}
 M.id          = "quote"
 
 M.name        = _("Quote of the Day")
+M.category    = "extras"
 
 M.label       = nil
 
@@ -1188,10 +1148,25 @@ M.text_elems  = { "quote", "author" }
 
 -- The attribution is bold until the user picks another variant.
 Config.declareTextVariants(M.id, { author = "bold" })
+Config.declareTextColors(M.id, { "author" }, { author = "accent" })
 
 M.getCountLabel = nil
 
 
+
+-- Every quote of the files in sui_quotes/, as { q, a?, b? } entries.
+function M.customQuotes()
+    local all = {}
+    for _i, name in ipairs(listCustomQuoteFiles()) do
+        local ok, data = pcall(dofile, customDir() .. "/" .. name)
+        for _j, entry in ipairs(ok and type(data) == "table" and data or {}) do
+            if type(entry) == "table" and type(entry.q) == "string" and entry.q ~= "" then
+                all[#all + 1] = entry
+            end
+        end
+    end
+    return all
+end
 
 function M.invalidateCache()
 
@@ -1233,13 +1208,14 @@ function M.build(w, ctx)
 
     local vspan_gap  = VerticalSpan:new{ width = quote_gap }
 
-    local _clr_quote       = SUIStyle.COLOR.text_primary
-    local _clr_attr        = CLR_TEXT_SUB
+    local ink              = (ctx and ctx.ink) or Chrome.PLAIN_INK
+    local _clr_quote       = ink.blk
+    local _clr_attr        = SUIStyle.textColor(styles.author, ctx and ctx.palette, ink.sub)
 
     local source    = getSource(ctx and ctx.pfx)
     local alignment = getAlignment(ctx and ctx.pfx)
 
-    local has_wallpaper = ctx and ctx.has_wallpaper
+    local text_alpha = ctx and ctx.text_alpha
 
     local content
     local hl_filepath
@@ -1249,23 +1225,23 @@ function M.build(w, ctx)
 
     if source == "highlights" then
 
-        content, hl_filepath, hl_title, hl_pos0, hl_page = buildFromHighlight(w, fonts, vspan_gap, has_wallpaper, _clr_quote, _clr_attr, alignment)
+        content, hl_filepath, hl_title, hl_pos0, hl_page = buildFromHighlight(w, fonts, vspan_gap, text_alpha, _clr_quote, _clr_attr, alignment)
 
     elseif source == "mixed" then
 
-        content, hl_filepath, hl_title, hl_pos0, hl_page = buildFromMixed(w, fonts, vspan_gap, has_wallpaper, _clr_quote, _clr_attr, alignment)
+        content, hl_filepath, hl_title, hl_pos0, hl_page = buildFromMixed(w, fonts, vspan_gap, text_alpha, _clr_quote, _clr_attr, alignment)
 
     elseif source == "custom" then
 
-        content = buildFromCustomQuote(w, fonts, vspan_gap, ctx and ctx.pfx, has_wallpaper, _clr_quote, _clr_attr, alignment)
+        content = buildFromCustomQuote(w, fonts, vspan_gap, ctx and ctx.pfx, text_alpha, _clr_quote, _clr_attr, alignment)
 
     elseif source == "custom_mixed" then
 
-        content, hl_filepath, hl_title, hl_pos0, hl_page = buildFromCustomMixed(w, fonts, vspan_gap, ctx and ctx.pfx, has_wallpaper, _clr_quote, _clr_attr, alignment)
+        content, hl_filepath, hl_title, hl_pos0, hl_page = buildFromCustomMixed(w, fonts, vspan_gap, ctx and ctx.pfx, text_alpha, _clr_quote, _clr_attr, alignment)
 
     else
 
-        content = buildFromQuote(w, fonts, vspan_gap, has_wallpaper, _clr_quote, _clr_attr, alignment)
+        content = buildFromQuote(w, fonts, vspan_gap, text_alpha, _clr_quote, _clr_attr, alignment)
 
     end
 
@@ -1341,15 +1317,15 @@ function M.build(w, ctx)
                 local page  = self._page
                 local open  = self._open
                 local BD        = require("ui/bidi")
-                local ConfirmBox = require("ui/widget/confirmbox")
-                UIManager:show(ConfirmBox:new{
+                local Dialogs = require("features/dialogs/sui_dialogs")
+                Dialogs.confirm{
                     text        = _("Open this file?") .. "\n\n" .. BD.filename(fp:match("([^/]+)$")),
                     ok_text     = _("Open"),
                     cancel_text = _("Cancel"),
                     ok_callback = function()
                         open(fp, pos0, page)
                     end,
-                })
+                }
             end
             return true
         end
@@ -1416,214 +1392,73 @@ local function _makeScaleItem(ctx_menu)
 end
 
 function M.getMenuItems(ctx_menu)
-
     local pfx     = ctx_menu.pfx
-
     local refresh = ctx_menu.refresh
-
     local _lc     = ctx_menu._
 
+    -- Persists the chosen source (and custom file, when given). The bundled
+    -- quote set needs no cache reset; every other source does.
+    local function saveSource(source, custom_file)
+        SUISettings:saveSetting(pfx .. SETTING_SOURCE, source)
+        if custom_file then
+            SUISettings:saveSetting(pfx .. SETTING_CUSTOM_FILE, custom_file)
+        end
+        if source ~= "quotes" then M.invalidateCache() end
+    end
 
+    -- File list for a source backed by a user-provided file; the folder is
+    -- scanned only when the sub-menu is opened.
+    local function makeCustomFileItems(source)
+        local items = Config.appendRadioItems({}, {
+            options    = function()
+                local options = {}
+                for _i, fname in ipairs(listCustomQuoteFiles()) do
+                    options[#options + 1] = { value = fname, label = fname }
+                end
+                return options
+            end,
+            empty_text = _lc("No .lua files found in sui_quotes/"),
+            get        = function()
+                return getSource(pfx) == source and getCustomFile(pfx) or nil
+            end,
+            set        = function(fname) saveSource(source, fname) end,
+            refresh    = refresh,
+        })
+        items[#items + 1] = {
+            text    = _lc("Place .lua files in the plugin's sui_quotes/ folder"),
+            enabled = false,
+        }
+        return items
+    end
 
     local rows = {
-
-        {
-
-            text           = _lc("Source"),
-
-            sub_item_table = {
-
+        Config.makeRadioSubmenuItem{
+            text    = _lc("Source"),
+            options = {
+                { value = "quotes",     label = _lc("Default Quotes") },
+                { value = "highlights", label = _lc("My Highlights") },
+                { value = "mixed",      label = _lc("Quotes + My Highlights") },
                 {
-
-                    text           = _lc("Default Quotes"),
-
-                    radio          = true,
-
-                    checked_func   = function() return getSource(pfx) == "quotes" end,
-
-                    keep_menu_open = true,
-
-                    callback       = function()
-
-                        SUISettings:saveSetting(pfx .. SETTING_SOURCE, "quotes")
-
-                        refresh()
-
-                    end,
-
+                    value               = "custom",
+                    label               = _lc("Custom File"),
+                    sub_item_table_func = function() return makeCustomFileItems("custom") end,
                 },
-
                 {
-
-                    text           = _lc("My Highlights"),
-
-                    radio          = true,
-
-                    checked_func   = function() return getSource(pfx) == "highlights" end,
-
-                    keep_menu_open = true,
-
-                    callback       = function()
-
-                        SUISettings:saveSetting(pfx .. SETTING_SOURCE, "highlights")
-
-                        M.invalidateCache()
-
-                        refresh()
-
-                    end,
-
+                    value               = "custom_mixed",
+                    label               = _lc("Custom File + My Highlights"),
+                    sub_item_table_func = function() return makeCustomFileItems("custom_mixed") end,
                 },
-
-                {
-
-                    text           = _lc("Quotes + My Highlights"),
-
-                    radio          = true,
-
-                    checked_func   = function() return getSource(pfx) == "mixed" end,
-
-                    keep_menu_open = true,
-
-                    callback       = function()
-
-                        SUISettings:saveSetting(pfx .. SETTING_SOURCE, "mixed")
-
-                        M.invalidateCache()
-
-                        refresh()
-
-                    end,
-
-                },
-
-                {
-
-                    text         = _lc("Custom File"),
-
-                    radio        = true,
-
-                    checked_func = function() return getSource(pfx) == "custom" end,
-
-                    -- Scan the filesystem only when the user opens this sub-menu.
-                    sub_item_table_func = function()
-                        local files    = listCustomQuoteFiles()
-                        local subitems = {}
-
-                        if #files == 0 then
-                            subitems[#subitems + 1] = {
-                                text    = _lc("No .lua files found in sui_quotes/"),
-                                enabled = false,
-                            }
-                        else
-                            for _, fname in ipairs(files) do
-                                local _fname = fname
-                                subitems[#subitems + 1] = {
-                                    text           = _fname,
-                                    radio          = true,
-                                    checked_func   = function()
-                                        return getSource(pfx) == "custom"
-                                               and getCustomFile(pfx) == _fname
-                                    end,
-                                    keep_menu_open = true,
-                                    callback       = function()
-                                        SUISettings:saveSetting(pfx .. SETTING_SOURCE,      "custom")
-                                        SUISettings:saveSetting(pfx .. SETTING_CUSTOM_FILE, _fname)
-                                        M.invalidateCache()
-                                        refresh()
-                                    end,
-                                }
-                            end
-                        end
-
-                        subitems[#subitems + 1] = {
-                            text    = _lc("Place .lua files in the plugin's sui_quotes/ folder"),
-                            enabled = false,
-                        }
-
-                        return subitems
-                    end,
-
-                },
-
-                {
-
-                    text         = _lc("Custom File + My Highlights"),
-
-                    radio        = true,
-
-                    checked_func = function() return getSource(pfx) == "custom_mixed" end,
-
-                    -- Scan the filesystem only when the user opens this sub-menu.
-                    sub_item_table_func = function()
-                        local files    = listCustomQuoteFiles()
-                        local subitems = {}
-
-                        if #files == 0 then
-                            subitems[#subitems + 1] = {
-                                text    = _lc("No .lua files found in sui_quotes/"),
-                                enabled = false,
-                            }
-                        else
-                            for _, fname in ipairs(files) do
-                                local _fname = fname
-                                subitems[#subitems + 1] = {
-                                    text           = _fname,
-                                    radio          = true,
-                                    checked_func   = function()
-                                        return getSource(pfx) == "custom_mixed"
-                                               and getCustomFile(pfx) == _fname
-                                    end,
-                                    keep_menu_open = true,
-                                    callback       = function()
-                                        SUISettings:saveSetting(pfx .. SETTING_SOURCE,      "custom_mixed")
-                                        SUISettings:saveSetting(pfx .. SETTING_CUSTOM_FILE, _fname)
-                                        M.invalidateCache()
-                                        refresh()
-                                    end,
-                                }
-                            end
-                        end
-
-                        subitems[#subitems + 1] = {
-                            text    = _lc("Place .lua files in the plugin's sui_quotes/ folder"),
-                            enabled = false,
-                        }
-
-                        return subitems
-                    end,
-
-                },
-
             },
-
+            get     = function() return getSource(pfx) end,
+            set     = saveSource,
+            refresh = refresh,
         },
-
         _makeScaleItem(ctx_menu),
 
-        {
-            text_func  = function() return _lc("Alignment") end,
-            value_func = function() return alignLabel(getAlignment(pfx)) end,
-            sub_item_table = {
-                {
-                    text           = _lc("Left"),
-                    checked_func   = function() return getAlignment(pfx) == "left" end,
-                    keep_menu_open = true,
-                    callback       = function() setAlignment(pfx, "left");   refresh() end,
-                },
-                {
-                    text           = _lc("Center"),
-                    checked_func   = function() return getAlignment(pfx) == "center" end,
-                    keep_menu_open = true,
-                    callback       = function() setAlignment(pfx, "center"); refresh() end,
-                },
-                {
-                    text           = _lc("Right"),
-                    checked_func   = function() return getAlignment(pfx) == "right" end,
-                    keep_menu_open = true,
-                    callback       = function() setAlignment(pfx, "right");  refresh() end,
-                },
-            },
+        Config.makeAlignmentItem{
+            key     = (pfx or "") .. SETTING_ALIGN,
+            refresh = refresh,
+            _lc     = _lc,
         },
 
         Config.makeTextSection({

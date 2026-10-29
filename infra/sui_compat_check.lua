@@ -1,5 +1,5 @@
 -- Compatibility checks at plugin startup.
--- Detects conflicting plugins and user patches, and verifies CoverBrowser.
+-- Detects conflicting plugins and verifies CoverBrowser.
 
 local _ = require("gettext")
 
@@ -92,81 +92,11 @@ local function is_zenos_present()
     return plugin_folder_exists("zenos")
 end
 
-local AUTO_DISABLE_PATCHES = {
-    "2---stretched-covers.lua",
-    "2--disable-all-CB-widgets.lua",
-    "2--disable-all-PT-widgets.lua",
-    "2--rounded-covers.lua",
-    "2--stretched-rounded-covers.lua",
-    "2-navbar-vos.lua",
-    "2-new-collections-star.lua",
-    "2-new-progress-bar-colored.lua",
-    "2-new-progress-bar.lua",
-    "2-pages-badge.lua",
-    "2-percent-badge.lua",
-    "2-rounded-folder-covers.lua",
-    "2-series-indicator.lua",
-    "20-faded-finished-books.lua",
-    "2-quick-settings.lua",
-    "2-automatic-book-series.lua",
-    "2-ui-font.lua",
-    "2-custom-navbar.lua",
-    "2-page-scrubber.lua",
-    "2-browser-double-tap.lua",
-    "2-browser-hide-underline.lua",
-    "2-browser-up-folder.lua",
-    "2-coverimage-eink-optimize.lua",
-    "2-disable-top-menu-zones.lua",
-    "2-filemanager-titlebar.lua",
-    "2-menu-size.lua",
-    "2-new-status-icons.lua",
-    "2-screensaver-chapter.lua",
-    "2-screensaver-cover.lua",
-    "2-series-badge-numbered.lua",
-    "2-statusbar-better-compact.lua",
-    "2-statusbar-cycle-presets.lua",
-}
-
--- Master switch for renaming the patches above to "<name>.disabled".
--- Off: user patches are left untouched. The list and the logic below are
--- kept so the behaviour can be turned back on by setting this to true.
-local DISABLE_CONFLICTING_PATCHES = false
-
--- Renames every installed patch from AUTO_DISABLE_PATCHES that is active (or
--- has already run this session). Returns the list of renamed file names.
-local function disable_conflicting_patches()
-    local renamed = {}
-    local ok_userpatch, userpatch = pcall(require, "userpatch")
-    local execution_status = ok_userpatch and userpatch and userpatch.execution_status
-    local patches_enabled = type(userpatch) ~= "table"
-        or type(userpatch.arePatchesDisabled) ~= "function"
-        or not userpatch.arePatchesDisabled()
-    local ok_ds, DataStorage = pcall(require, "datastorage")
-    local patch_dir = ok_ds and (DataStorage:getDataDir() .. "/patches") or "patches"
-    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
-    if not ok_lfs then return renamed end
-
-    for _i, filename in ipairs(AUTO_DISABLE_PATCHES) do
-        local source = patch_dir .. "/" .. filename
-        local installed = lfs.attributes(source, "mode") == "file"
-        local was_run = type(execution_status) == "table" and execution_status[filename] ~= nil
-        if installed and (was_run or patches_enabled)
-                and os.rename(source, source .. ".disabled") then
-            renamed[#renamed + 1] = filename
-        end
-    end
-    return renamed
-end
-
 local function schedule_coverbrowser_check()
     local UIManager = require("ui/uimanager")
     UIManager:scheduleIn(1.0, function()
         local ok_cm = pcall(require, "covermenu")
         if ok_cm then return end
-
-        local ButtonDialog = require("ui/widget/buttondialog")
-        local dialog
-        local buttons = {}
 
         local disabled_list = {}
         if G_reader_settings then
@@ -175,39 +105,29 @@ local function schedule_coverbrowser_check()
         end
         local plugin_available = disabled_list["coverbrowser"] ~= nil
 
-        if plugin_available then
-            table.insert(buttons, {{
-                text = _("Enable"),
-                callback = function()
-                    UIManager:close(dialog)
-                    if G_reader_settings then
-                        disabled_list["coverbrowser"] = nil
-                        G_reader_settings:saveSetting("plugins_disabled", disabled_list)
-                        G_reader_settings:flush()
-                    end
-                    local Event = require("ui/event")
-                    UIManager:show(require("ui/widget/confirmbox"):new{
-                        text = _("Please restart KOReader for the change to take effect."),
-                        ok_text = _("Restart now"),
-                        ok_callback = function()
-                            UIManager:broadcastEvent(Event:new("Restart"))
-                        end,
-                    })
+        local function enable()
+            if G_reader_settings then
+                disabled_list["coverbrowser"] = nil
+                G_reader_settings:saveSetting("plugins_disabled", disabled_list)
+                G_reader_settings:flush()
+            end
+            local Event = require("ui/event")
+            require("features/dialogs/sui_dialogs").confirm{
+                text        = _("Please restart KOReader for the change to take effect."),
+                ok_text     = _("Restart now"),
+                ok_callback = function()
+                    UIManager:broadcastEvent(Event:new("Restart"))
                 end,
-            }})
+            }
         end
 
-        table.insert(buttons, {{
-            text = _("OK"),
-            callback = function() UIManager:close(dialog) end,
-        }})
-
-        dialog = ButtonDialog:new{
-            title = _("CoverBrowser plugin is not enabled, some features will not work correctly."),
-            title_align = "center",
-            buttons = buttons,
+        require("features/dialogs/sui_dialogs").confirm{
+            text         = _("CoverBrowser plugin is not enabled, some features will not work correctly."),
+            ok_text      = _("Enable"),
+            cancel_text  = _("OK"),
+            no_ok_button = not plugin_available,
+            ok_callback  = enable,
         }
-        UIManager:show(dialog)
     end)
 end
 
@@ -279,13 +199,6 @@ local function apply_compat_check()
                     end
                 end
             end
-        end
-    end
-
-    if DISABLE_CONFLICTING_PATCHES then
-        for _i, filename in ipairs(disable_conflicting_patches()) do
-            disabled_labels[#disabled_labels + 1] = filename
-            needs_restart = true
         end
     end
 

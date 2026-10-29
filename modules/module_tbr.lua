@@ -46,6 +46,8 @@ local BookList  = require("ui/widget/booklist")
 
 local SUISettings = require("infra/sui_store")
 local GridRenderer = require("engines/sui_book_grid")
+local Sources = require("engines/sui_book_sources")
+local SourceMenu = require("features/sui_source_menu")
 
 local TBR_MAX       = 5
 local TBR_SETTING   = "simpleui_tbr_list"    -- G_reader_settings key (kept in sync)
@@ -202,10 +204,8 @@ local function addTBR(filepath)
         if not (RC.coll and RC.coll[TBR_COLL_NAME]) then
             RC:addCollection(TBR_COLL_NAME)
         end
-        -- Call the *original* (un-hooked) addItem by going through the metatable
-        -- directly — we stored the original in plugin._orig_rc_additem, but we
-        -- don't have access to plugin here.  Instead we build the entry manually,
-        -- matching what buildEntry / addItem would do.
+        -- Bypass the hooked addItem: build the entry manually, matching what
+        -- buildEntry / addItem would do.
         local ffiUtil = require("ffi/util")
         local lfs2    = require("libs/libkoreader-lfs")
         local real    = ffiUtil.realpath(filepath) or filepath
@@ -258,206 +258,12 @@ end
 -- Module
 -- ---------------------------------------------------------------------------
 
--- Returns a short display title for a filepath.
-local function _getBookTitle(fp)
-    local title = fp:match("([^/]+)%.[^%.]+$") or fp
-    pcall(function()
-        local DS = require("docsettings")
-        local ok2, ds = pcall(DS.open, DS, fp)
-        if ok2 and ds then
-            local rp = ds:readSetting("doc_props") or {}
-            if rp.title and rp.title ~= "" then title = rp.title end
-            pcall(function() ds:close() end)
-        end
-    end)
-    if #title > 48 then title = title:sub(1, 45) .. "…" end
-    return title
-end
-
--- ── Arrange (TBR-specific: uses isTBR/removeTBR, not generic) ─────────
+-- ── Sort and Arrange ────────────────────────────────────────────────
 local function arrangeMenuItems(ctx_menu)
-    local _lc          = ctx_menu._
-    local refresh       = ctx_menu.refresh
-    local SortWidget    = ctx_menu.SortWidget
-    local _UIManager    = ctx_menu.UIManager
-    return {
-        GridRenderer.makeSortMenuItem({
-            _lc         = _lc,
-            refresh     = refresh,
-            state_key   = TBR_SORT_STATE,
-            getCollName = function() return TBR_COLL_NAME end,
-            getCount    = getTBRCount,
-            separator   = true,
-            -- Keeps the G_reader_settings fallback list in sync with the
-            -- freshly-written ReadCollection order.
-            onSorted    = function() _syncSettings(getTBRList()) end,
-        }),
-        {
-            text = _lc("Arrange"),
-            sub_item_table_func = function()
-                local sub_items = {}
-
-                sub_items[#sub_items + 1] = {
-                    text         = _lc("Arrange To Be Read List"),
-                    enabled_func = function() return getTBRCount() > 1 end,
-                    keep_menu_open = true,
-                    callback = function()
-                        local list = getTBRList()
-                        if #list < 2 then
-                            UI.Notify.toast(_lc("Add at least 2 books to arrange."), 2)
-                            return
-                        end
-                        local sort_items = {}
-                        for _, fp in ipairs(list) do
-                            sort_items[#sort_items + 1] = {
-                                text     = _getBookTitle(fp),
-                                filepath = fp,
-                                mandatory = "",
-                            }
-                        end
-                        local function on_save()
-                            local new_list = {}
-                            for _, item in ipairs(sort_items) do
-                                if item.filepath then
-                                    new_list[#new_list + 1] = item.filepath
-                                end
-                            end
-                            local RC2 = getRC()
-                            if RC2 and RC2.coll[TBR_COLL_NAME] then
-                                local ordered = {}
-                                for _, fp in ipairs(new_list) do
-                                    local entry = RC2.coll[TBR_COLL_NAME][fp]
-                                    if entry then ordered[#ordered + 1] = entry end
-                                end
-                                RC2:updateCollectionOrder(TBR_COLL_NAME, ordered)
-                                RC2:write({ [TBR_COLL_NAME] = true })
-                            end
-                            _syncSettings(new_list)
-                            refresh()
-                        end
-                        _UIManager:show(SortWidget:new{ title = _lc("Arrange To Be Read List"), item_table = sort_items, covers_fullscreen = true, callback = on_save })
-                    end,
-                }
-
-                sub_items[#sub_items + 1] = { text = _lc("To Be Read Books"), enabled = false, separator = true }
-
-                local list = getTBRList()
-                if #list == 0 then
-                    sub_items[#sub_items + 1] = { text = _lc("No books in To Be Read list."), enabled = false }
-                else
-                    for _, fp in ipairs(list) do
-                        local _fp    = fp
-                        local _title = _getBookTitle(fp)
-                        sub_items[#sub_items + 1] = {
-                            text           = _title,
-                            checked_func   = function() return isTBR(_fp) end,
-                            keep_menu_open = true,
-                            callback       = function()
-                                removeTBR(_fp)
-                                refresh()
-                            end,
-                        }
-                    end
-                end
-
-                return sub_items
-            end,
-            sui_build = ctx_menu.is_sui and function(ctx, _item)
-                local SUIWindow = require("engines/sui_window")
-                return SUIWindow.ListRow{
-                    title        = _lc("Arrange"),
-                    subtitle     = function()
-                        local list = getTBRList()
-                        if #list == 0 then return _lc("No books in To Be Read list.") end
-                        local names = {}
-                        for _, fp in ipairs(list) do
-                            names[#names + 1] = _getBookTitle(fp)
-                        end
-                        return table.concat(names, "  ·  ")
-                    end,
-                    inner_w      = ctx.inner_w,
-                    show_chevron = true,
-                    on_tap       = function()
-                        local list = getTBRList()
-                        local sort_items = {}
-                        for _, fp in ipairs(list) do
-                            sort_items[#sort_items + 1] = {
-                                text      = _getBookTitle(fp),
-                                orig_item = fp,
-                            }
-                        end
-
-                        ctx.push("nested_menu", {
-                            title = _lc("Arrange"),
-                            items_func = function()
-                                return {
-                                    {
-                                        text = "Items List",
-                                        sui_build = function(ctx2)
-                                            local SUIWindow2 = require("engines/sui_window")
-                                            local function save_order(items_to_save)
-                                                local new_list = {}
-                                                for _, it in ipairs(items_to_save) do
-                                                    new_list[#new_list + 1] = it.orig_item
-                                                end
-                                                local RC2 = getRC()
-                                                if RC2 and RC2.coll[TBR_COLL_NAME] then
-                                                    local ordered = {}
-                                                    for _, fp in ipairs(new_list) do
-                                                        local entry = RC2.coll[TBR_COLL_NAME][fp]
-                                                        if entry then ordered[#ordered + 1] = entry end
-                                                    end
-                                                    RC2:updateCollectionOrder(TBR_COLL_NAME, ordered)
-                                                    RC2:write({ [TBR_COLL_NAME] = true })
-                                                end
-                                                _syncSettings(new_list)
-                                            end
-
-                                            local cards = {}
-                                            for i, item in ipairs(sort_items) do
-                                                local _i   = i
-                                                local _fp  = item.orig_item
-                                                cards[#cards + 1] = SUIWindow2.ArrangeCard{
-                                                    inner_w      = ctx2.inner_w,
-                                                    title        = item.text,
-                                                    on_delete    = function()
-                                                        table.remove(sort_items, _i)
-                                                        removeTBR(_fp)
-                                                        ctx_menu.refresh()
-                                                        ctx2.repaint()
-                                                    end,
-                                                    on_move_up   = (_i > 1) and function()
-                                                        sort_items[_i], sort_items[_i-1] = sort_items[_i-1], sort_items[_i]
-                                                        save_order(sort_items)
-                                                        ctx_menu.refresh()
-                                                        ctx2.repaint()
-                                                    end or nil,
-                                                    on_move_down = (_i < #sort_items) and function()
-                                                        sort_items[_i], sort_items[_i+1] = sort_items[_i+1], sort_items[_i]
-                                                        save_order(sort_items)
-                                                        ctx_menu.refresh()
-                                                        ctx2.repaint()
-                                                    end or nil,
-                                                }
-                                            end
-
-                                            if #cards == 0 then
-                                                cards[#cards + 1] = SUIWindow2.ListRow{
-                                                    title   = _lc("No books in To Be Read list."),
-                                                    inner_w = ctx2.inner_w,
-                                                }
-                                            end
-                                            return cards
-                                        end
-                                    }
-                                }
-                            end
-                        })
-                    end
-                }
-            end or nil,
-        },
-    }
+    return SourceMenu.collectionItems(ctx_menu, "tbr", nil, {
+        sort      = SourceMenu.keyedState(TBR_SORT_STATE),
+        separator = true,
+    })
 end
 
 -- ── extra_menu_items_after — auto-remove-on-finish toggle ──────────────────
@@ -501,7 +307,7 @@ M.TBR_MAX       = TBR_MAX
 -- Use this wherever the name is shown to the user; keep TBR_COLL_NAME
 -- for all RC / settings key lookups.
 function M.getDisplayName()
-    return _("To Be Read")
+    return Sources.label("tbr")
 end
 
 -- Public API
@@ -515,10 +321,11 @@ M.removeTBR   = removeTBR
 -- book that just became "complete" should be dropped from the TBR list.
 M.isAutoRemoveFinishedEnabled = isAutoRemoveFinishedEnabled
 
--- Menu glue for the "tbr" row module's extra_menu_items_before (below) --
--- kept as a named local/export since it's entangled with this file's
--- private helpers (getTBRList, removeTBR, TBR_COLL_NAME, _getBookTitle, ...).
-M.arrangeMenuItems = arrangeMenuItems
+-- Keeps the G_reader_settings fallback list in sync with the collection order.
+M.syncSettings = _syncSettings
+
+-- "Remove from list when finished" row, shared with the book source.
+M.autoRemoveMenuItems = extraMenuItemsAfter
 
 -- ---------------------------------------------------------------------------
 -- genTBRButton — button for the single-book hold dialog.
@@ -530,9 +337,10 @@ function M.genTBRButton(file, close_cb)
     local indicator = string.format("(%d)", count)
 
     return {
-        text    = (in_tbr and _("Remove from To Be Read") or _("Add to To Be Read"))
-                  .. "  " .. indicator,
-        enabled = true,
+        text     = (in_tbr and _("Remove from To Be Read") or _("Add to To Be Read"))
+                   .. "  " .. indicator,
+        sui_icon = "bookmark",
+        enabled  = true,
         callback = function()
             if in_tbr then
                 removeTBR(file)
@@ -551,6 +359,10 @@ function M.genTBRButton(file, close_cb)
     }
 end
 
+-- Book list of the row: the "tbr" source (engines/sui_book_sources.lua),
+-- which reads getTBRList above.
+local source = Sources.bind("tbr")
+
 -- ---------------------------------------------------------------------------
 -- "cover row" module registration (id/build/getHeight/getMenuItems/
 -- reset) — merged directly onto M below. `paged = true` removes the old
@@ -562,13 +374,14 @@ end
 local tbr_module = GridRenderer.makeModule{
     id          = "tbr",
     name        = _("To Be Read"),
-    label       = _("To Be Read"),
+    category    = "books",
+    label       = Sources.label("tbr"),
     default_on  = false,
     is_book_mod = true,   -- needed for the surgical repaint of the swipe
     max_items   = 5,
     paged       = true,
     cache_key   = "_tbr_fps",   -- shared with module_coverdeck.lua
-    getFileList = getTBRList,
+    getFileList = source.getFileList,
     extra_menu_items_before = arrangeMenuItems,
     extra_menu_items_after  = extraMenuItemsAfter,
 

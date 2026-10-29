@@ -131,7 +131,7 @@ function Onboarding.show(on_finish)
                     face      = Font:getFace(SUIStyle.FACE_REGULAR, ctx.SZ(SUIStyle.FS_BODY)),
                     width     = iw - ctx.SZ(Screen:scaleBySize(40)),
                     alignment = "left",
-                    fgcolor   = SUIStyle.COLOR.text_secondary,
+                    fgcolor   = SUIStyle.COLOR.text_primary,
                 },
             },
         })
@@ -145,27 +145,21 @@ function Onboarding.show(on_finish)
     local function buildPresetList(ctx)
         local iw = ctx.inner_w
         local rows = {}
-        local builtins = SUIPresets.getBuiltinPresets and SUIPresets.getBuiltinPresets() or {}
 
         local preset_rows_args = { align = "left" }
-        rows[#rows + 1] = VerticalSpan:new{ width = ctx.SZ(Screen:scaleBySize(14)) }
-        for i, bp in ipairs(builtins) do
-            rows[#rows + 1] = SUI.ListRow{
-                title     = bp.name,
-                subtitle  = bp.desc,
-                inner_w   = iw - ctx.SZ(Screen:scaleBySize(40)),
-                radio     = true,
-                checked   = (st.selected_preset == bp.id),
-                separator = (i < #builtins),
-                on_tap    = function()
-                    st.selected_preset = bp.id
-                    if SUIPresets.applyBuiltin then SUIPresets.applyBuiltin(st.selected_preset) end
-                    SUISettings:set("simpleui_hs_active_preset", st.selected_preset)
-                    local ok, HS = pcall(require, "screens/sui_homescreen")
-                    if ok and HS and HS.rebuildLayout then HS.rebuildLayout() end
-                    ctx.repaint()
-                end,
-            }
+        for _i, row in ipairs(SUIPresets.buildListRows{
+            inner_w    = iw - ctx.SZ(Screen:scaleBySize(40)),
+            is_checked = function(id) return st.selected_preset == id end,
+            on_builtin = function(bp)
+                st.selected_preset = bp.id
+                if SUIPresets.applyBuiltin then SUIPresets.applyBuiltin(st.selected_preset) end
+                SUISettings:set("simpleui_hs_active_preset", st.selected_preset)
+                local ok, HS = pcall(require, "screens/sui_homescreen")
+                if ok and HS and HS.rebuildLayout then HS.rebuildLayout() end
+                ctx.repaint()
+            end,
+        }) do
+            table.insert(preset_rows_args, row)
         end
 
         return rows
@@ -209,7 +203,7 @@ function Onboarding.show(on_finish)
                     face      = Font:getFace(SUIStyle.FACE_REGULAR, ctx.SZ(SUIStyle.FS_BODY)),
                     width     = iw - ctx.SZ(Screen:scaleBySize(40)),
                     alignment = "left",
-                    fgcolor   = SUIStyle.COLOR.text_secondary,
+                    fgcolor   = SUIStyle.COLOR.text_primary,
                 },
             },
         })
@@ -292,7 +286,7 @@ function Onboarding.show(on_finish)
                     face      = Font:getFace(SUIStyle.FACE_REGULAR, ctx.SZ(SUIStyle.FS_BODY)),
                     width     = iw - ctx.SZ(Screen:scaleBySize(40)),
                     alignment = "left",
-                    fgcolor   = SUIStyle.COLOR.text_secondary,
+                    fgcolor   = SUIStyle.COLOR.text_primary,
                 },
             },
         })
@@ -334,7 +328,6 @@ function Onboarding.show(on_finish)
 
         local Size      = require("ui/size")
         local fg        = SUIStyle.COLOR.text_primary
-        local fg_sub    = SUIStyle.COLOR.text_secondary
         local sep_color = SUIStyle.COLOR.gray_soft
 
         local tip_vg = VerticalGroup:new{ align = "left" }
@@ -359,7 +352,7 @@ function Onboarding.show(on_finish)
                         face      = Font:getFace(SUIStyle.FACE_REGULAR, ctx.SZ(SUIStyle.FS_CAPTION)),
                         width     = text_w,
                         alignment = "left",
-                        fgcolor   = fg_sub,
+                        fgcolor   = fg,
                     },
                 },
             }

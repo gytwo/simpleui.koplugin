@@ -5,19 +5,21 @@
 -- no C. sub-namespace.
 --
 -- Architecture:
---   LayoutService  — data layer (load/save layout, module names)
+--   LayoutService  — data layer, in infra/sui_layout (load/save layout, module names)
 --   buildScreens   — render layer (one function per screen)
 --   SettingsWindow — entry point (:show)
 --
 -- Screen map (all keys registered in SUIWindow.screens):
 --   __root__               — top-level settings menu
 --   home_screen_settings   — Home Screen section (layout, "Extra Custom Screens",
---                             "Wallpaper" (nested_menu sub-item), presets, behaviour)
+--                             "Wallpaper" and "Stats" (nested_menu sub-items), presets,
+--                             behaviour)
 --   custom_screens          — Custom Screens list (reached via Home Screen ▸
 --                              "Extra Custom Screens", not linked from __root__)
 --   bars_settings           — Bars section
 --   library_settings        — Library section
 --   style_settings          — Style section (icons, fonts and appearance)
+--   critter_settings        — Tiny Critter section
 --   quick_actions_settings — Quick Actions section
 --   about_settings         — About section
 --   pages                  — Layout editor (page list)
@@ -50,205 +52,20 @@
 --   end
 -- ===========================================================================
 
-local Device      = require("device")
-local Geom        = require("ui/geometry")
 local UIManager   = require("ui/uimanager")
 local UI         = require("infra/sui_core")
 local _           = require("infra/sui_i18n").translate
 
 local SUI         = require("engines/sui_window")
-local SUIStyle    = require("features/sui_style")
 local Registry    = require("modules/moduleregistry")
-local SUISettings = require("infra/sui_store")
+local Config      = require("infra/sui_config")
+local BentoSheet  = require("features/dialogs/sui_bento_sheet")
+local Bento       = require("infra/sui_bento")
 
-local SortWidget  = require("ui/widget/sortwidget")
-local ButtonDialog = require("ui/widget/buttondialog")
-local logger      = require("logger")
 
 local SettingsWindow = {}
 
--- ===========================================================================
--- 1. Data Services
--- ===========================================================================
-
-local LayoutService = {}
-
--- Normalize layout module entries to plain ids. Legacy { id, width } tables
--- (brief experimental schema) migrate width into Config bento settings and
--- collapse back to a string id so the layout stays a pure order list.
-function LayoutService.entryId(entry)
-    if type(entry) == "table" then return entry.id end
-    return entry
-end
-
-local function _normalizeLayoutModules(layout, pfx)
-    if type(layout) ~= "table" or type(layout.pages) ~= "table" then return layout end
-    local Config = require("infra/sui_config")
-    local changed = false
-    for _, page in ipairs(layout.pages) do
-        if type(page.modules) == "table" then
-            local out = {}
-            for _, entry in ipairs(page.modules) do
-                if type(entry) == "table" and entry.id then
-                    if type(entry.width) == "number" then
-                        Config.setBentoWidth(entry.width, entry.id, pfx)
-                    end
-                    out[#out + 1] = entry.id
-                    changed = true
-                else
-                    out[#out + 1] = entry
-                end
-            end
-            page.modules = out
-        end
-    end
-    if changed then
-        -- Caller (load) persists via layout_key when appropriate.
-    end
-    return layout, changed
-end
-
-
-local _DEFAULT_PFX        = "simpleui_hs_"
-local _DEFAULT_LAYOUT_KEY = "simpleui_layout"
-
--- Module membership of each layout as of its last load/save, keyed by layout
--- key. The editor mutates the stored layout table in place, so membership
--- changes can only be detected against this independent snapshot.
-local _committed_sets = {}
-
--- Returns the set of module ids placed in a layout.
-local function _activeSet(layout)
-    local set = {}
-    for _, page in ipairs(layout.pages) do
-        for _, entry in ipairs(page.modules) do
-            local mod_id = LayoutService.entryId(entry)
-            if mod_id then set[mod_id] = true end
-        end
-    end
-    return set
-end
-
-function LayoutService.load(pfx, layout_key)
-    pfx        = pfx or _DEFAULT_PFX
-    layout_key = layout_key or _DEFAULT_LAYOUT_KEY
-
-    local saved = SUISettings:readSetting(layout_key)
-    if type(saved) == "table" and saved.pages then
-        local _, changed = _normalizeLayoutModules(saved, pfx)
-        if changed then SUISettings:saveSetting(layout_key, saved) end
-        _committed_sets[layout_key] = _activeSet(saved)
-        return saved
-    end
-
-    local order          = Registry.loadOrder(pfx)
-    local pages          = {}
-    local cur_page       = { id = 1, modules = {} }
-
-    for _, mod_id in ipairs(order) do
-        if mod_id == "__page_break__" then
-            table.insert(pages, cur_page)
-            cur_page = { id = #pages + 1, modules = {} }
-        else
-            local mod = Registry.get(mod_id)
-            if mod and Registry.isEnabled(mod, pfx) then
-                table.insert(cur_page.modules, mod_id)
-            end
-        end
-    end
-
-    table.insert(pages, cur_page)
-
-    local layout = { pages = pages }
-    _committed_sets[layout_key] = _activeSet(layout)
-    return layout
-end
-
-function LayoutService.save(layout, pfx, layout_key, screen_id)
-    pfx        = pfx or _DEFAULT_PFX
-    layout_key = layout_key or _DEFAULT_LAYOUT_KEY
-    screen_id  = screen_id or "hs"
-
-    SUISettings:saveSetting(layout_key, layout)
-
-    local active_set = _activeSet(layout)
-    -- Membership before this save, used to apply enable/disable only to the
-    -- modules that were actually added to or removed from the layout.
-    local previous_set = _committed_sets[layout_key] or active_set
-    _committed_sets[layout_key] = active_set
-    local flat_order = {}
-
-    for _, page in ipairs(layout.pages) do
-        for _, entry in ipairs(page.modules) do
-            local mod_id = LayoutService.entryId(entry)
-            if mod_id then table.insert(flat_order, mod_id) end
-        end
-    end
-
-    for _, mod in ipairs(Registry.list()) do
-        if not active_set[mod.id] then
-            table.insert(flat_order, mod.id)
-        end
-    end
-
-    SUISettings:saveSetting(pfx .. "module_order", flat_order)
-
-    for _, mod in ipairs(Registry.list()) do
-        local is_active = (active_set[mod.id] == true)
-        -- Modules that stay in (or out of) the layout keep their own settings,
-        -- including per-item visibility.
-        if is_active ~= (previous_set[mod.id] == true) then
-            -- A module taken out of the layout drops its text styles, so adding
-            -- it back later starts from the defaults.
-            if not is_active and mod.text_elems then
-                require("infra/sui_config").resetTextStyles(mod.id, mod.text_elems, pfx)
-            end
-            if type(mod.setEnabled) == "function" then
-                mod.setEnabled(pfx, is_active)
-            elseif mod.enabled_key then
-                SUISettings:saveSetting(pfx .. mod.enabled_key, is_active)
-            end
-        end
-    end
-
-    -- Repaint whichever screen this layout belongs to, if it's currently
-    -- open. The built-in Homescreen keeps going through the flat HS.refresh
-    -- (unchanged codepath); any other screen_id uses the generic, id-aware
-    -- refreshScreen — see engines/sui_screen_engine.lua.
-    local HS = package.loaded["screens/sui_homescreen"]
-    if HS then
-        if screen_id == "hs" then
-            if HS._instance then
-                pcall(function() HS.refresh(false) end)
-            end
-        elseif HS.refreshScreen then
-            pcall(function() HS.refreshScreen(screen_id, false) end)
-        end
-    end
-end
-
-function LayoutService.getModuleName(mod_id)
-    local mod = Registry.get(mod_id)
-    local mod_name = mod and mod.name or mod_id
-    if type(mod_id) == "string" and mod_id:match("_row_") then
-        -- Find position across all instanciable base keys.
-        local inst_keys = {
-            "simpleui_qa_row_instances",
-            "simpleui_spacer_row_instances",
-        }
-        for _, key in ipairs(inst_keys) do
-            local inst_ids = SUISettings:readSetting(key) or {}
-            if #inst_ids > 1 then
-                for idx, mid in ipairs(inst_ids) do
-                    if mid == mod_id then
-                        return mod_name .. " " .. idx
-                    end
-                end
-            end
-        end
-    end
-    return mod_name
-end
+local LayoutService = require("infra/sui_layout")
 
 -- ===========================================================================
 -- 2. Screen Builders
@@ -281,24 +98,13 @@ local function buildScreens(st)
         return plugin
     end
 
-    -- makeCtxMenu: builds the standard ctx_menu passed to plugin menu generators.
-    -- All screens that delegate to a plugin.makeFooMenuItems share this shape.
+    -- makeCtxMenu: the standard ctx_menu passed to plugin menu generators, with
+    -- the key prefixes of the screen being edited.
     local function makeCtxMenu(ctx)
-        return {
-            pfx          = st.pfx,
-            pfx_qa       = st.pfx_qa,
-            is_sui       = true,           -- signals that we are inside a SUIWindow
-            refresh      = SUI.withRepaint(ctx),
-            show_arrange      = function(params) ctx.push("arrange", params) end,
-            show_row_page     = function(params) ctx.push("row_page", params) end,
-            show_item_picker  = function(params) ctx.push("item_picker", params) end,
-            UIManager    = UIManager,
-            _            = _,
-            N_           = require("infra/sui_i18n").ngettext,
-            SortWidget   = SortWidget,
-            lock_overlay   = ctx.lockOverlay,
-            unlock_overlay = ctx.unlockOverlay,
-        }
+        local ctx_menu  = SUI.makeCtxMenu(ctx)
+        ctx_menu.pfx    = st.pfx
+        ctx_menu.pfx_qa = st.pfx_qa
+        return ctx_menu
     end
 
     -- makeMenuTable: wraps a KOReader item list as SUI.MenuTable rows.
@@ -307,8 +113,6 @@ local function buildScreens(st)
             items          = items,
             inner_w        = ctx.inner_w,
             repaint        = function() ctx.repaint() end,
-            lock_overlay   = ctx.lockOverlay   or function() end,
-            unlock_overlay = ctx.unlockOverlay or function() end,
             push_stack = function(id, params)
                 if type(id) == "string" then
                     ctx.push(id, params)
@@ -351,6 +155,7 @@ local function buildScreens(st)
         return {
             SUI.ListRow{
                 title        = _("Home Screen"),
+                left_icon    = "home",
                 subtitle     = _("Layout, wallpaper, presets and behaviour"),
                 inner_w      = iw,
                 show_chevron = true,
@@ -358,6 +163,7 @@ local function buildScreens(st)
             },
             SUI.ListRow{
                 title        = _("Bars"),
+                left_icon    = "bars",
                 subtitle     = _("Status, title, navigation and pagination"),
                 inner_w      = iw,
                 show_chevron = true,
@@ -365,6 +171,7 @@ local function buildScreens(st)
             },
             SUI.ListRow{
                 title        = _("Library"),
+                left_icon    = "library",
                 subtitle     = _("Book-browser settings"),
                 inner_w      = iw,
                 show_chevron = true,
@@ -372,13 +179,23 @@ local function buildScreens(st)
             },
             SUI.ListRow{
                 title        = _("Style"),
+                left_icon    = "style",
                 subtitle     = _("Icons, fonts and appearance"),
                 inner_w      = iw,
                 show_chevron = true,
                 on_tap       = function() ctx.push("style_settings") end,
             },
             SUI.ListRow{
+                title        = _("Tiny Critter"),
+                left_icon    = "critter",
+                subtitle     = _("Your companion and what it says"),
+                inner_w      = iw,
+                show_chevron = true,
+                on_tap       = function() ctx.push("critter_settings") end,
+            },
+            SUI.ListRow{
                 title        = _("Quick Actions"),
+                left_icon    = "quick_actions",
                 subtitle     = _("Global custom actions & icons"),
                 inner_w      = iw,
                 show_chevron = true,
@@ -393,11 +210,37 @@ local function buildScreens(st)
             },
             SUI.ListRow{
                 title        = _("About"),
+                left_icon    = "info",
                 subtitle     = _("Version, author and updates"),
                 inner_w      = iw,
                 show_chevron = true,
                 on_tap       = function() ctx.push("about_settings") end,
             },
+        }
+    end
+
+    -- Stats menu screen. Opening a statistics window closes this window; the
+    -- statistics window's back button reopens it on the same screen.
+    local function statsMenuParams()
+        return {
+            title      = _("Stats"),
+            items_func = function(ctx)
+                local plugin = getPlugin()
+                if not (plugin and plugin.makeStatsMenuItems) then return {} end
+                return plugin.makeStatsMenuItems{
+                    open_window = function(id)
+                        ctx.close()
+                        require("screens/sui_stats_launcher").open(id, {
+                            on_back = function()
+                                SettingsWindow:show(nil, {
+                                    { id = "home_screen_settings" },
+                                    { id = "nested_menu", params = statsMenuParams() },
+                                })
+                            end,
+                        })
+                    end,
+                }
+            end,
         }
     end
 
@@ -443,6 +286,12 @@ local function buildScreens(st)
                 inner_w      = iw,
                 show_chevron = true,
                 on_tap       = function() ctx.push("presets") end,
+            },
+            SUI.ListRow{
+                title        = _("Stats"),
+                inner_w      = iw,
+                show_chevron = true,
+                on_tap       = function() ctx.push("nested_menu", statsMenuParams()) end,
             },
             SUI.ListRow{
                 title        = _("Behaviour"),
@@ -506,38 +355,20 @@ local function buildScreens(st)
                     })
                 end,
                 on_edit = function()
-                    local InputDialog = require("ui/widget/inputdialog")
-                    local dialog
-                    dialog = InputDialog:new{
-                        title      = _("Rename screen"),
-                        input      = _screen.name,
-                        input_hint = _("Screen name"),
-                        buttons    = {{
-                            {
-                                text     = _("Cancel"),
-                                id       = "close",
-                                callback = function() UIManager:close(dialog) end,
-                            },
-                            {
-                                text             = _("Save"),
-                                is_enter_default = true,
-                                callback         = function()
-                                    local name = dialog:getInputText()
-                                    name = name and name:match("^%s*(.-)%s*$") or ""
-                                    UIManager:close(dialog)
-                                    if name ~= "" then
-                                        CustomScreens.rename(_screen.id, name)
-                                        ctx.repaint()
-                                    end
-                                end,
-                            },
-                        }},
+                    require("features/dialogs/sui_dialogs").prompt{
+                        title     = _("Rename screen"),
+                        value     = _screen.name,
+                        hint      = _("Screen name"),
+                        ok_text   = _("Save"),
+                        on_submit = function(name)
+                            CustomScreens.rename(_screen.id, name)
+                            ctx.repaint()
+                        end,
                     }
-                    UIManager:show(dialog)
                 end,
                 on_delete = function()
-                    local ConfirmBox = require("ui/widget/confirmbox")
-                    UIManager:show(ConfirmBox:new{
+                    local Dialogs = require("features/dialogs/sui_dialogs")
+                    Dialogs.confirm{
                         text        = string.format(
                             _("Delete \"%s\"? This removes its layout, modules and Quick Action."),
                             _screen.name),
@@ -546,7 +377,7 @@ local function buildScreens(st)
                             CustomScreens.delete(_screen.id)
                             ctx.repaint()
                         end,
-                    })
+                    }
                 end,
             })
         end
@@ -587,8 +418,8 @@ local function buildScreens(st)
             local _p_idx = p_idx
 
             local del_fn = _p_idx > 1 and function()
-                local ConfirmBox = require("ui/widget/confirmbox")
-                UIManager:show(ConfirmBox:new{
+                local Dialogs = require("features/dialogs/sui_dialogs")
+                Dialogs.confirm{
                     text        = _("Delete") .. " " .. title .. "?",
                     ok_callback = function()
                         local actual_idx
@@ -600,7 +431,7 @@ local function buildScreens(st)
                             saveAndRepaint(ctx)
                         end
                     end,
-                })
+                }
             end or nil
 
             local mod_names = {}
@@ -643,165 +474,116 @@ local function buildScreens(st)
     end
 
     -- ── 2.4. Layout Editor: modules on a page ────────────────────────────────
-    local function buildPageEdit(ctx)
-        local iw   = ctx.inner_w
-        local items = {}
-        local page = st.layout.pages[st.current_page]
-        if not page then return items end
+    -- Removes a module from its page (and destroys it, for a dynamic instance).
+    local function removeModule(ctx, mod_id)
+        local Dialogs  = require("features/dialogs/sui_dialogs")
+        local mod_name = LayoutService.getModuleName(mod_id)
+        Dialogs.confirm{
+            text        = _("Delete") .. " " .. mod_name .. "?",
+            ok_callback = function()
+                LayoutService.remove(st.layout, st.pfx, mod_id)
+                saveAndRepaint(ctx)
+            end,
+        }
+    end
 
-        -- Build a positional number for each _row_ instance based on creation
-        -- order, using the persisted instance list as the source of truth.
-        -- Moving rows in the layout does not change their number; only deletion
-        -- reindexes (destroyInstance already removes from the persisted list,
-        -- so the next repaint reflects the new numbers automatically).
-        local row_counters = {}
-        local qa_inst_ids = SUISettings:readSetting("simpleui_qa_row_instances") or {}
-        for idx, mid in ipairs(qa_inst_ids) do
-            row_counters[mid] = { idx = idx, kind = "qa" }
-        end
-        local spacer_inst_ids = SUISettings:readSetting("simpleui_spacer_row_instances") or {}
-        for idx, mid in ipairs(spacer_inst_ids) do
-            row_counters[mid] = { idx = idx, kind = "spacer" }
-        end
-
-        for m_idx, entry in ipairs(page.modules) do
-            local mod_id       = LayoutService.entryId(entry)
-            local mod_name     = LayoutService.getModuleName(mod_id)
-            local mod_subtitle = nil
-
-            if row_counters[mod_id] then
-                local entry = row_counters[mod_id]
-                if entry.kind == "spacer" then
-                    local ok_cfg, Config2 = pcall(require, "infra/sui_config")
-                    if ok_cfg and Config2 then
-                        local pct = Config2.getModuleScalePct(mod_id, st.pfx)
-                        mod_subtitle = pct .. "%"
-                    end
-                else
-                    local items_key = st.pfx_qa .. mod_id .. "_items"
-                    local qa_ids = SUISettings:readSetting(items_key) or {}
-                    if #qa_ids > 0 then
-                        local ok_qa, QA = pcall(require, "features/sui_quickactions")
-                        if ok_qa and QA and QA.getEntry then
-                            local names = {}
-                            for _, qa_id in ipairs(qa_ids) do
-                                local entry2 = QA.getEntry(qa_id)
-                                table.insert(names, entry2 and entry2.label or qa_id)
-                            end
-                            mod_subtitle = table.concat(names, "  ·  ")
-                        end
-                    end
-                    if not mod_subtitle or mod_subtitle == "" then mod_subtitle = _("No actions configured") end
-                end
-            end
-
-            -- Featured Collection instances: shows the assigned collection as a
-            -- subtitle (e.g. "test"), to distinguish instances in the page's
-            -- module list without having to open each one.
-            if type(mod_id) == "string" and mod_id:match("^coll_row_") then
-                local coll_name = SUISettings:readSetting(st.pfx .. mod_id .. "_coll_name")
-                if coll_name and coll_name ~= "" then
-                    mod_subtitle = coll_name
-                else
-                    mod_subtitle = _("No collection selected")
-                end
-            end
-
-            table.insert(items, {
-                text         = mod_name,
-                subtitle     = mod_subtitle,
-                orig_item    = mod_id,
-                show_chevron = true,
-                on_tap       = function()
-                    st.current_module_id = mod_id
-                    ctx.push("module_settings")
-                end,
-                on_delete    = function()
-                    local ConfirmBox = require("ui/widget/confirmbox")
-                    UIManager:show(ConfirmBox:new{
-                        text        = _("Delete") .. " " .. mod_name .. "?",
-                        ok_callback = function()
+    -- Lets the user pick the page a module moves to.
+    local function moveModuleToPage(ctx, mod_id)
+        local picker_items = {}
+        for p_idx, _p in ipairs(st.layout.pages) do
+            if p_idx ~= st.current_page then
+                local _p_idx = p_idx
+                local title  = _p_idx == 1
+                    and _("Page 1 (Home)")
+                    or  string.format(_("Page %d"), _p_idx)
+                table.insert(picker_items, {
+                    text = title,
+                    on_tap = function(picker_ctx)
+                        local page = LayoutService.findPage(st.layout, mod_id)
+                        if page then
                             for i, m in ipairs(page.modules) do
                                 if LayoutService.entryId(m) == mod_id then
                                     table.remove(page.modules, i)
                                     break
                                 end
                             end
-                            -- If this is a dynamic instance, destroy it and purge its settings.
-                            if mod_id:match("_row_") then
-                                Registry.purgeInstanceSettings(mod_id, st.pfx)
-                                Registry.destroyInstance(mod_id)
-                            end
-                            saveAndRepaint(ctx)
-                        end,
-                    })
-                end,
-                more_items = {
-                    {
-                        text = _("Move to page"),
-                        icon = "move_page",
-                        on_tap = function()
-                            local picker_items = {}
-                            for p_idx, p in ipairs(st.layout.pages) do
-                                if p_idx ~= st.current_page then
-                                    local _p_idx = p_idx
-                                    local title  = _p_idx == 1
-                                        and _("Page 1 (Home)")
-                                        or  string.format(_("Page %d"), _p_idx)
-                                    table.insert(picker_items, {
-                                        text = title,
-                                        on_tap = function(picker_ctx)
-                                            local actual_idx
-                                            for i, m in ipairs(page.modules) do
-                                                if LayoutService.entryId(m) == mod_id then
-                                                    actual_idx = i
-                                                    break
-                                                end
-                                            end
-                                            if actual_idx then
-                                                table.remove(page.modules, actual_idx)
-                                                table.insert(st.layout.pages[_p_idx].modules, mod_id)
-                                                LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
-                                            end
-                                            picker_ctx.pop()
-                                            ctx.repaint()
-                                        end
-                                    })
-                                end
-                            end
-                            if #picker_items == 0 then
-                                UI.Notify.toast(_("No other pages available."), 2)
-                                return
-                            end
-                            ctx.push("item_picker", { title = _("Move to page"), items = picker_items })
+                            table.insert(st.layout.pages[_p_idx].modules, mod_id)
+                            LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
                         end
-                    }
-                },
-            })
+                        picker_ctx.pop()
+                        ctx.repaint()
+                    end
+                })
+            end
         end
+        if #picker_items == 0 then
+            UI.Notify.toast(_("No other pages available."), 2)
+            return
+        end
+        ctx.push("item_picker", { title = _("Move to page"), items = picker_items })
+    end
 
-        return SUI.ArrangeList{
-            ctx        = ctx,
-            inner_w    = iw,
-            items      = items,
-            empty_text = _("No modules"),
-            on_repaint = function() ctx.repaint() end,
-            on_change  = function(new_items)
-                local new_mods = {}
-                for _, it in ipairs(new_items) do
-                    table.insert(new_mods, it.orig_item)
-                end
-                st.layout.pages[st.current_page].modules = new_mods
-                LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
+    local function buildPageEdit(ctx)
+        local page = st.layout.pages[st.current_page]
+        if not page then return {} end
+        local ids, spans = LayoutService.pageSpans(page, st.pfx)
+        local mode       = LayoutService.mode(st.pfx)
+
+        return SUI.BentoMap{
+            inner_w     = ctx.inner_w,
+            rows        = Bento.packFor(ids, spans, mode),
+            spans       = spans,
+            row_total   = mode.classic and Bento.CLASSIC_MAX or Bento.ROW,
+            label_for   = LayoutService.getModuleName,
+            span_label  = function(span)
+                if mode.classic then return span .. "%" end
+                return span == Bento.FULL and _("Full Width") or Config.bentoSpanLabel(span)
+            end,
+            summary_for = function(mod_id) return Registry.getSummary(mod_id, st.pfx, st.pfx_qa) end,
+            can_move    = function(mod_id) return Bento.canMove(ids, spans, mod_id, mode) end,
+            on_move     = function(mod_id, dir)
+                LayoutService.move(st.layout, st.pfx, mod_id, dir)
+                saveAndRepaint(ctx)
+            end,
+            open_text   = _("Incomplete row"),
+            empty_text  = _("No modules"),
+            on_delete   = function(mod_id) removeModule(ctx, mod_id) end,
+            on_tap      = function(mod_id)
+                BentoSheet.show{
+                    mod_id     = mod_id,
+                    pfx        = st.pfx,
+                    layout     = st.layout,
+                    subtitle_for = function(id) return Registry.getSummary(id, st.pfx, st.pfx_qa) end,
+                    on_changed = function() ctx.repaint() end,
+                    rows       = function(id)
+                        return {
+                            {
+                                text = _("Settings"), sui_icon = "settings", chevron = true,
+                                callback = function()
+                                    st.current_module_id = id
+                                    ctx.push("module_settings")
+                                end,
+                            },
+                            {
+                                text = _("To Page"), sui_icon = "move_page", chevron = true,
+                                callback = function() moveModuleToPage(ctx, id) end,
+                            },
+                        }
+                    end,
+                }
             end,
         }
     end
 
     -- ── 2.5. Module Picker ───────────────────────────────────────────────────
+    -- Two levels: the categories that still have something to add, then the
+    -- modules of the chosen category (params.category).
     local function buildModulePicker(ctx)
         local iw         = ctx.inner_w
         local items      = {}
         local active_set = {}
+        local cur        = ctx.current()
+        local chosen     = cur and cur.params and cur.params.category
 
         for _, page in ipairs(st.layout.pages) do
             for _, m in ipairs(page.modules) do
@@ -810,53 +592,55 @@ local function buildScreens(st)
             end
         end
 
-        local all_mods = Registry.list()
-        logger.dbg("simpleui: buildModulePicker: Registry.list() count =", #all_mods)
-        local active_count = 0
-        for k, _ in pairs(active_set) do active_count = active_count + 1 end
-        logger.dbg("simpleui: buildModulePicker: active_set count =", active_count)
-        for k, _ in pairs(active_set) do logger.dbg("  active:", k) end
-        for _, mod in ipairs(all_mods) do
-            local is_inst = mod.id:match("_row_") ~= nil
-            logger.dbg("  mod:", mod.id, "is_instance:", is_inst, "in_active:", active_set[mod.id] ~= nil)
+        -- Candidates by category: singleton modules not yet in the layout
+        -- (instances are skipped) and, always, one "Add" entry per instanciable
+        -- module.
+        local by_cat = {}
+        local function addEntry(mod_id, title, on_tap)
+            local cat = Registry.getCategory(mod_id)
+            by_cat[cat] = by_cat[cat] or {}
+            table.insert(by_cat[cat], { title = title, on_tap = on_tap })
         end
-        logger.dbg("simpleui: isInstanciable(quick_actions_row) =", Registry.isInstanciable("quick_actions_row"))
 
-        -- Singleton modules: show only those not yet in the layout,
-        -- and skip instances of instanciable modules (they have "_row_" in their id).
         for _, mod in ipairs(Registry.list()) do
-            local is_instance = mod.id:match("_row_") ~= nil
-            if not active_set[mod.id] and not is_instance then
+            if not active_set[mod.id] and not Registry.isInstance(mod.id) then
                 local _mod_id = mod.id
-                table.insert(items, SUI.ListRow{
-                    title   = mod.name,
-                    inner_w = iw,
-                    on_tap  = function()
-                        table.insert(st.layout.pages[st.current_page].modules, _mod_id)
-                        LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
-                        ctx.pop()
-                    end,
-                })
+                addEntry(_mod_id, mod.name, function()
+                    table.insert(st.layout.pages[st.current_page].modules, _mod_id)
+                    LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
+                    ctx.pop{ levels = 2 }
+                end)
             end
         end
 
-        -- Instanciable modules: always show an "Add" entry regardless of
-        -- how many instances already exist in the layout.
-        local instanciable_bases = { "quick_actions_row", "spacer_row", "coll_row" }
-        for _i, base_id in ipairs(instanciable_bases) do
-            if Registry.isInstanciable(base_id) then
-                local base_mod = Registry.getBase(base_id)
-                local base_name = (base_mod and base_mod.name) or base_id
+        for _i, base_id in ipairs(Registry.getInstanciableBaseIds()) do
+            local base_mod = Registry.getBase(base_id)
+            addEntry(base_id, (base_mod and base_mod.name) or base_id, function()
+                local new_id = Registry.createInstance(base_id)
+                if new_id then
+                    table.insert(st.layout.pages[st.current_page].modules, new_id)
+                    LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
+                end
+                ctx.pop{ levels = 2 }
+            end)
+        end
+
+        for _i, cat in ipairs(Registry.getCategories()) do
+            local entries = by_cat[cat.key]
+            if entries and chosen then
+                if cat.key == chosen then
+                    for _j, e in ipairs(entries) do
+                        table.insert(items, SUI.ListRow{ title = e.title, inner_w = iw, on_tap = e.on_tap })
+                    end
+                end
+            elseif entries then
+                local _cat = cat
                 table.insert(items, SUI.ListRow{
-                    title    = base_name,
-                    inner_w  = iw,
-                    on_tap   = function()
-                        local new_id = Registry.createInstance(base_id)
-                        if new_id then
-                            table.insert(st.layout.pages[st.current_page].modules, new_id)
-                            LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
-                        end
-                        ctx.pop()
+                    title        = cat.title,
+                    inner_w      = iw,
+                    show_chevron = true,
+                    on_tap       = function()
+                        ctx.push("module_picker", { category = _cat.key, title = _cat.title })
                     end,
                 })
             end
@@ -915,6 +699,14 @@ local function buildScreens(st)
         return SUI.buildModuleSettingsScreen(ctx, mod, {
             pfx           = st.pfx,
             pfx_qa        = st.pfx_qa,
+            layout_sheet  = function()
+                BentoSheet.show{
+                    mod_id     = mod.id,
+                    pfx        = st.pfx,
+                    layout     = st.layout,
+                    on_changed = function() ctx.repaint() end,
+                }
+            end,
             extra_refresh = function()
                 LayoutService.save(st.layout, st.pfx, st.layout_key, st.screen_id)
             end,
@@ -977,8 +769,7 @@ local function buildScreens(st)
                 ctx.repaint()
             end,
             on_save        = function() ctx.repaint() end,
-            lock_overlay   = ctx.lockOverlay   or function() end,
-            unlock_overlay = ctx.unlockOverlay or function() end,
+            in_window      = true,
         }
         return makeMenuTable(ctx, items)
     end
@@ -989,7 +780,7 @@ local function buildScreens(st)
         local params = cur and cur.params or {}
         local items  = params.items or {}
         if type(params.items_func) == "function" then
-            items = params.items_func()
+            items = params.items_func(ctx)
         end
         return makeMenuTable(ctx, items)
     end
@@ -998,7 +789,7 @@ local function buildScreens(st)
     local function buildArrange(ctx)
         local cur    = ctx.current()
         local params = cur and cur.params or {}
-        
+
         local items = params.items
         if not items and type(params.items_func) == "function" then
             items = params.items_func()
@@ -1029,13 +820,13 @@ local function buildScreens(st)
     local function buildRowPage(ctx)
         local cur    = ctx.current()
         local params = cur and cur.params or {}
-        
+
         local items = params.items
         if not items and type(params.items_func) == "function" then
             items = params.items_func()
         end
         items = items or {}
-        
+
         return SUI.RowPage{
             items      = items,
             inner_w    = ctx.inner_w,
@@ -1073,10 +864,13 @@ local function buildScreens(st)
         return buildPluginMenuScreen(ctx, plugin and plugin.makeStyleMenuItems)
     end
 
+    local function buildCritterSettings(ctx)
+        local plugin = getPlugin()
+        return buildPluginMenuScreen(ctx, plugin and plugin.makeCritterMenuItems)
+    end
+
     local function buildAboutSettings(ctx)
         local plugin   = getPlugin()
-        local ctx_menu = makeCtxMenu(ctx)
-        ctx_menu.ConfirmBox = require("ui/widget/confirmbox")
         return buildPluginMenuScreen(ctx, plugin and plugin.makeAboutMenuItems)
     end
 
@@ -1088,6 +882,7 @@ local function buildScreens(st)
         bars_settings          = buildBarsSettings,
         library_settings       = buildLibrarySettings,
         style_settings         = buildStyleSettings,
+        critter_settings       = buildCritterSettings,
         about_settings         = buildAboutSettings,
         pages                  = buildPages,
         page_edit              = buildPageEdit,
@@ -1116,12 +911,16 @@ local function makeScreenTitles(st)
         bars_settings          = _("Bars"),
         library_settings       = _("Library"),
         style_settings         = _("Style"),
+        critter_settings       = _("Tiny Critter"),
         about_settings         = _("About"),
         pages = function()
             return st.screen_id == "hs" and _("Layout Editor")
                 or (st.screen_name or _("Layout Editor"))
         end,
-        module_picker          = _("Add Module"),
+        module_picker = function(ctx)
+            local cur = ctx.current()
+            return cur and cur.params and cur.params.title or _("Add Module")
+        end,
         item_picker = function(ctx)
             local cur = ctx.current()
             return cur and cur.params and cur.params.title or _("Add Item")
@@ -1158,7 +957,11 @@ end
 -- 4. Entry point
 -- ===========================================================================
 
-function SettingsWindow:show(on_close)
+--- Opens the settings window. `nav_path` optionally lists screens ({ id, params })
+--- to open on top of the root, e.g. to return to a nested menu.
+--- `state` optionally seeds the editing context, for a `nav_path` that skips the
+--- screens which would otherwise set it.
+function SettingsWindow:show(on_close, nav_path, state)
     local st = {
         layout            = LayoutService.load(),
         layout_loaded_key = "simpleui_layout",
@@ -1174,6 +977,7 @@ function SettingsWindow:show(on_close)
         layout_key        = "simpleui_layout",
         screen_id         = "hs",
     }
+    for key, value in pairs(state or {}) do st[key] = value end
 
     local wrapped_on_close = function()
         if on_close then on_close() end
@@ -1182,13 +986,14 @@ function SettingsWindow:show(on_close)
     local screens = buildScreens(st)
     local titles  = makeScreenTitles(st)
 
-    local Config = require("infra/sui_config")
     local win = SUI:new{
         name           = "sui_win_settings",
+        icon           = "settings",
         screens        = screens,
         screen_titles  = titles,
         navpager_mode  = Config.isNavpagerEnabled(),
         on_close       = wrapped_on_close,
+        nav_path       = nav_path,
         position       = "bottom",
         screen_footers = {
             custom_screens = function(ctx)
@@ -1197,32 +1002,16 @@ function SettingsWindow:show(on_close)
                     on_tap = function()
                         local ok, CustomScreens = pcall(require, "infra/sui_custom_screens")
                         if not ok or not CustomScreens then return end
-                        local InputDialog = require("ui/widget/inputdialog")
-                        local dialog
-                        dialog = InputDialog:new{
-                            title      = _("Create screen"),
-                            input      = "",
-                            input_hint = _("Screen name"),
-                            buttons    = {{
-                                {
-                                    text     = _("Cancel"),
-                                    id       = "close",
-                                    callback = function() UIManager:close(dialog) end,
-                                },
-                                {
-                                    text             = _("Create"),
-                                    is_enter_default = true,
-                                    callback         = function()
-                                        local name = dialog:getInputText()
-                                        name = name and name:match("^%s*(.-)%s*$") or ""
-                                        UIManager:close(dialog)
-                                        CustomScreens.create(name ~= "" and name or nil)
-                                        ctx.repaint()
-                                    end,
-                                },
-                            }},
+                        require("features/dialogs/sui_dialogs").prompt{
+                            title       = _("Create screen"),
+                            hint        = _("Screen name"),
+                            ok_text     = _("Create"),
+                            allow_empty = true,
+                            on_submit   = function(name)
+                                CustomScreens.create(name ~= "" and name or nil)
+                                ctx.repaint()
+                            end,
                         }
-                        UIManager:show(dialog)
                     end,
                 })
             end,
@@ -1248,20 +1037,14 @@ function SettingsWindow:show(on_close)
                 local all_mods = Registry.list()
                 local available = false
                 for _, mod in ipairs(all_mods) do
-                    local is_instance = mod.id:match("_row_") ~= nil
-                    if not active_set[mod.id] and not is_instance then
+                    if not active_set[mod.id] and not Registry.isInstance(mod.id) then
                         available = true
                         break
                     end
                 end
+                -- An instanciable module can always be added once more.
                 if not available then
-                    local instanciable_bases = { "quick_actions_row", "spacer_row", "coll_row" }
-                    for _i, base_id in ipairs(instanciable_bases) do
-                        if Registry.isInstanciable(base_id) then
-                            available = true
-                            break
-                        end
-                    end
+                    available = #Registry.getInstanciableBaseIds() > 0
                 end
 
                 return SUI.CenteredButtonFooter(ctx, {
@@ -1279,6 +1062,41 @@ function SettingsWindow:show(on_close)
     }
 
     win:show()
+end
+
+--- Opens the page editor of the page that holds `mod_id` on the screen with
+--- settings prefix `pfx`; going back leads through the page list.
+function SettingsWindow:showPageEditor(pfx, mod_id)
+    local layout_key, screen_id = LayoutService.screenFor(pfx)
+    if not layout_key then return end
+    local layout = LayoutService.load(pfx, layout_key)
+    local _page, page_idx = LayoutService.findPage(layout, mod_id)
+    if not page_idx then return end
+
+    local name
+    if screen_id ~= "hs" then
+        for _i, screen in ipairs(require("infra/sui_custom_screens").list()) do
+            if screen.id == screen_id then name = screen.name end
+        end
+    end
+    local params = {
+        pfx = pfx, pfx_qa = pfx .. "qa_",
+        layout_key = layout_key, screen_id = screen_id, name = name,
+    }
+    self:show(nil, {
+        { id = screen_id == "hs" and "home_screen_settings" or "custom_screens" },
+        { id = "pages", params = params },
+        { id = "page_edit" },
+    }, {
+        layout            = layout,
+        layout_loaded_key = layout_key,
+        current_page      = page_idx,
+        pfx               = pfx,
+        pfx_qa            = params.pfx_qa,
+        layout_key        = layout_key,
+        screen_id         = screen_id,
+        screen_name       = name,
+    })
 end
 
 return SettingsWindow

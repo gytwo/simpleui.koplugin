@@ -13,13 +13,12 @@
 -- storage go through sui_group_actions / sui_cover_overrides, shared with
 -- sui_series_grouping.lua rather than duplicated.
 --
--- Because sui_virtual_path now encodes a full filter TRAIL rather than a
--- single (dimension, value) pair, the data layer already supports stacked
--- filters (e.g. author → then narrow by tag within that author). Nothing
--- in this file's UI currently exposes a "narrow further" action from a
--- file_list, so today's behaviour is unchanged — but the path grammar,
--- the row filtering, and the facet-count computation are all trail-aware, so
--- adding that affordance later is a UI-only change, not a data-layer one.
+-- sui_virtual_path encodes a full filter TRAIL, so the path grammar, the row
+-- filtering and the facet counts are all trail-aware. A leaf whose last
+-- dimension defines `subgroup_by` (see sui_filter_state) lists its books
+-- split by that dimension while "Group by Book Series" is on: one folder per
+-- series with at least FilterState.MIN_GROUP_SIZE books, then the books left
+-- ungrouped. Each folder is the leaf of the stacked trail (author → series).
 --
 -- Settings key: "simpleui_browsemeta_mode"
 --   "normal"  (default) — standard filesystem browsing
@@ -31,20 +30,24 @@
 --   M.uninstall()             — remove all patches
 --   M.getCurrentMode(fc)      — "normal"|"author"|"series"|"tags" from fc.path
 --   M.getPathMode(path)       — same, from an explicit path
+--   M.getPathDepth(path)      — number of resolved filters in a virtual path, nil if real
 --   M.navigateTo(fm, mode)    — navigate FM to the requested mode
 --   M.navigateToRoot(fc, fm, mode)
 --   M.activateMode(fm, mode, already_active) — single entry point for mode switchers
 --   M.MODES / M.getModeLabel(mode)           — ordered mode ids and their display labels
+--   M.SERIES_GROUPING_MODES                  — modes whose lists can be grouped by series
 --   M.getPathLabel(path)                     — display name of the innermost virtual level
 --   M.isAtVirtualRoot(fc, mode)
 --   M.getSavedMode() / M.setSavedMode(mode)
 --   M.openVirtualCoverPicker(vpath, fc)
 --   M.getAuthorBookCount(fc, author)    — count books by author in current base_dir (cached)
---   M.navigateToAuthorLeaf(fm, author)  — navigate FM directly to author virtual leaf
+--   M.navigateToLeaf(fm, dimension, value, opts) — navigate FM directly to a virtual leaf
 
 local lfs     = require("libs/libkoreader-lfs")
 local ffiUtil = require("ffi/util")
 local logger  = require("logger")
+local Memory  = require("infra/sui_memory")
+local Text    = require("infra/sui_text")
 local _ = require("infra/sui_i18n").translate
 local SUISettings = require("infra/sui_store")
 
@@ -54,6 +57,7 @@ local MetadataSource   = require("features/library/sui_metadata_source")
 local CoverOverrides   = require("features/library/sui_cover_overrides")
 local GroupActions     = require("features/library/sui_group_actions")
 local CoverFinder      = require("features/library/sui_cover_finder")
+local FolderCovers     = require("features/library/sui_foldercovers")
 
 local M = {}
 
@@ -71,6 +75,16 @@ M.MODES = { "normal", "author", "series", "tags" }
 function M.getModeLabel(mode)
     if mode == "normal" then return _("Library") end
     return DIM_LABELS[mode]
+end
+
+-- Modes whose lists can be grouped by series: the filesystem view and every
+-- dimension that splits its leaves into sub-groups.
+M.SERIES_GROUPING_MODES = {}
+for _i, mode in ipairs(M.MODES) do
+    local definition = FilterState.DIMENSIONS[mode]
+    if mode == "normal" or (definition and definition.subgroup_by) then
+        M.SERIES_GROUPING_MODES[#M.SERIES_GROUPING_MODES + 1] = mode
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -136,6 +150,18 @@ function M.setEnabled(v)
     SUISettings:saveSetting(_BM_KEY, v)
 end
 
+-- Whether the "no value" group (books without an author, series or tag) is
+-- listed in the Authors / Series / Tags views. Off by default.
+local _SHOW_EMPTY_KEY = "simpleui_browsemeta_show_empty"
+
+function M.getShowEmpty()
+    return SUISettings:isTrue(_SHOW_EMPTY_KEY)
+end
+
+function M.setShowEmpty(v)
+    SUISettings:saveSetting(_SHOW_EMPTY_KEY, v)
+end
+
 -- ---------------------------------------------------------------------------
 -- Public path helpers
 -- ---------------------------------------------------------------------------
@@ -143,6 +169,11 @@ end
 function M.getPathLevel(path)
     local _b, _s, _d, level = VirtualPath.parse(path)
     return level
+end
+
+function M.getPathDepth(path)
+    local _base, state = VirtualPath.parse(path)
+    return state and #state.trail
 end
 
 function M.getPathMode(path)
@@ -210,9 +241,8 @@ function M.navigateTo(fm, mode)
     if fm.updateTitleBarPath then
         pcall(function() fm:updateTitleBarPath(target) end)
     end
-    -- Force the titlebar to re-evaluate the back-button state for page 1.
-    -- onGotoPage triggers _resolveIsSub which re-checks the path-based state,
-    -- ensuring the back button is correct when lock_home_folder is active.
+    -- Re-evaluates the title-bar state for page 1: onGotoPage re-checks the
+    -- path-based back-button state, which depends on lock_home_folder.
     if fc.onGotoPage then
         pcall(function() fc:onGotoPage(1) end)
     end
@@ -319,37 +349,42 @@ function M.getAuthorBookCount(fc, author_name)
     return #MetadataSource.getValidRows(bim, base, fs, variant, accept)
 end
 
--- Navigates the FM directly to the virtual leaf for *author_name*, bypassing
--- the top-level Authors list. The up-button / back-button will land on the
--- Authors root (not the real filesystem), matching the expected UX.
+-- Navigates the FM directly to the virtual leaf of `value` in `dimension`,
+-- bypassing the top-level list of the dimension. The up button lands on that
+-- list, not on the real filesystem.
 --
--- origin_file (optional): the book file that triggered this navigation.
---   When provided, pressing back from the virtual leaf returns directly to
---   the real folder where the book lives, with the list scrolled to that
---   book. Without it, back lands on the Authors root.
+-- opts (all optional):
+--   base_dir     directory whose subtree the leaf lists; the file manager's
+--                current one by default
+--   origin_file  the book the navigation started from: going back from the
+--                leaf returns to the real folder, scrolled to that book
+--   return_fn    called when going back from the leaf, instead of returning
+--                to a real folder, for a navigation that started elsewhere
 --
 -- Preconditions: browse mode must be installed (M.install() called).
-function M.navigateToAuthorLeaf(fm, author_name, origin_file)
-    if not fm or not author_name or author_name == "" then return end
-    local fc = fm.file_chooser
-    if not fc then return end
+function M.navigateToLeaf(fm, dimension, value, opts)
+    local fc = fm and fm.file_chooser
+    if not (fc and FilterState.isDimension(dimension) and value and value ~= "") then return end
+    opts = opts or {}
 
-    local base   = VirtualPath.getBaseDir(fc.path)
-    local target = VirtualPath.buildLeaf(base, nil, "author", author_name)
+    local fc_base = VirtualPath.getBaseDir(fc.path)
+    local base    = opts.base_dir or fc_base
+    local target  = VirtualPath.buildLeaf(base, nil, dimension, value)
 
-    -- Save the origin so onFolderUp can return to exactly the right place.
-    -- Stored on fc (not a module upvalue) so it survives across module reloads.
-    if origin_file then
-        local real_path = fc.path
-        if VirtualPath.isVirtual(real_path) then real_path = base end
-        fc._sui_author_dialog_origin = { path = real_path, file = origin_file }
+    -- The origin lives on the file chooser, not in a module upvalue, so it
+    -- survives module reloads. It is bound to the leaf it was set for.
+    if opts.origin_file or opts.return_fn then
+        fc._sui_leaf_origin = {
+            leaf      = target,
+            path      = VirtualPath.isVirtual(fc.path) and fc_base or fc.path,
+            file      = opts.origin_file,
+            return_fn = opts.return_fn,
+        }
     else
-        fc._sui_author_dialog_origin = nil
+        fc._sui_leaf_origin = nil
     end
 
-    -- Set the entry path to the Authors root so the up-button hierarchy is
-    -- correct when the user did NOT come from the dialog (normal flow).
-    fc._browse_by_meta_entry_path = VirtualPath.buildDimList(base, nil, "author")
+    fc._browse_by_meta_entry_path = VirtualPath.buildDimList(base, nil, dimension)
     fm._navbar_suppress_path_change = true
     fc:changeToPath(target)
     fm._navbar_suppress_path_change = nil
@@ -359,8 +394,8 @@ function M.navigateToAuthorLeaf(fm, author_name, origin_file)
     if fc.onGotoPage then
         pcall(function() fc:onGotoPage(1) end)
     end
-    -- Persist "author" mode so the next session restores the virtual tree.
-    M.setSavedMode("author")
+    -- Persist the mode so the next session restores the virtual tree.
+    M.setSavedMode(dimension)
 end
 
 -- ---------------------------------------------------------------------------
@@ -381,9 +416,16 @@ local function _resolveLeafBooks(fc, base_dir, filter_state)
     return out
 end
 
-function M.openVirtualCoverPicker(vpath, fc)
+-- Closes `sheet`, the flow sheet an action was started from, when the action
+-- ends without showing anything on it.
+local function _closeSheet(sheet)
+    if sheet then sheet:close() end
+end
+
+-- `sheet`: optional flow sheet to show the picker on, as a page.
+function M.openVirtualCoverPicker(vpath, fc, sheet)
     local base_dir, filter_state, _dim, level = VirtualPath.parse(vpath)
-    if level ~= "file_list" then return end
+    if level ~= "file_list" then return _closeSheet(sheet) end
 
     local ok_bim, bim = pcall(require, "bookinfomanager")
     local books = _resolveLeafBooks(fc, base_dir, filter_state)
@@ -403,19 +445,21 @@ function M.openVirtualCoverPicker(vpath, fc)
         items        = books,
         menu         = fc,
         empty_message = _("No books found."),
+        parent       = sheet,
     }
 end
 
-local function _createCollectionFromVirtualFolder(vpath, fc)
+-- `sheet`: optional flow sheet to show the name prompt on, as a page.
+local function _createCollectionFromVirtualFolder(vpath, fc, sheet)
     local base_dir, filter_state, _dim, level = VirtualPath.parse(vpath)
-    if level ~= "file_list" then return end
+    if level ~= "file_list" then return _closeSheet(sheet) end
 
     local trail = filter_state.trail
     local last  = trail[#trail]
     -- "No value" virtual folders (e.g. the "no author" bucket) have no
     -- meaningful name and would produce a collection without a clear
     -- identity — same guard the original had.
-    if not last or last.value == false then return end
+    if not last or last.value == false then return _closeSheet(sheet) end
 
     local books = _resolveLeafBooks(fc, base_dir, filter_state)
     local paths = {}
@@ -425,6 +469,7 @@ local function _createCollectionFromVirtualFolder(vpath, fc)
         suggested_name = last.value,
         paths          = paths,
         empty_message  = _("No books found."),
+        parent         = sheet,
     }
 end
 
@@ -438,6 +483,81 @@ local _FAKE_DIR_ATTR = {
 local function _fakeAttr(size)
     _FAKE_DIR_ATTR.size = size or 0
     return _FAKE_DIR_ATTR
+end
+
+-- Folder item of one facet value. It is always marked as a virtual meta leaf
+-- so the folder decoration (stacked-cover lines + badge) is rendered even
+-- when no cover is available (e.g. the "no author"/"no series" bucket whose
+-- books have no cached covers yet). `first_paths` are the books its cover is
+-- taken from, in order; the list is shared, read-only.
+local function _facetFolder(fc, base_dir, filter_state, dimension, entry, index, count, first_paths, collate)
+    local value = entry[1]
+    local item  = fc:getListItem(nil, VirtualPath.displayValue(value),
+        VirtualPath.buildLeaf(base_dir, filter_state, dimension, value),
+        _fakeAttr(index), collate)
+    item.nb_sub_files         = count
+    item.mandatory            = tostring(count) .. " \u{F016}"
+    item.is_virtual_meta_leaf = true
+    item.virtual_leaf_count   = count
+    item.cover_paths          = first_paths
+    return item
+end
+
+-- Appends to `dirs` one folder per sub-group of the leaf `filter_state`
+-- reaches, when sub-grouping applies. Returns the set of group keys listed as
+-- folders (their books are not listed again), or nil when the leaf is not
+-- split.
+local function _appendSubgroupFolders(fc, bim, base_dir, filter_state, collate, dirs)
+    local dimension = FilterState.subgroupDimension(filter_state)
+    if not (dimension and FolderCovers.getSeriesGrouping(FilterState.entryDimension(filter_state))) then
+        return nil
+    end
+
+    local variant, accept = _listingFilter(fc)
+    local counts, firsts = MetadataSource.getValidFacetCounts(
+        bim, base_dir, dimension, filter_state, variant, accept)
+    local sizes = {}
+    for key, count in pairs(counts) do
+        if key ~= false then sizes[key] = count end
+    end
+    local total  = #MetadataSource.getValidRows(bim, base_dir, filter_state, variant, accept)
+    local groups = FilterState.selectGroups(sizes, total)
+
+    local values = MetadataSource.getFacetValues(bim, base_dir, dimension, filter_state, false)
+    for i, entry in ipairs(values) do
+        if groups[entry.key] then
+            dirs[#dirs + 1] = collate
+                and _facetFolder(fc, base_dir, filter_state, dimension, entry, i,
+                                 counts[entry.key], firsts[entry.key], collate)
+                or true
+        end
+    end
+    return groups
+end
+
+-- Widest secondary text of a listed book, in characters. The list renderer
+-- sizes its right-hand column to this text and gives the title what remains,
+-- so the text has to stay short whatever the metadata holds.
+local CONTEXT_MAX_CHARS = 28
+
+-- Series label of a book: its series name followed by its index.
+local function _seriesLabel(row)
+    if not row.series or row.series == "" then return nil end
+    local suffix = row.series_index and (" #" .. tostring(row.series_index)) or ""
+    return Text.truncate(row.series, CONTEXT_MAX_CHARS - #suffix) .. suffix
+end
+
+-- Secondary text of a book listed in a leaf: the detail the trail leaves open.
+-- Without an author filter it is the first author, with one it is the series,
+-- and once the series is fixed too only the index in it remains.
+local function _bookContext(row, selected)
+    if not selected.author then
+        return Text.truncate(Text.formatAuthors(row.authors), CONTEXT_MAX_CHARS)
+    end
+    if selected.series then
+        return row.series_index and "#" .. tostring(row.series_index) or nil
+    end
+    return _seriesLabel(row)
 end
 
 local function _getVirtualList(fc, path, collate)
@@ -463,10 +583,7 @@ local function _getVirtualList(fc, path, collate)
 
     -- active_dimension is only ever set at the "dim_list" level (see
     -- VirtualPath.parse's docstring) — at "file_list" it is nil BY DESIGN,
-    -- because the trail is already fully resolved. Requiring it here for
-    -- every level used to make every author/series/tags leaf folder come
-    -- back empty, since this guard ran before the file_list branch below
-    -- ever got a chance to query anything.
+    -- because the trail is already fully resolved.
     if not base_dir then return dirs, files end
     if level == "dim_list" and not active_dimension then return dirs, files end
     _ensureCacheBaseDir(base_dir)
@@ -475,10 +592,9 @@ local function _getVirtualList(fc, path, collate)
     if not ok_bim or not bim then return dirs, files end
 
     if level == "dim_list" then
-        local values = MetadataSource.getFacetValues(bim, base_dir, active_dimension, filter_state)
-        local overrides = SUISettings:readSetting("simpleui_fc_covers") or {}
+        local values = MetadataSource.getFacetValues(bim, base_dir, active_dimension, filter_state, M.getShowEmpty())
 
-        -- Real (validated) per-group counts and a representative file. A row
+        -- Real (validated) per-group counts and the first books of each group. A row
         -- only counts when its file exists on disk and passes fc:show_file:
         -- the facet counts may include stale bookinfo entries or files the
         -- chooser hides. Groups are matched by entry.key.
@@ -486,52 +602,25 @@ local function _getVirtualList(fc, path, collate)
         -- Only built when collate is truthy: a falsy collate means the caller
         -- only wants a cheap item COUNT (mirrors FileChooser:getList's own
         -- "collate == nil count only" path in KOReader core).
-        local real_counts, real_reprs = {}, {}
+        local real_counts, real_firsts = {}, {}
         if collate then
             local variant, accept = _listingFilter(fc)
-            real_counts, real_reprs = MetadataSource.getValidFacetCounts(
+            real_counts, real_firsts = MetadataSource.getValidFacetCounts(
                 bim, base_dir, active_dimension, filter_state, variant, accept)
         end
 
         for i, entry in ipairs(values) do
-            local val   = entry[1]
-            local label = VirtualPath.displayValue(val)
-            local vpath = VirtualPath.buildLeaf(base_dir, filter_state, active_dimension, val)
-
-            if collate then
-                local real_count = real_counts[entry.key] or 0
-                local real_repr  = real_reprs[entry.key]
-
+            if not collate then
+                dirs[#dirs + 1] = true
+            else
                 -- Skip virtual folders whose every book has been deleted from
                 -- disk — showing an empty virtual folder would confuse the
                 -- user, even though the bookinfo DB may still hold stale rows.
+                local real_count = real_counts[entry.key] or 0
                 if real_count > 0 then
-                    local item = fc:getListItem(nil, label, vpath, _fakeAttr(i), collate)
-                    item.nb_sub_files = real_count
-                    item.mandatory    = tostring(real_count) .. " \u{F016}"
-
-                    local repr
-                    local override_fp = overrides[vpath]
-                    if override_fp and lfs.attributes(override_fp, "mode") == "file" then
-                        repr = override_fp
-                    elseif real_repr then
-                        repr = real_repr
-                    elseif entry._first then
-                        repr = entry._first[1]
-                    end
-
-                    -- Always mark as a virtual meta leaf so the folder
-                    -- decoration (stacked-cover lines + badge) is rendered
-                    -- even when no representative cover is available (e.g.
-                    -- the "no author"/"no series" bucket whose books have no
-                    -- cached covers yet).
-                    item.is_virtual_meta_leaf = true
-                    item.virtual_leaf_count   = real_count
-                    if repr then item.representative_filepath = repr end
-                    dirs[#dirs + 1] = item
+                    dirs[#dirs + 1] = _facetFolder(fc, base_dir, filter_state, active_dimension,
+                        entry, i, real_count, real_firsts[entry.key], collate)
                 end
-            else
-                dirs[#dirs + 1] = true
             end
         end
         return dirs, files
@@ -539,53 +628,40 @@ local function _getVirtualList(fc, path, collate)
 
     if level == "file_list" then
         local rows = MetadataSource.getMatchingFiles(bim, base_dir, filter_state)
-        -- active_dimension is nil here (see the comment above) — the
-        -- dimension actually being browsed is the last one resolved into
-        -- the trail, e.g. browsing Author > "Terry Pratchett" leaves
+        -- The dimension being browsed is the last one resolved into the
+        -- trail, e.g. browsing Author > "Terry Pratchett" leaves
         -- trail = { {dimension="author", value="Terry Pratchett"} }.
         local trail = filter_state and filter_state.trail or {}
         local leaf_dimension = trail[#trail] and trail[#trail].dimension
         MetadataSource.sortFiles(rows, leaf_dimension)
-        local is_author_dim = (leaf_dimension == "author") -- tags + series share the "else" path
+
+        local subgroups = _appendSubgroupFolders(fc, bim, base_dir, filter_state, collate, dirs)
 
         for _, row in ipairs(rows) do
-            local fullpath, fname = row[1], row[2]
-            -- lfs.attributes() is needed here: FC requires the attr table to
-            -- build each list item, and it doubles as a stale-entry filter.
-            local attr = lfs.attributes(fullpath)
-            if attr and attr.mode == "file" and fc:show_file(fname, fullpath) then
-                local item = fc:getListItem(path, fname, fullpath, attr, collate)
-                -- Forward metadata from the resolved row so CoverBrowser and
-                -- list-view renderers can display title/author/series
-                -- without re-reading the sidecar.
-                if row.title or row.authors or row.series then
-                    item.doc_props = {
-                        display_title = row.title,
-                        authors       = row.authors,
-                        series        = row.series,
-                        series_index  = row.series_index,
-                    }
-                end
-                -- Contextual mandatory text:
-                --   author mode  → series + index (gives reading-order context)
-                --   series mode  → first author name
-                --   tags mode    → first author name (same as series mode)
-                if collate then
-                    if is_author_dim then
-                        if row.series and row.series ~= "" then
-                            local m = row.series
-                            if row.series_index then
-                                m = m .. " #" .. tostring(row.series_index)
-                            end
-                            item.mandatory = m
-                        end
-                    else
-                        if row.authors and row.authors ~= "" then
-                            item.mandatory = row.authors:gsub("\n.*", " et al.")
-                        end
+            -- Books of a sub-group are listed inside its folder.
+            if not (subgroups and subgroups[row.series_key]) then
+                local fullpath, fname = row[1], row[2]
+                -- lfs.attributes() is needed here: FC requires the attr table to
+                -- build each list item, and it doubles as a stale-entry filter.
+                local attr = lfs.attributes(fullpath)
+                if attr and attr.mode == "file" and fc:show_file(fname, fullpath) then
+                    local item = fc:getListItem(path, fname, fullpath, attr, collate)
+                    -- Forward metadata from the resolved row so CoverBrowser and
+                    -- list-view renderers can display title/author/series
+                    -- without re-reading the sidecar.
+                    if row.title or row.authors or row.series then
+                        item.doc_props = {
+                            display_title = row.title,
+                            authors       = row.authors,
+                            series        = row.series,
+                            series_index  = row.series_index,
+                        }
                     end
+                    if collate then
+                        item.mandatory = _bookContext(row, filter_state.selected) or item.mandatory
+                    end
+                    files[#files + 1] = item
                 end
-                files[#files + 1] = item
             end
         end
         return dirs, files
@@ -631,7 +707,8 @@ local function _installPatches()
             if VirtualPath.isVirtual(path) then
                 local collate = fc:getCollate()
                 local dirs, fls = _getVirtualList(fc, path, collate)
-                return fc:genItemTable(dirs, fls, path)
+                -- Virtual listings never hit the filesystem, so they count as readable.
+                return fc:genItemTable(dirs, fls, path), true
             end
             return orig(fc, path)
         end
@@ -657,7 +734,7 @@ local function _installPatches()
             for _, d in ipairs(dirs) do item_table[#item_table + 1] = d end
             for _, f in ipairs(fls)  do item_table[#item_table + 1] = f end
 
-            local up_path = path:gsub("(/[^/]+)$", "")
+            local up_path = VirtualPath.parentOf(path)
             local hide_up = fc._browse_by_meta_entry_path == path
             if not hide_up and path ~= "/" then
                 table.insert(item_table, 1, {
@@ -739,7 +816,7 @@ local function _installPatches()
             end
             if path and VirtualPath.isVirtual(path) then
                 if path:sub(-3) == "/.." then
-                    return path:gsub("/[^/]+/..$", "")
+                    return VirtualPath.parentOf(path:sub(1, -4))
                 end
                 return path
             end
@@ -785,9 +862,6 @@ local function _installPatches()
             -- folder items — CoverBrowser routes those through showFileDialog
             -- instead (handled above).
             if item and item.path and item.is_virtual_meta_leaf then
-                local UIManager    = require("ui/uimanager")
-                local ButtonDialog = require("ui/widget/buttondialog")
-                local dialog
                 local folder_name = (item.text or item.path:match("([^/]+)$") or ""):gsub("/$", "")
                 local _b, filter_state = VirtualPath.parse(item.path)
                 local trail = filter_state.trail
@@ -795,42 +869,38 @@ local function _installPatches()
                 -- "no value" leaf: long-press disabled (no meaningful name).
                 if not last or last.value == false then return true end
 
-                dialog = ButtonDialog:new{
-                    title       = folder_name,
-                    title_align = "center",
-                    buttons = (function()
-                        local btns = {}
-                        -- Hide the cover picker in quad mosaic mode (the quad
-                        -- grid always auto-selects covers; single-cover
-                        -- override is not applicable in that mode).
-                        local in_list_view = fc and fc.display_mode_type == "list"
-                        local ok_fc_mod, FC = pcall(require, "features/library/sui_foldercovers")
-                        local effective_style = (ok_fc_mod and FC and FC.resolveStyle)
-                            and FC.resolveStyle(fc, item.path, item) or "single"
-                        if effective_style ~= "quad" or in_list_view then
-                            btns[#btns + 1] = {{
-                                text     = _("Set folder cover"),
-                                callback = function()
-                                    UIManager:close(dialog)
-                                    M.openVirtualCoverPicker(item.path, fc)
-                                end,
-                            }}
-                        end
-                        btns[#btns + 1] = {{
-                            text     = _("Create collection"),
-                            callback = function()
-                                UIManager:close(dialog)
-                                _createCollectionFromVirtualFolder(item.path, fc)
-                            end,
-                        }}
-                        btns[#btns + 1] = {{
-                            text     = _("Cancel"),
-                            callback = function() UIManager:close(dialog) end,
-                        }}
-                        return btns
-                    end)(),
+                local items = {}
+                local sheet
+                -- The cover picker is hidden in quad mosaic mode, where the
+                -- grid always picks covers itself.
+                local in_list_view    = fc and fc.display_mode_type == "list"
+                local effective_style = FolderCovers.resolveStyle(fc, item.path, item)
+                if effective_style ~= "quad" or in_list_view then
+                    items[#items + 1] = {
+                        text      = _("Set folder cover"),
+                        sui_icon  = "cover",
+                        keep_open = true,
+                        chevron   = true,
+                        callback  = function() M.openVirtualCoverPicker(item.path, fc, sheet) end,
+                    }
+                end
+                items[#items + 1] = {
+                    text      = _("Create collection"),
+                    sui_icon  = "collections",
+                    keep_open = true,
+                    chevron   = true,
+                    callback  = function() _createCollectionFromVirtualFolder(item.path, fc, sheet) end,
                 }
-                UIManager:show(dialog)
+
+                local ActionSheet = require("engines/sui_action_sheet")
+                sheet = ActionSheet.show{
+                    name       = "sui_win_virtual_folder_actions",
+                    title      = folder_name,
+                    icon       = "folder",
+                    flow       = true,
+                    auto_close = true,
+                    sections   = { ActionSheet.list(items) },
+                }
                 return true
             end
             return orig(fc, item)
@@ -1006,5 +1076,7 @@ function M.reset()
     MetadataSource.clearCache()
     _last_base_dir = nil
 end
+
+Memory.onReset(M.reset)
 
 return M
