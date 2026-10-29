@@ -91,14 +91,50 @@ function SUISettings:get(key, default_value)
     return _getStore():readSetting(key, default_value)
 end
 
---- Write a value and persist to disk immediately.
---- Passing nil is equivalent to SUISettings:del(key).
-function SUISettings:set(key, value)
+-- Incremented on every write. Derived caches compare it against the value
+-- they were built at, so a single integer check tells them whether any
+-- setting changed.
+local _generation = 0
+
+local function _write(key, value)
+    _generation = _generation + 1
     if value == nil then
         _getStore():delSetting(key)
     else
         _getStore():saveSetting(key, value)
     end
+end
+
+--- Number of writes since startup. Changes whenever any setting changes.
+function SUISettings:generation()
+    return _generation
+end
+
+--- Marks derived values stale without writing a setting, for inputs that are
+--- not settings (night mode).
+function SUISettings:invalidateDerived()
+    _generation = _generation + 1
+end
+
+--- Wraps a function of no arguments so that its result is recomputed only
+--- when a setting has changed since the previous call. Meant for values
+--- derived from settings and read on hot paths such as widget painting.
+function SUISettings.memoize(fn)
+    local value, built_at
+    return function()
+        if built_at ~= _generation then
+            value = fn()
+            -- Taken after the call: reading a setting may migrate a stored value.
+            built_at = _generation
+        end
+        return value
+    end
+end
+
+--- Write a value and persist to disk immediately.
+--- Passing nil is equivalent to SUISettings:del(key).
+function SUISettings:set(key, value)
+    _write(key, value)
     -- LuaSettings:saveSetting() only updates in-memory data; KOReader does
     -- NOT automatically flush our file on exit (only G_reader_settings gets
     -- that treatment).  Flush here so every write is immediately durable.
@@ -119,23 +155,18 @@ end
 --- (e.g. SimpleUIPlugin:onSuspend() in main.lua already does this for all
 --- pending settings, including any written via this method).
 function SUISettings:setNoFlush(key, value)
-    if value == nil then
-        _getStore():delSetting(key)
-    else
-        _getStore():saveSetting(key, value)
-    end
-    -- Deliberately no :flush() call here — see docstring above.
+    _write(key, value)
 end
 
 --- Delete a value from the in-memory settings table WITHOUT flushing to disk.
 --- Companion to :setNoFlush() for the same latency-sensitive use case.
 function SUISettings:delNoFlush(key)
-    _getStore():delSetting(key)
+    _write(key, nil)
 end
 
 --- Delete a key and persist to disk immediately.
 function SUISettings:del(key)
-    _getStore():delSetting(key)
+    _write(key, nil)
     if _store then _store:flush() end
 end
 
@@ -164,23 +195,9 @@ end
 -- Compatibility aliases — G_reader_settings-style method names.
 -- ---------------------------------------------------------------------------
 
-function SUISettings:readSetting(key, default_value)
-    return _getStore():readSetting(key, default_value)
-end
-
-function SUISettings:saveSetting(key, value)
-    if value == nil then
-        _getStore():delSetting(key)
-    else
-        _getStore():saveSetting(key, value)
-    end
-    if _store then _store:flush() end
-end
-
-function SUISettings:delSetting(key)
-    _getStore():delSetting(key)
-    if _store then _store:flush() end
-end
+SUISettings.readSetting = SUISettings.get
+SUISettings.saveSetting = SUISettings.set
+SUISettings.delSetting  = SUISettings.del
 
 --- Iterate over all key/value pairs currently stored in SUISettings.
 --- Returns a stateless iterator compatible with generic for:
@@ -197,80 +214,122 @@ function SUISettings:iterateKeys()
 end
 
 -- ---------------------------------------------------------------------------
--- DeletedBooks — persistent store for finished books removed from the device.
+-- FinishedBooks — persistent ledger of every finished book.
 --
--- When "Preserve deleted books in statistics" is enabled (default: on) and a
--- book whose summary.status == "complete" is deleted via the KOReader file
--- manager (single file or as part of a folder delete), this module records a
--- minimal entry so the book continues to be counted in books_year /
--- books_total on the homescreen.
+-- The ledger is the source of truth for the "books read" figures: counting
+-- from it needs neither the reading history nor any sidecar access, and a
+-- finished book stays recorded after its file is deleted.
 --
--- Storage: a single key "simpleui_deleted_books" inside the existing
--- sui_settings.lua file.  Value is a table keyed by partial_md5_checksum:
+-- Storage: one key "simpleui_finished_books" inside sui_settings.lua:
 --
 --   {
---     ["<md5>"] = { title = "…", authors = "…", year = 2024 },
---     …
+--     initialised = true,            -- a full reconcile has run
+--     books = {
+--       ["<partial md5>"] = {        -- a book tracked from its sidecar
+--         title, authors   strings
+--         finished         completion date "YYYY-MM-DD", or just "YYYY"
+--                          when only the year is known; nil when unknown
+--         excluded         true when left out of the totals and goals
+--         path             last known file path
+--         gone             true once the file no longer exists on the device
+--       },
+--       ["manual:<id>"] = {          -- a book entered by hand
+--         manual           true
+--         title, authors   strings (authors may be empty)
+--         started          start stamp, "YYYY-MM-DD" or "YYYY"; nil when unknown
+--         finished         completion stamp, same formats; nil when unknown
+--       },
+--       ["manual:bulk:<year>"] = {   -- books entered as a plain number
+--         manual           true
+--         count            number of books
+--         finished         "YYYY"
+--       },
+--     },
 --   }
 --
--- year is the calendar year (integer) captured at deletion time from
--- summary.modified — the same source used by countMarkedReadBoth.
+-- A manual entry has no file, so it is never reconciled and never `gone`. It
+-- belongs to the year of its completion stamp, else of its start stamp.
+--
+-- A table stored under the legacy "simpleui_deleted_books" key is folded in
+-- on first load as `gone` entries. A number stored under the legacy
+-- "simpleui_reading_goal_physical" key is folded in as the bulk entry of the
+-- current year.
 --
 -- Public API:
---   DeletedBooks.isEnabled()          → boolean (nil → true, i.e. on by default)
---   DeletedBooks.add(md5, title, authors, year)
---   DeletedBooks.removeByMd5(md5)
---   DeletedBooks.getAll()             → table (keyed by md5) or {}
+--   FinishedBooks.preserveGone()      → boolean (nil → true, i.e. on by default)
+--   FinishedBooks.manualInAllTime()   → boolean (nil → true, i.e. on by default)
+--   FinishedBooks.setManualInAllTime(enabled)
+--   FinishedBooks.load()              → ledger table (live reference)
+--   FinishedBooks.save(ledger)        → persists the ledger
 -- ---------------------------------------------------------------------------
 
-local STORE_KEY = "simpleui_deleted_books"
+local LEDGER_KEY          = "simpleui_finished_books"
+local LEGACY_KEY          = "simpleui_deleted_books"
+local LEGACY_PHYSICAL_KEY = "simpleui_reading_goal_physical"
 
-local DeletedBooks = {}
+local FinishedBooks = {}
 
-function DeletedBooks.isEnabled()
+--- Whether finished books whose file is gone still count towards the totals.
+function FinishedBooks.preserveGone()
     return SUISettings:nilOrTrue("simpleui_preserve_deleted_books_in_stats")
 end
 
--- Load the raw store table (always a copy-by-reference of the live data).
-local function _load()
-    return SUISettings:get(STORE_KEY) or {}
+--- Whether manual books count towards the all-time total. They always count
+--- towards the year they belong to.
+function FinishedBooks.manualInAllTime()
+    return SUISettings:nilOrTrue("simpleui_manual_books_in_all_time")
 end
 
--- Persist the store table immediately.
-local function _save(tbl)
-    SUISettings:set(STORE_KEY, tbl)
+function FinishedBooks.setManualInAllTime(enabled)
+    SUISettings:saveSetting("simpleui_manual_books_in_all_time", enabled and true or false)
 end
 
---- Add or update an entry for a deleted finished book.
--- md5     : partial_md5_checksum string (key used by the statistics DB)
--- title   : book title string (may be nil)
--- authors : book authors string (may be nil)
--- year    : integer calendar year when the book was finished
-function DeletedBooks.add(md5, title, authors, year)
-    if not md5 then return end
-    local tbl = _load()
-    tbl[md5] = {
-        title   = title   or "",
-        authors = authors or "",
-        year    = year    or 0,
-    }
-    _save(tbl)
+local function _migrateLegacy(books)
+    for md5, stored in pairs(SUISettings:get(LEGACY_KEY) or {}) do
+        local year = tonumber(stored.year)
+        books[md5] = {
+            title    = stored.title or "",
+            authors  = stored.authors or "",
+            finished = year and year > 0 and string.format("%04d", year) or nil,
+            gone     = true,
+        }
+    end
 end
 
---- Remove the entry whose key matches md5 (no-op when absent).
-function DeletedBooks.removeByMd5(md5)
-    if not md5 then return end
-    local tbl = _load()
-    if tbl[md5] == nil then return end   -- nothing to do
-    tbl[md5] = nil
-    _save(tbl)
+-- Folds the legacy plain count of manually tracked books into the ledger as
+-- the bulk entry of the current year, then drops the legacy key.
+local function _foldLegacyCount(ledger)
+    local legacy = SUISettings:get(LEGACY_PHYSICAL_KEY)
+    if legacy == nil then return end
+
+    local count = math.floor(tonumber(legacy) or 0)
+    if count > 0 then
+        local year = os.date("%Y")
+        ledger.books["manual:bulk:" .. year] = { manual = true, count = count, finished = year }
+        SUISettings:set(LEDGER_KEY, ledger)
+    end
+    SUISettings:del(LEGACY_PHYSICAL_KEY)
 end
 
---- Return the full store table (keyed by md5).  Empty table when nothing stored.
-function DeletedBooks.getAll()
-    return _load()
+--- Returns the ledger, creating it (and migrating legacy data) on first use.
+--- The returned table is the live stored one: mutate it, then save() it.
+function FinishedBooks.load()
+    local ledger = SUISettings:get(LEDGER_KEY)
+    if not ledger then
+        ledger = { books = {} }
+        _migrateLegacy(ledger.books)
+        SUISettings:set(LEDGER_KEY, ledger)
+        SUISettings:del(LEGACY_KEY)
+    end
+    _foldLegacyCount(ledger)
+    return ledger
 end
 
-SUISettings.DeletedBooks = DeletedBooks
+--- Persists a ledger obtained from load().
+function FinishedBooks.save(ledger)
+    SUISettings:set(LEDGER_KEY, ledger)
+end
+
+SUISettings.FinishedBooks = FinishedBooks
 
 return SUISettings

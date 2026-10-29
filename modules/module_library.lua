@@ -22,11 +22,15 @@
 --      "flat_library_sort_mode" setting (see sortRaw below).
 
 local lfs    = require("libs/libkoreader-lfs")
+local util   = require("util")
 local _ = require("infra/sui_i18n").translate
 
+local Config       = require("infra/sui_config")
 local SUISettings  = require("infra/sui_store")
 local GridRenderer = require("engines/sui_book_grid")
 local LibraryScan  = require("engines/sui_library_scan")
+local Finished     = require("features/library/sui_finished_books")
+local SH           = require("modules/module_books_shared")
 
 local MAX_ITEMS = 5  -- default_cols for the grid — same convention as Collections/Featured Collection
 
@@ -34,19 +38,17 @@ local SORT_KEY    = "flat_library_sort_mode"    -- pfx .. SORT_KEY
 local SHUFFLE_KEY = "flat_library_shuffle_order" -- pfx .. SHUFFLE_KEY
 
 local DEFAULT_SORT = "title_asc"
-
--- Unlike Recent/New Books (where hiding finished books by default keeps the
--- "what should I pick up next" list short), the whole point of the flat
--- Library is to be the complete catalogue, so finished books are shown by
--- default here; the toggle just lets the person narrow it down.
-local SHOW_FINISHED_DEFAULT = true
+local SORT_ORDER   = {
+    "title_asc", "title_desc", "author_asc",
+    "date_desc", "date_asc", "size_desc", "size_asc", "shuffle",
+}
 
 -- ---------------------------------------------------------------------------
 -- Sort setting accessors (namespaced by pfx, like every other per-instance
 -- setting in this codebase).
 -- ---------------------------------------------------------------------------
 local function getSortMode(pfx)
-    return SUISettings:readSetting(pfx .. SORT_KEY) or DEFAULT_SORT
+    return Config.readChoice(pfx .. SORT_KEY, SORT_ORDER, DEFAULT_SORT)
 end
 local function saveSortMode(pfx, mode)
     SUISettings:saveSetting(pfx .. SORT_KEY, mode)
@@ -71,11 +73,6 @@ end
 local _title_cache  = {}
 local _author_cache = {}
 
-local function getSH()
-    local ok, m = pcall(require, "modules/module_books_shared")
-    return ok and m or nil
-end
-
 local function cachedTitle(fp)
     local t = _title_cache[fp]
     if t then return t end
@@ -96,8 +93,7 @@ local function cachedAuthor(fp)
     if row and row.authors and row.authors ~= "" then
         a = row.authors
     else
-        local SH = getSH()
-        a = (SH and SH.getBookData(fp).authors) or ""
+        a = SH.getBookData(fp).authors or ""
     end
     _author_cache[fp] = a
     return a
@@ -176,11 +172,15 @@ local function sortRaw(raw, mode, pfx)
             if mode == "size_desc" then return sizes[a] > sizes[b] else return sizes[a] < sizes[b] end
         end)
     elseif mode == "author_asc" then
-        table.sort(fps, function(a, b) return cachedAuthor(a):lower() < cachedAuthor(b):lower() end)
+        local keys = {}
+        for _, fp in ipairs(fps) do keys[fp] = util.stringLower(cachedAuthor(fp)) end
+        table.sort(fps, function(a, b) return keys[a] < keys[b] end)
     else -- "title_asc" / "title_desc" / unrecognized -> default
         local desc = (mode == "title_desc")
+        local keys = {}
+        for _, fp in ipairs(fps) do keys[fp] = util.stringLower(cachedTitle(fp)) end
         table.sort(fps, function(a, b)
-            local ta, tb = cachedTitle(a):lower(), cachedTitle(b):lower()
+            local ta, tb = keys[a], keys[b]
             if desc then return ta > tb else return ta < tb end
         end)
     end
@@ -214,10 +214,6 @@ local SORT_LABELS = {
     size_asc    = _("File size (smallest)"),
     shuffle     = _("Random"),
 }
-local SORT_ORDER = {
-    "title_asc", "title_desc", "author_asc",
-    "date_desc", "date_asc", "size_desc", "size_asc", "shuffle",
-}
 
 local function extraMenuItemsBefore(ctx_menu)
     local _lc     = ctx_menu._
@@ -226,41 +222,24 @@ local function extraMenuItemsBefore(ctx_menu)
 
     local items = {}
 
-    items[#items + 1] = {
-        -- Title stays static — the chosen mode is surfaced only via
-        -- mandatory_func (native Menu's right-side value) / SUIWindow's
-        -- automatic right_value inference from the checked radio child
-        -- below (see the "Row title vs. right-side value" note in
-        -- engines/sui_window.lua's SUIWindow.MenuTable doc block). It must
-        -- never be baked into the row's own text/text_func.
-        text_func = function() return _lc("Sort") end,
-        mandatory_func = function()
-            return SORT_LABELS[getSortMode(pfx)] or SORT_LABELS[DEFAULT_SORT]
-        end,
-        sub_item_table_func = function()
-            local sub = {}
-            for _, mode in ipairs(SORT_ORDER) do
-                local _m = mode
-                sub[#sub + 1] = {
-                    text           = SORT_LABELS[_m],
-                    radio          = true,
-                    checked_func   = function() return getSortMode(pfx) == _m end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        saveSortMode(pfx, _m)
-                        -- Picking "Random" for the first time (or switching
-                        -- back to it) rolls a fresh order right away, rather
-                        -- than silently reusing whatever was last persisted.
-                        if _m == "shuffle" then
-                            local home = LibraryScan.resolveHomeDir()
-                            if home then generateShuffleOrder(pfx, LibraryScan.getRaw(home)) end
-                        end
-                        refresh()
-                    end,
-                }
+    local sort_options = {}
+    for _, mode in ipairs(SORT_ORDER) do
+        sort_options[#sort_options + 1] = { value = mode, label = SORT_LABELS[mode] }
+    end
+    items[#items + 1] = Config.makeRadioSubmenuItem{
+        text    = _lc("Sort"),
+        options = sort_options,
+        get     = function() return getSortMode(pfx) end,
+        set     = function(mode)
+            saveSortMode(pfx, mode)
+            -- Entering "Random" rolls a fresh order right away instead of
+            -- reusing whatever was last persisted.
+            if mode == "shuffle" then
+                local home = LibraryScan.resolveHomeDir()
+                if home then generateShuffleOrder(pfx, LibraryScan.getRaw(home)) end
             end
-            return sub
         end,
+        refresh = refresh,
     }
 
     -- One-off action, only meaningful (and shown as enabled) while "Random"
@@ -278,6 +257,8 @@ local function extraMenuItemsBefore(ctx_menu)
         end,
     }
 
+    items[#items + 1] = Finished.makeSubmenuItem(refresh)
+
     return items
 end
 
@@ -287,6 +268,7 @@ end
 local mod = GridRenderer.makeModule{
     id          = "flat_library",
     name        = _("Flat Library"),
+    category    = "books",
     label       = _("Books"),
     default_on  = false,
     is_book_mod = true,   -- surgical repaint on swipe between pages; suppresses the generic empty-state
@@ -295,36 +277,11 @@ local mod = GridRenderer.makeModule{
 
     getFileList = function(ctx) return getFileList(ctx) end,
 
-    -- Excludes (unless the user opts in via "Show finished books") anything
-    -- already marked 100%/complete — same logic as module_recent.lua, minus
-    -- its currently-open-book exclusion: unlike Recent (a "what to pick up
-    -- next" list, where the book you're already reading is redundant), Flat
-    -- Library is meant to be the complete catalogue, so the open book stays
-    -- visible here like any other in-progress book.
+    -- Leaves out finished books while the library mode is "hide". Unlike
+    -- Recent, the open book stays listed: the Library is the complete
+    -- catalogue.
     filterItem = function(fp, ctx)
-        local pfx = (ctx and ctx.pfx) or ""
-        local show_finished_setting = SUISettings:readSetting(pfx .. "flat_library_show_finished")
-        local show_finished = show_finished_setting
-        if show_finished == nil then show_finished = SHOW_FINISHED_DEFAULT end
-        if show_finished then return true end
-        local pct, is_complete = 0, false
-        local pre = ctx.prefetched and ctx.prefetched[fp]
-        if pre and pre ~= false then
-            pct = pre.percent or 0
-            is_complete = type(pre.summary) == "table" and pre.summary.status == "complete"
-        else
-            local ok, DS = pcall(require, "docsettings")
-            if ok and DS then
-                local ok2, ds = pcall(DS.open, DS, fp)
-                if ok2 and ds then
-                    pct = ds:readSetting("percent_finished") or 0
-                    local summary = ds:readSetting("summary")
-                    is_complete = type(summary) == "table" and summary.status == "complete"
-                    pcall(function() ds:close() end)
-                end
-            end
-        end
-        return pct < 1.0 and not is_complete
+        return not Finished.isHidden() or not SH.isFinished(fp, ctx and ctx.prefetched)
     end,
 
     -- Same defaults as Recent Books: progress bar + "% Read" label, no overlay.
@@ -337,10 +294,6 @@ local mod = GridRenderer.makeModule{
     -- user-editable, never locked, but purely opt-in and consistent across
     -- every book-grid module (nothing pre-enabled by default).
     badges = { pages = "off", series = "off", new = "off" },
-
-    extra_settings = {
-        { key = "show_finished", label = _("Show finished books"), default = SHOW_FINISHED_DEFAULT },
-    },
 
     extra_menu_items_before = extraMenuItemsBefore,
 

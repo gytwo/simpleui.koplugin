@@ -78,6 +78,8 @@ Open the existing `.po` file for your language, correct or complete the `msgstr`
 
 ## Contributing code
 
+By submitting a contribution you agree that it is licensed under the project's license, GPL-3.0-or-later (see [LICENSE](LICENSE)).
+
 ### Setup
 
 SimpleUI is a standard KOReader plugin written in Lua. No build system or compilation step is required. The plugin runs directly from the source files.
@@ -149,7 +151,7 @@ msgmerge --update locale/<lang>.po locale/simpleui.pot
 - If a string is shown to the user, it must be wrapped in `_()`
 - Add a short comment when the reason for a decision is not obvious from the code
 - All settings keys written to `G_reader_settings` must use either the `simpleui_` or `navbar_` prefix — never bare unprefixed keys
-- Settings rows keep a static label; the current choice is shown only as the right-side value (`value_func`, plus `mandatory_func` for the native menu) — never concatenated into the label (`"Sort: Title"`). Use `Config.makeRadioSubmenuItem` for N-way choices; the convention is described in `engines/sui_window.lua`
+- Settings rows keep a static label; the current choice is shown only as the right-side value (`value_func`, plus `mandatory_func` for the native menu) — never concatenated into the label (`"Sort: Title"`). Use `Config.makeRadioSubmenuItem` for N-way choices (`Config.appendRadioItems` when the radio entries belong in an existing list); the convention is described in `engines/sui_window.lua`
 
 ### Patching KOReader classes
 
@@ -209,7 +211,7 @@ If you are adding a new feature that requires user-supplied files, always resolv
 
 Run `make build` from inside the plugin folder. This produces `simpleui.koplugin.zip` in the parent directory.
 
-The Makefile automatically excludes development-only files (README, LICENSE, Makefile itself, `.git`, etc.) and the contents of the user data directories (`icons/custom/` and `desktop_modules/custom_quotes/`) so that user files on a device are never overwritten by an update.
+The Makefile automatically excludes development-only files (README, Makefile itself, `.git`, etc.) and the contents of the user data directories (`icons/custom/` and `desktop_modules/custom_quotes/`) so that user files on a device are never overwritten by an update.
 
 ### File structure
 
@@ -246,7 +248,7 @@ simpleui.koplugin/
 │   ├── module_collections.lua — Collections module
 │   ├── module_tbr.lua        — To Be Read module
 │   ├── module_reading_goals.lua — Reading Goals module
-│   ├── module_reading_stats.lua — Reading Stats module
+│   ├── reading_stats/ — Reading Stats module: module_reading_stats.lua, catalog.lua, width_sheet.lua
 │   ├── module_quick_actions.lua — Quick Actions module
 │   ├── module_quote.lua      — Quote of the Day module
 │   ├── module_clock.lua      — Clock module

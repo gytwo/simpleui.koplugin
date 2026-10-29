@@ -1,18 +1,9 @@
 -- sui_i18n.lua — Simple UI
 -- Translation loader.
 --
--- DESIGN (v2 — isolated proxy, no global monkey-patch)
--- =====================================================
--- The previous approach replaced package.loaded["gettext"] with a wrapper
--- table that only had __index (read delegation) but no __newindex.  This
--- caused a silent state-mutation bug: when another plugin (e.g. zlibrary)
--- temporarily wrote to a gettext field to load its own .po files, the write
--- landed on the wrapper and never reached the native module.  The native
--- gettext then failed to find its translations entirely.
---
--- The fix is straightforward: do NOT touch the global module cache at all.
--- Instead, export a self-contained translate() / ngettext() pair that each
--- simpleui module uses directly as its local `_` / `N_`.
+-- Each module exports its own translate() / ngettext() pair, used directly as
+-- its local `_` / `N_`. The global gettext module is never replaced or
+-- wrapped, so writes made to it by other code always reach the native module.
 --
 -- Public API:
 --   local I18n = require("infra/sui_i18n")
@@ -30,6 +21,7 @@
 --   3. Done — no code changes needed.
 
 local logger = require("logger")
+local util   = require("util")
 
 -- Locate the plugin directory from this file's path.
 local _dir = require("infra/sui_paths").getPluginDir()
@@ -145,7 +137,7 @@ local function parsePO(path)
     end
 
     for line in f:lines() do
-        local text = line:match("^%s*(.-)%s*$")
+        local text = util.trim(line)
         if text == "" then
             flush()
         elseif text:match("^#") then

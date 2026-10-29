@@ -6,7 +6,7 @@
 -- Each accessor caches its result in a module-local upvalue; subsequent calls
 -- are a single nil-check + table field read, with zero I/O.
 local _FrameContainer, _CenterContainer, _HorizontalGroup, _VerticalGroup
-local _VerticalSpan, _LineWidget, _OverlapGroup, _TextWidget, _ImageWidget
+local _VerticalSpan, _LineWidget, _OverlapGroup, _ImageWidget, _HorizontalSpan
 local _Geom
 local function FrameContainer()  _FrameContainer  = _FrameContainer  or require("ui/widget/container/framecontainer");  return _FrameContainer  end
 local function CenterContainer() _CenterContainer = _CenterContainer or require("ui/widget/container/centercontainer"); return _CenterContainer end
@@ -15,8 +15,8 @@ local function VerticalGroup()   _VerticalGroup   = _VerticalGroup   or require(
 local function VerticalSpan()    _VerticalSpan    = _VerticalSpan    or require("ui/widget/verticalspan");              return _VerticalSpan    end
 local function LineWidget()      _LineWidget      = _LineWidget      or require("ui/widget/linewidget");                return _LineWidget      end
 local function OverlapGroup()    _OverlapGroup    = _OverlapGroup    or require("ui/widget/overlapgroup");              return _OverlapGroup    end
-local function TextWidget()      _TextWidget      = _TextWidget      or require("ui/widget/textwidget");                return _TextWidget      end
 local function ImageWidget()     _ImageWidget     = _ImageWidget     or require("ui/widget/imagewidget");               return _ImageWidget     end
+local function HorizontalSpan() _HorizontalSpan  = _HorizontalSpan  or require("ui/widget/horizontalspan");            return _HorizontalSpan  end
 local function Geom()            _Geom            = _Geom            or require("ui/geometry");                         return _Geom            end
 local Blitbuffer      = require("ffi/blitbuffer")
 local UIManager       = require("ui/uimanager")
@@ -28,6 +28,7 @@ local BD = require("ui/bidi")
 
 local Config = require("infra/sui_config")
 local SUISettings = require("infra/sui_store")
+local Backdrop = require("infra/sui_backdrop")
 
 -- Lazy reference to sui_style — used by _safeIconFile() to validate icon paths
 -- before passing them to ImageWidget. Loaded on first use to avoid a circular
@@ -124,16 +125,23 @@ end
 
 local M = {}
 
-local function _navbarBackdropStrength()
+-- Surface of the bar (tone, opacity and frame; see infra/sui_backdrop.lua),
+-- resolved on every use so a change shows on the next build.
+local function _navbarSurface()
     local ok, WP = pcall(require, "features/sui_wallpaper")
-    if ok and WP and WP.getNavbarBackdropStrength then
-        return WP.getNavbarBackdropStrength()
-    end
-    return SUISettings:isTrue("simpleui_navbar_transparent") and 0 or 100
+    if ok and WP then return WP.resolveBar("navbar") end
+    return Backdrop.resolveDefault("navbar")
 end
 
-local function _navbarIsTransparent()
-    return _navbarBackdropStrength() <= 0
+-- Layout of the bar: "full" spans the screen width with a rule along its top
+-- edge, "floating" is a rounded box inset from the sides.
+function M.getBarLayout()
+    local ok, WP = pcall(require, "features/sui_wallpaper")
+    return ok and WP and WP.getNavbarLayout() or "full"
+end
+
+local function _isFullWidth()
+    return M.getBarLayout() == "full"
 end
 
 
@@ -144,97 +152,30 @@ local function _barColorInactiveText()
     M.COLOR_INACTIVE_TEXT = M.COLOR_INACTIVE_TEXT or _SUIStyle().COLOR.text_dim
     return M.COLOR_INACTIVE_TEXT
 end
-local function _barColorSeparator()
-    M.COLOR_SEPARATOR = M.COLOR_SEPARATOR or _SUIStyle().COLOR.gray
-    return M.COLOR_SEPARATOR
-end
 
--- Returns the separator colour: transparent when the user has hidden it,
--- otherwise the default grey.
-local function _sepColor()
-    return _barColorSeparator()
-end
--- Public accessor used by sui_core.lua to draw the full-width separator line.
-function M.sepColor() return _sepColor() end
-
--- ---------------------------------------------------------------------------
--- Bar color helpers
--- Priority: transparent > default.
--- ---------------------------------------------------------------------------
-local function _getBarBg()
-    if M.getBarStyle() == "bare" or _navbarIsTransparent() then return nil end
-    local s = _navbarBackdropStrength()
-    if s >= 100 then return _SUIStyle().COLOR.surface end
-    -- Partial scrim: no opaque FrameContainer background.
-    return nil
-end
-
--- Full-width scrim over the entire bottom-bar footprint (TOP_SP + BAR_H +
--- BOT_SP). Used by the default bar style when strength is 1–99.
-local function _applyNavbarScrim(widget)
-    local s = _navbarBackdropStrength()
-    if s <= 0 or s >= 100 then return widget end
+-- Fill of a full-width bar across its entire footprint (TOP_SP + BAR_H +
+-- BOT_SP), in the tone and opacity of `surface`.
+local function _applyNavbarFill(widget, surface)
+    if surface.strength <= 0 then return widget end
     local orig_paint = widget.paintTo
     function widget:paintTo(bb, x, y)
         local dimen = self.dimen
         -- Prefer measured height; fall back to TOTAL_H so TOP/BOT padding is
         -- never left as bare wallpaper when dimen is not yet assigned.
         local h = (dimen and dimen.h and dimen.h > 0) and dimen.h or M.TOTAL_H()
-        local ok, WP = pcall(require, "features/sui_wallpaper")
-        if ok and WP and WP.paintBackdrop then
-            WP.paintBackdrop(bb, 0, y, Screen:getWidth(), h, s)
-        end
+        Backdrop.paintBackdrop(bb, 0, y, Screen:getWidth(), h, surface.strength, 0, surface.color)
         return orig_paint(self, bb, x, y)
     end
     return widget
 end
 
--- Dedicated fill + border layer for the framed bar at partial opacity. Owns
--- width/height so paint never depends on a parent having assigned dimen
--- (paintTo overrides on FrameContainer were skipped after tab switches /
--- dithered refreshes). Paints both the scrim and the border through the
--- shared wallpaper backdrop painter so their rounded corners always match —
--- mixing this fill with a native FrameContainer border, which rounds
--- corners with a different algorithm, leaves a sliver of wallpaper showing
--- through at the corners.
-local _NavbarFill
-local function NavbarFill()
-    if _NavbarFill then return _NavbarFill end
-    local Widget = require("ui/widget/widget")
-    local Geom = require("ui/geometry")
-    _NavbarFill = Widget:extend{
-        width = 0,
-        height = 0,
-        strength = 0,
-        radius = 0,
-        border_sz = 0,
-        border_color = nil,
-    }
-    function _NavbarFill:getSize()
-        return Geom:new{ w = self.width, h = self.height }
-    end
-    function _NavbarFill:paintTo(bb, x, y)
-        local w, h = self.width, self.height
-        if w <= 0 or h <= 0 then return end
-        local ok, WP = pcall(require, "features/sui_wallpaper")
-        if not (ok and WP) then return end
-        if self.strength > 0 and WP.paintBackdrop then
-            WP.paintBackdrop(bb, x, y, w, h, self.strength, self.radius)
-        end
-        if self.border_sz > 0 and WP.paintFrame then
-            WP.paintFrame(bb, x, y, w, h, self.border_sz, self.radius, self.border_color)
-        end
-    end
-    return _NavbarFill
-end
-
 local function _getBarFg()
-    return _SUIStyle().COLOR.text_primary
+    return (Backdrop.contentColors(_navbarSurface()))
 end
 
 -- Returns the color for inactive/dim nav items.
 local function _getInactiveColor()
-    return _barColorInactiveText()
+    return select(2, Backdrop.contentColors(_navbarSurface(), _barColorInactiveText()))
 end
 
 -- ---------------------------------------------------------------------------
@@ -273,23 +214,30 @@ local function _getBottomMarginPct()
     return _cached("bot_margin_pct", function() return Config.getBottomMarginPct() end)
 end
 
-function M.getBarStyle()
-    return SUISettings:readSetting("simpleui_bar_style") or "default"
-end
-
 -- VerticalSpan and LineWidget singletons — created once per layout, reused
 -- across all tab cell renders. Declared before invalidateDimCache and
 -- buildTabCell so all references resolve correctly.
 local _vspan_icon_top = nil
 local _vspan_icon_txt = nil
+
+-- Bumped whenever the layout settings change. A bar built under an older
+-- generation is rebuilt whole instead of being updated in place.
+local _layout_gen = 0
+
 function M.invalidateDimCache()
+    _layout_gen      = _layout_gen + 1
     _dim             = {}
     _vspan_icon_top  = nil
     _vspan_icon_txt  = nil
 end
 
-function M.BAR_H()       return _cached("bar_h",   function() return math.floor(Screen:scaleBySize(96) * _getNavbarScale()) end) end
-function M.ICON_SZ()     return _cached("icon_sz", function() return math.floor(Screen:scaleBySize(44) * _getNavbarScale() * (_getIconScalePct()  / 100)) end) end
+-- Base sizes at 100%, in dp. The label font keeps its own base (see LABEL_FS),
+-- so the bar and the icons can shrink without shrinking the label.
+local BAR_H_DP = 77
+local ICON_DP  = 35
+
+function M.BAR_H()       return _cached("bar_h",   function() return math.floor(Screen:scaleBySize(BAR_H_DP) * _getNavbarScale()) end) end
+function M.ICON_SZ()     return _cached("icon_sz", function() return math.floor(Screen:scaleBySize(ICON_DP) * _getNavbarScale() * (_getIconScalePct()  / 100)) end) end
 function M.ICON_TOP_SP() return _cached("it_sp",   function() return math.floor(Screen:scaleBySize(10) * _getNavbarScale()) end) end
 function M.ICON_TXT_SP() return _cached("itxt_sp", function() return math.floor(Screen:scaleBySize(4)  * _getNavbarScale()) end) end
 function M.LABEL_FS()    return _cached("lbl_fs",  function()
@@ -312,19 +260,18 @@ function M.INDIC_H()     return _cached("indic_h", function() return math.floor(
 -- Structural dimensions — not affected by the size setting.
 function M.TOP_SP()      return _cached("top_sp",  function() return Screen:scaleBySize(2)  end) end
 function M.BOT_SP()      return _cached("bot_sp",  function() return math.floor(Screen:scaleBySize(12) * _getBottomMarginPct() / 100) end) end
-function M.SEP_H()
-    return _cached("sep_h", function()
-        local style = M.getBarStyle()
-        if style == "framed" or style == "bare" then
-            return 0
-        end
-        return Screen:scaleBySize(1)
-    end)
+
+-- Height the bar strip occupies when it is shown, whether or not it is
+-- enabled. Surfaces that keep clear of the bar's area regardless of its state
+-- (floating windows) use this one.
+function M.AREA_H()
+    return M.BAR_H() + M.TOP_SP() + M.BOT_SP()
 end
 
+-- Height the bar actually takes from the screen: 0 while it is disabled.
 function M.TOTAL_H()
     if not SUISettings:nilOrTrue("simpleui_bar_enabled") then return 0 end
-    return M.BAR_H() + M.TOP_SP() + M.BOT_SP()
+    return M.AREA_H()
 end
 
 -- ---------------------------------------------------------------------------
@@ -368,17 +315,14 @@ function M.patchDimmedIcon(btn)
     if not lw or lw._sui_dim_patched then return end
     lw._sui_dim_patched = true
     local orig_lw_pt = lw.paintTo
-    local Blitbuffer = require("ffi/blitbuffer")
     local UI_core    = require("infra/sui_core")
     lw.paintTo = function(self_lw, bb, x, y)
+        -- Set by Button:hide(); the disabled path below paints on its own.
+        if self_lw.hide then return end
         if not btn.enabled then
             local sz = self_lw:getSize()
             local w, h = sz.w, sz.h
             if w > 0 and h > 0 then
-                if not self_lw._sui_tmp_bb or self_lw._sui_tmp_bb:getWidth() ~= w or self_lw._sui_tmp_bb:getHeight() ~= h then
-                    if self_lw._sui_tmp_bb then self_lw._sui_tmp_bb:free() end
-                    self_lw._sui_tmp_bb = Blitbuffer.new(w, h, Blitbuffer.TYPE_BB8)
-                end
                 local saved_dim = self_lw.dim
                 local saved_orig_nm = self_lw.original_in_nightmode
                 local saved_alpha = self_lw.alpha
@@ -389,16 +333,16 @@ function M.patchDimmedIcon(btn)
                 -- already pre-filled with an opaque backdrop colour: forcing
                 -- alpha = true here makes KOReader's own paintTo blend the
                 -- icon onto that backdrop through its real alpha channel
-                -- when it has one (e.g. an icon built by
-                -- Bottombar.withWallpaperAlphaIcons for a wallpaper), which
-                -- is what produces a correct opaque render for the mask.
+                -- when it has one (e.g. an icon built with alpha blending
+                -- for a wallpaper), which is what produces a correct opaque
+                -- render for the mask.
                 -- A plain icon with no alpha channel is unaffected either
                 -- way, since KOReader only takes the alpha-blend path when
                 -- the underlying bitmap actually carries one.
                 self_lw.alpha = true
 
                 local fg = _getInactiveColor()
-                UI_core.paintWithAlphaMask(self_lw, bb, x, y, w, h, fg, orig_lw_pt, self_lw._sui_tmp_bb)
+                UI_core.paintWithAlphaMask(self_lw, bb, x, y, w, h, fg, orig_lw_pt)
 
                 self_lw.dim = saved_dim
                 self_lw.original_in_nightmode = saved_orig_nm
@@ -407,80 +351,6 @@ function M.patchDimmedIcon(btn)
             end
         end
         orig_lw_pt(self_lw, bb, x, y)
-    end
-    local orig_lw_free = lw.free
-    lw.free = function(self_lw)
-        if self_lw._sui_tmp_bb then self_lw._sui_tmp_bb:free(); self_lw._sui_tmp_bb = nil end
-        if orig_lw_free then orig_lw_free(self_lw) end
-    end
-end
-
--- ---------------------------------------------------------------------------
--- withWallpaperAlphaIcons(fn) — runs fn() with every IconWidget built during
--- its execution alpha-blended by default, then restores the original
--- constructor.
---
--- IconWidget's render is lazy but caches on its first getSize()/paintTo()
--- call, baking in whichever alpha value was set at that point — and a
--- Button measures its own icon (triggering that first render) while
--- sizing itself in init(), before the caller ever gets a handle back to
--- patch anything. By the time Button:new() returns, an icon meant to sit
--- transparently over a wallpaper has already been rendered flat and
--- cached that way; flipping .alpha afterwards has no effect. The icon has
--- to be born with alpha = true, which means patching IconWidget.init for
--- the duration of construction.
---
--- Same technique infra/sui_patches.lua applies globally, for the whole
--- lifetime of the FileManager wallpaper; this scoped variant gives any
--- other caller (e.g. the section label in engines/sui_section_label.lua) the same guarantee
--- for a handful of buttons without a global patch.
--- ---------------------------------------------------------------------------
-function M.withWallpaperAlphaIcons(fn)
-    local IconWidget = require("ui/widget/iconwidget")
-    local orig_init = IconWidget.init
-    IconWidget.init = function(self, ...)
-        orig_init(self, ...)
-        self.alpha = true
-        self.original_in_nightmode = false
-    end
-    local ok, err = pcall(fn)
-    IconWidget.init = orig_init
-    if not ok then error(err) end
-end
-
--- ---------------------------------------------------------------------------
--- patchWallpaperIcon(btn) — makes an icon Button's frame paint transparently
--- over a wallpaper.
---
--- Button always gives its inner FrameContainer an opaque background
--- (COLOR_WHITE) unless the Button itself was created with an explicit
--- `background`, painting straight over whatever sits behind the button and
--- hiding the wallpaper underneath it. Only handles the frame — the icon
--- itself must already have been built with alpha blending on, via
--- withWallpaperAlphaIcons above.
---
--- Same technique infra/sui_patches.lua uses to make FileManager's own icon
--- Buttons transparent over its wallpaper (nil the frame background while
--- painting), applied here per-instance for callers that only need it on a
--- specific button rather than every Button in the app — e.g.
--- the section label (engines/sui_section_label.lua) for the book-grid header's
--- pagination chevrons.
--- ---------------------------------------------------------------------------
-function M.patchWallpaperIcon(btn)
-    if not btn or btn._sui_wallpaper_patched then return end
-    btn._sui_wallpaper_patched = true
-
-    local orig_pt = btn.paintTo
-    btn.paintTo = function(self_btn, bb, x, y)
-        local frame = self_btn[1]
-        if frame and frame.background then
-            local saved_bg = frame.background
-            frame.background = nil
-            orig_pt(self_btn, bb, x, y)
-            frame.background = saved_bg
-        else
-            orig_pt(self_btn, bb, x, y)
-        end
     end
 end
 
@@ -491,7 +361,10 @@ function M.resizePaginationButtons(widget, icon_size)
             if btn then
                 btn.icon_width  = icon_size
                 btn.icon_height = icon_size
+                -- init() rebuilds the label and frame, dropping Button:hide().
+                local was_hidden = btn.hidden
                 btn:init()
+                if was_hidden then btn.hidden = false; btn:hide() end
                 M.patchDimmedIcon(btn)
             end
         end
@@ -503,12 +376,12 @@ function M.resizePaginationButtons(widget, icon_size)
     end)
     -- Apply any user-defined icon overrides for the pagination chevrons.
     -- This is called at every layout/rotation so overrides survive rebuilds.
-    pcall(function()
-        local ok_ss, style = pcall(_SUIStyle)
-        if ok_ss and style and style.applyPaginationIcons then
-            style.applyPaginationIcons(widget)
-        end
-    end)
+    --pcall(function()
+    --    local ok_ss, style = pcall(_SUIStyle)
+    --    if ok_ss and style and style.applyPaginationIcons then
+    --        style.applyPaginationIcons(widget)
+     --   end
+    --end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -542,13 +415,14 @@ end
 -- function is now just the sizing/settings adapter between this bar's own
 -- dimension accessors and that shared builder.
 function M.buildTabCell(action_id, active, tab_w, mode)
-    local bar_style = M.getBarStyle()
+    local full_width = _isFullWidth()
+    local surface = _navbarSurface()
     -- Inactive top rule only when the bar fill is fully opaque. With a
     -- wallpaper scrim (or transparent bar) a solid surface line reads as a
-    -- white strip across the top of the bar.
+    -- strip across the top of the bar.
     local inactive_indicator_color = nil
-    if bar_style == "default" and _navbarBackdropStrength() >= 100 then
-        inactive_indicator_color = _getBarBg() or _SUIStyle().COLOR.surface
+    if full_width and surface.strength >= 100 then
+        inactive_indicator_color = surface.color
     end
 
     local lbl_face, lbl_bold = M.LABEL_FONT(active)
@@ -561,8 +435,9 @@ function M.buildTabCell(action_id, active, tab_w, mode)
         icon_txt_sp              = M.ICON_TXT_SP(),
         indic_h                  = M.INDIC_H(),
         mode                     = mode,
-        bar_style                = bar_style,
+        full_width               = full_width,
         fgcolor                  = _getBarFg(),
+        surface_color            = surface.color,
         inactive_indicator_color = inactive_indicator_color,
     })
 
@@ -610,11 +485,12 @@ function M.buildNavpagerArrowCell(is_prev, enabled, tab_w, mode)
             vg[#vg + 1] = _vspan_icon_txt
         end
         local lbl_face, lbl_bold = M.LABEL_FONT(false)
-        tw = TextWidget():new{
-            text    = label,
-            face    = lbl_face,
-            bold    = lbl_bold,
-            fgcolor = color,
+        tw = _QARenderer().buildLabel{
+            text      = label,
+            face      = lbl_face,
+            bold      = lbl_bold,
+            fgcolor   = color,
+            max_width = _QARenderer().tabLabelMaxWidth(tab_w),
         }
         vg[#vg + 1] = tw
     end
@@ -633,11 +509,11 @@ function M.buildNavpagerArrowCell(is_prev, enabled, tab_w, mode)
         content,
     }
 
-    local bar_style = M.getBarStyle()
-    if bar_style == "default" and not _navbarIsTransparent() then
+    local surface = _navbarSurface()
+    if _isFullWidth() and surface.strength > 0 then
         og[#og + 1] = LineWidget():new{
             dimen          = Geom():new{ w = tab_w, h = M.INDIC_H() },
-            background     = _getBarBg() or _SUIStyle().COLOR.surface,
+            background     = surface.color,
             overlap_offset = { 0, 0 },
         }
     end
@@ -654,8 +530,9 @@ end
 -- Updates the Prev/Next arrow cells of an existing navpager bar in-place.
 -- Mutates only ImageWidget().dim and TextWidget().fgcolor on the two arrow cells
 -- rather than rebuilding the entire bar (~37 widget allocations per rebuild).
--- Returns true when the update was applied, false when the bar structure is
--- missing or unrecognised (caller must fall back to a full replaceBar).
+-- Returns `applied` (false when the bar structure is missing or unrecognised,
+-- so the caller must fall back to a full replaceBar) and `changed` (whether
+-- the arrows differ from what is on screen).
 function M.updateNavpagerArrows(widget, has_prev, has_next)
     local bar = widget._navbar_bar
     if not bar then return false end
@@ -663,7 +540,7 @@ function M.updateNavpagerArrows(widget, has_prev, has_next)
     -- Arrows are always visible when navpager is enabled.
     if not bar._navpager_has_arrows then return false end
 
-    local hg = bar._navpager_hg or bar[1]
+    local hg = bar._tab_row
     if not hg then return false end
     local prev_cc = hg[1]     -- slot 1 = Prev arrow CenterContainer
     local next_cc = hg[#hg]   -- last slot = Next arrow CenterContainer
@@ -674,7 +551,7 @@ function M.updateNavpagerArrows(widget, has_prev, has_next)
     end
     -- Skip all work when the visible state has not changed.
     if prev_cc._arrow_enabled == has_prev and next_cc._arrow_enabled == has_next then
-        return true
+        return true, false
     end
     local dimmed = _navpagerColor()
     local function _apply(cc, enabled)
@@ -690,100 +567,76 @@ function M.updateNavpagerArrows(widget, has_prev, has_next)
     end
     _apply(prev_cc, has_prev)
     _apply(next_cc, has_next)
-    return true
+    return true, true
 end
 
--- Shared helper to assemble the final FrameContainer for all bottom bar variants.
-local function _buildBarContainer(hg_args, is_navpager)
-    local side_m = _UI().SIDE_M()
-    local style = M.getBarStyle()
-    if style == "framed" then
-        local radius = math.floor(Screen:scaleBySize(12) * _getNavbarScale())
-        local border_color = _SUIStyle().COLOR.gray
-        local inner_bg = _getBarBg()
-        local strength = _navbarBackdropStrength()
-        local border_sz = require("features/sui_style").BORDER_SZ
-        local hg = HorizontalGroup():new(hg_args)
-
-        -- Content frame: native fill + border when strength is 0 or 100 (a
-        -- single native draw keeps them consistent); at partial strength the
-        -- border moves into NavbarFill below so it shares the scrim's
-        -- rounded-corner geometry.
-        local partial = strength > 0 and strength < 100
-        local fc = FrameContainer():new{
-            bordersize = partial and 0 or border_sz,
-            color      = border_color,
-            background = (strength >= 100) and inner_bg or nil,
-            radius     = radius,
-            padding    = 0, margin = 0,
-            hg,
-        }
-
-        local inner
-        if partial then
-            local sz = fc:getSize()
-            local box_w = math.max(1, sz.w)
-            local box_h = math.max(1, sz.h)
-            local fill = NavbarFill():new{
-                width = box_w,
-                height = box_h,
-                strength = strength,
-                radius = radius,
-                border_sz = border_sz,
-                border_color = border_color,
-            }
-            fill.dimen = Geom():new{ w = box_w, h = box_h }
-            fc.dimen = Geom():new{ w = box_w, h = box_h }
-            inner = OverlapGroup():new{
-                dimen = Geom():new{ w = box_w, h = box_h },
-                fill,
-                fc,
-            }
-        else
-            inner = fc
-        end
-
-        local wrapper = FrameContainer():new{
-            bordersize     = 0, padding = 0, margin = 0,
-            padding_left   = side_m,
-            padding_right  = side_m,
-            padding_top    = M.TOP_SP(),
-            padding_bottom = M.BOT_SP(),
-            background     = nil,
-            inner,
-        }
-
-        if is_navpager then
-            wrapper._navpager_has_arrows = true
-            wrapper._navpager_hg = hg
-        end
-        return wrapper
-    end
-
+-- Floating layout: the tab row in a rounded box inset from the screen sides.
+-- The box surface (fill and frame) is painted behind the row; a frame adds
+-- its thickness around the row.
+local function _buildFloatingBar(hg_args, is_navpager, surface)
+    local radius = math.floor(Screen:scaleBySize(12) * _getNavbarScale())
     local hg = HorizontalGroup():new(hg_args)
     local fc = FrameContainer():new{
-        bordersize      = 0,
-        padding         = 0,
-        padding_left    = side_m,
-        padding_right   = side_m,
-        padding_bottom  = M.BOT_SP(),
-        margin          = 0,
-        background      = _getBarBg(),
+        bordersize = 0,
+        padding    = surface.border_sz,
+        margin     = 0,
+        hg,
+    }
+    local sz = fc:getSize()
+    local box_w = math.max(1, sz.w)
+    local box_h = math.max(1, sz.h)
+    local fill = Backdrop.BackdropFill:new{
+        width   = box_w,
+        height  = box_h,
+        surface = surface,
+        radius  = radius,
+    }
+    fill.dimen = Geom():new{ w = box_w, h = box_h }
+    fc.dimen = Geom():new{ w = box_w, h = box_h }
+
+    local side_m = _UI().SIDE_M()
+    local wrapper = FrameContainer():new{
+        bordersize     = 0, padding = 0, margin = 0,
+        padding_left   = side_m,
+        padding_right  = side_m,
+        padding_top    = M.TOP_SP(),
+        padding_bottom = M.BOT_SP(),
+        OverlapGroup():new{
+            dimen = Geom():new{ w = box_w, h = box_h },
+            fill,
+            fc,
+        },
+    }
+    wrapper._tab_row = hg
+    wrapper._navpager_has_arrows = is_navpager or nil
+    return wrapper
+end
+
+-- Full-width layout: the tab row under a rule across its top edge (drawn while
+-- the frame is on); the surface fills the whole bar footprint.
+local function _buildFullWidthBar(hg_args, is_navpager, surface)
+    local side_m = _UI().SIDE_M()
+    local hg = HorizontalGroup():new(hg_args)
+    local fc = FrameContainer():new{
+        bordersize     = 0,
+        padding        = 0,
+        padding_left   = side_m,
+        padding_right  = side_m,
+        padding_bottom = M.BOT_SP(),
+        margin         = 0,
         hg,
     }
 
     local top_vg = VerticalGroup():new{ align = "center" }
-    local sep_h = M.SEP_H()
-    
-    if style == "default" and sep_h > 0 then
-        local sep_bg = _navbarIsTransparent() and nil or M.sepColor()
+    local sep_h = surface.border_sz
+    if sep_h > 0 then
         local pad_above = M.TOP_SP() - sep_h
         if pad_above > 0 then
             top_vg[#top_vg + 1] = VerticalSpan():new{ width = pad_above }
         end
         top_vg[#top_vg + 1] = LineWidget():new{
             dimen      = Geom():new{ w = _UI().getUsableW(), h = sep_h },
-            background = sep_bg,
+            background = _SUIStyle().COLOR.gray,
         }
     else
         top_vg[#top_vg + 1] = VerticalSpan():new{ width = M.TOP_SP() }
@@ -793,7 +646,6 @@ local function _buildBarContainer(hg_args, is_navpager)
         bordersize = 0, padding = 0, margin = 0,
         padding_left  = side_m,
         padding_right = side_m,
-        background = nil,
         top_vg,
     }
 
@@ -802,13 +654,41 @@ local function _buildBarContainer(hg_args, is_navpager)
         top_fc,
         fc,
     }
+    wrapper._tab_row = hg
+    wrapper._navpager_has_arrows = is_navpager or nil
+    return _applyNavbarFill(wrapper, surface)
+end
 
-    if is_navpager then 
-        wrapper._navpager_has_arrows = true 
-        wrapper._navpager_hg = hg
+-- Appends the cells of `tab_config` to `hg_args`. Cell i takes width slot
+-- `first_slot + i - 1`; a gap in the config leaves an empty slot. Returns the
+-- cell records that setActiveTab uses to update the bar in place.
+local function _appendTabCells(hg_args, tab_config, count, active_action_id, widths, first_slot, mode)
+    local cells = {}
+    for pos = 1, count do
+        local action_id = tab_config[pos]
+        local width     = widths[first_slot + pos - 1]
+        if action_id then
+            hg_args[#hg_args + 1] = M.buildTabCell(action_id, action_id == active_action_id, width, mode)
+            cells[#cells + 1] = { id = action_id, pos = pos, width = width, index = #hg_args }
+        else
+            hg_args[#hg_args + 1] = HorizontalSpan():new{ width = width }
+        end
     end
-    
-    return _applyNavbarScrim(wrapper)
+    return { cells = cells, active = active_action_id, mode = mode, gen = _layout_gen }
+end
+
+-- Assembles the final bar container for the current layout and surface.
+-- `tab_state` (from _appendTabCells) is kept on the bar for in-place updates.
+local function _buildBarContainer(hg_args, is_navpager, tab_state)
+    local surface = _navbarSurface()
+    local bar
+    if _isFullWidth() then
+        bar = _buildFullWidthBar(hg_args, is_navpager, surface)
+    else
+        bar = _buildFloatingBar(hg_args, is_navpager, surface)
+    end
+    bar._tab_state = tab_state
+    return bar
 end
 
 -- Assembles the full bottom bar FrameContainer from all tab cells.
@@ -828,20 +708,16 @@ function M.buildBarWidget(active_action_id, tab_config, num_tabs, mode)
             has_prev, has_next)
     end
 
-    local widths = M.getTabWidths(num_tabs, usable_w)
-    for i = 1, num_tabs do
-        local action_id = tab_config[i]
-        hg_args[#hg_args + 1] = M.buildTabCell(action_id, action_id == active_action_id, widths[i], mode)
-    end
+    local widths    = M.getTabWidths(num_tabs, usable_w)
+    local tab_state = _appendTabCells(hg_args, tab_config, num_tabs, active_action_id, widths, 1, mode)
 
-    return _buildBarContainer(hg_args, false)
+    return _buildBarContainer(hg_args, false, tab_state)
 end
 
 -- Navpager-mode bar with explicit has_prev / has_next flags.
 -- Called both from buildBarWidget (which resolves flags via getNavpagerState)
 -- and from the updatePageInfo hook (which passes pre-snapshotted values).
 function M.buildBarWidgetWithArrows(active_action_id, tab_config, mode, has_prev, has_next)
-    local HorizontalSpan = require("ui/widget/horizontalspan")
     mode = mode or Config.getNavbarMode()
     local screen_w  = Screen:getWidth()
     local side_m    = _UI().SIDE_M()
@@ -857,20 +733,12 @@ function M.buildBarWidgetWithArrows(active_action_id, tab_config, mode, has_prev
     hg_args[#hg_args + 1] = M.buildNavpagerArrowCell(true, has_prev, widths[1], mode)
 
     -- Centre tabs
-    for i = 1, center_n do
-        local action_id = tab_config[i]
-        local w = widths[i + 1]
-        if action_id then
-            hg_args[#hg_args + 1] = M.buildTabCell(action_id, action_id == active_action_id, w, mode)
-        else
-            hg_args[#hg_args + 1] = HorizontalSpan:new{ width = w }
-        end
-    end
+    local tab_state = _appendTabCells(hg_args, tab_config, center_n, active_action_id, widths, 2, mode)
 
     -- Next arrow
     hg_args[#hg_args + 1] = M.buildNavpagerArrowCell(false, has_next, widths[total_n], mode)
 
-    return _buildBarContainer(hg_args, true)
+    return _buildBarContainer(hg_args, true, tab_state)
 end
 
 -- Builds a bottom bar identical to buildBarWidget but with a keyboard-focus
@@ -888,23 +756,11 @@ function M.buildBarWidgetWithKeyFocus(active_action_id, tab_config, kbfocus_idx,
     local usable_w = _UI().getUsableW(screen_w)
     local widths   = M.getTabWidths(num_tabs, usable_w)
     local hg_args  = { align = "top" }
-    local bw       = Screen:scaleBySize(3)
-    
     for i = 1, num_tabs do
         local action_id = tab_config[i]
         local cell = M.buildTabCell(action_id, action_id == active_action_id, widths[i], mode)
         if i == kbfocus_idx then
-            local tw    = widths[i]
-            local tab_h = M.BAR_H()
-            local kbfg  = _getBarFg()
-            cell = OverlapGroup():new{
-                dimen = Geom():new{ w = tw, h = tab_h },
-                cell,
-                LineWidget():new{ dimen = Geom():new{ w = tw, h = bw },    background = kbfg },
-                LineWidget():new{ dimen = Geom():new{ w = tw, h = bw },    background = kbfg, overlap_offset = {0, tab_h - bw} },
-                LineWidget():new{ dimen = Geom():new{ w = bw, h = tab_h }, background = kbfg },
-                LineWidget():new{ dimen = Geom():new{ w = bw, h = tab_h }, background = kbfg, overlap_offset = {tw - bw, 0} },
-            }
+            cell = _UI().wrapFocusRing(cell, widths[i], M.BAR_H(), _getBarFg())
         end
         hg_args[#hg_args + 1] = cell
     end
@@ -922,8 +778,6 @@ local function _showNavbarSettingsWindow(plugin)
             items          = plugin._makeNavbarMenu(ctx_menu),
             inner_w        = ctx.inner_w,
             repaint        = function() ctx.repaint() end,
-            lock_overlay   = ctx.lockOverlay,
-            unlock_overlay = ctx.unlockOverlay,
             push_stack     = function(id, params)
                 if type(id) == "string" then ctx.push(id, params) else ctx.push("nested_menu", params) end
             end,
@@ -976,6 +830,92 @@ function M.replaceBar(widget, new_bar, tabs)
     widget._navbar_bar = new_bar
 
     if tabs then widget._navbar_tabs = tabs end
+end
+
+-- Moves the active indicator of `bar` to `action_id` by rebuilding only the
+-- cell that loses it and the cell that gains it. Cells keep their size, so
+-- the row layout stays valid.
+-- Returns `applied` (false when the bar was built for another configuration
+-- and must be rebuilt whole) and `changed` (whether the indicator moved).
+local function _swapActiveCells(bar, action_id, tabs)
+    local state = bar._tab_state
+    if not (state and state.gen == _layout_gen and state.mode == Config.getNavbarMode()
+            and #state.cells == #tabs) then
+        return false
+    end
+    local prev_cell, next_cell
+    for _, cell in ipairs(state.cells) do
+        if tabs[cell.pos] ~= cell.id then return false end
+        if cell.id == state.active then prev_cell = cell end
+        if cell.id == action_id    then next_cell = cell end
+    end
+    if state.active == action_id then return true, false end
+
+    local row = bar._tab_row
+    if prev_cell then
+        row[prev_cell.index] = M.buildTabCell(prev_cell.id, false, prev_cell.width, state.mode)
+    end
+    if next_cell then
+        row[next_cell.index] = M.buildTabCell(next_cell.id, true, next_cell.width, state.mode)
+    end
+    state.active = action_id
+    return true, prev_cell ~= nil or next_cell ~= nil
+end
+
+-- Makes `action_id` the active tab of the bar on `widget`, without repainting.
+-- Returns true when the bar on screen changed.
+function M.setActiveTab(widget, action_id, tabs)
+    tabs = tabs or Config.loadTabConfig()
+    if not SUISettings:nilOrTrue("simpleui_bar_enabled") then
+        M.replaceBar(widget, nil, tabs)
+        return false
+    end
+    local bar = widget._navbar_bar
+    if bar and widget._navbar_container
+            and widget._navbar_container[widget._navbar_bar_idx] == bar then
+        local applied, changed = _swapActiveCells(bar, action_id, tabs)
+        if applied then
+            widget._navbar_tabs = tabs
+            if Config.isNavpagerEnabled() then
+                local _, arrows_changed = M.updateNavpagerArrows(widget, Config.getNavpagerState())
+                changed = changed or arrows_changed or false
+            end
+            return changed
+        end
+    end
+    M.replaceBar(widget, M.buildBarWidget(action_id, tabs), tabs)
+    return true
+end
+
+-- Repaints the strip of `widget` that holds the bar. The widget is repainted
+-- as a whole, but the screen refresh is limited to the strip.
+function M.repaintBar(widget)
+    local bar_h = M.TOTAL_H()
+    if bar_h == 0 then return end
+    UIManager:setDirty(widget, "ui", Geom():new{
+        x = 0, y = Screen:getHeight() - bar_h, w = Screen:getWidth(), h = bar_h,
+    })
+end
+
+-- setActiveTab, then repaints the bar when its indicator moved.
+function M.showActiveTab(widget, action_id, tabs)
+    if M.setActiveTab(widget, action_id, tabs) then M.repaintBar(widget) end
+end
+
+-- Syncs the Prev/Next arrows of the bar on `widget` with the page state,
+-- rebuilding the bar when its structure does not allow an in-place update.
+-- Repaints the bar only when something changed.
+function M.syncNavpagerArrows(widget, active_action_id, has_prev, has_next)
+    local applied, changed = M.updateNavpagerArrows(widget, has_prev, has_next)
+    if applied then
+        if changed then M.repaintBar(widget) end
+        return
+    end
+    local tabs = Config.loadTabConfig()
+    M.replaceBar(widget,
+        M.buildBarWidgetWithArrows(active_action_id, tabs, Config.getNavbarMode(), has_prev, has_next),
+        tabs)
+    M.repaintBar(widget)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1325,16 +1265,14 @@ function M.onTabTap(plugin, action_id, fm_self)
     -- from the action_id itself (own tab if present, else Library).
     local indicator_tab = _resolveActiveTab(action_id, tabs)
     plugin.active_action = indicator_tab
-    -- Skip the eager replaceBar when the homescreen is open: navigate() will
-    -- close the HS and call replaceBar+setDirty itself, so doing it here too
-    -- produces a redundant buildBarWidget call and extra repaint flushes.
+    -- Skip the eager indicator update when the homescreen is open: navigate()
+    -- closes the HS and updates the FM bar itself.
     -- Also skip for "homescreen": UIManager.show calls setActiveAndRefreshFM
     -- when the HS widget is shown, covering the bar update at that point.
-    -- Also skip when already_active: the indicator is already correct and
-    -- rebuilding the bar would allocate all widgets for an identical result.
+    -- Also skip when already_active: the indicator is already correct.
     -- Also skip when fm_self is an injected widget (Collections, History, etc.):
-    -- navigate() will close it and then call replaceBar on the real FM, so
-    -- painting the bar on the about-to-close widget is wasted work.
+    -- navigate() closes it and then updates the real FM, so painting the bar
+    -- on the about-to-close widget is wasted work.
     local hs_open = (function()
         local HS = package.loaded["screens/sui_homescreen"]
         return HS and HS._instance ~= nil
@@ -1342,10 +1280,7 @@ function M.onTabTap(plugin, action_id, fm_self)
     local injected_open = fm_self ~= plugin.ui and fm_self._navbar_injected
     if fm_self._navbar_container and action_id ~= "homescreen" and not hs_open
             and not already_active and not injected_open then
-        M.replaceBar(fm_self, M.buildBarWidget(indicator_tab, tabs), tabs)
-        -- setDirty(fm_self) covers the full screen and recurses into navbar_container.
-        -- The previous double-dirty (navbar_container + fm_self) queued two e-ink cycles.
-        UIManager:setDirty(fm_self, "ui")
+        M.showActiveTab(fm_self, indicator_tab, tabs)
     end
     -- When the homescreen is open, update its bar immediately so the active
     -- indicator reflects the new tab before navigate() closes the HS.
@@ -1356,8 +1291,7 @@ function M.onTabTap(plugin, action_id, fm_self)
         local HS = package.loaded["screens/sui_homescreen"]
         local hs_inst = HS and HS._instance
         if hs_inst and hs_inst._navbar_container then
-            M.replaceBar(hs_inst, M.buildBarWidget(indicator_tab, tabs), tabs)
-            UIManager:setDirty(hs_inst, "ui")
+            M.showActiveTab(hs_inst, indicator_tab, tabs)
         end
     end
     pcall(function() plugin:_updateFMHomeIcon() end)
@@ -1369,7 +1303,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local function showUnavailable(msg)
-    UI.Notify.toast(msg)
+    _UI().Notify.toast(msg)
 end
 
 local function setActiveAndRefreshFM(plugin, action_id, tabs)
@@ -1381,8 +1315,7 @@ local function setActiveAndRefreshFM(plugin, action_id, tabs)
     end
     local fm = plugin.ui
     if fm and fm._navbar_container then
-        M.replaceBar(fm, M.buildBarWidget(action_id, fm._navbar_tabs or tabs), tabs)
-        UIManager:setDirty(fm, "ui")
+        M.showActiveTab(fm, action_id, fm._navbar_tabs or tabs)
     end
     return action_id
 end
@@ -1423,6 +1356,8 @@ local function _executeInPlace(action_id, plugin, fm)
             if entry.widget == hs_inst then hs_idx = i; break end
         end
         if hs_idx and hs_idx > 1 then
+            -- The action may act on the file list.
+            require("infra/sui_patches").materializeLazyListing()
             local entry = table.remove(stack, hs_idx)
             table.insert(stack, 1, entry)
         end
@@ -1563,8 +1498,7 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
         -- Update the FM bar. indicator_tab was resolved at the top of navigate()
         -- and already stored in plugin.active_action.
         if fm._navbar_container then
-            M.replaceBar(fm, M.buildBarWidget(indicator_tab, tabs), tabs)
-            UIManager:setDirty(fm, "ui")
+            M.showActiveTab(fm, indicator_tab, tabs)
         end
         -- For other actions, fall through with fm_self = fm.
         fm_self = fm
@@ -1596,8 +1530,7 @@ function M.navigate(plugin, action_id, fm_self, tabs, force)
     end
 
     if fm_self ~= fm and fm._navbar_container then
-        M.replaceBar(fm, M.buildBarWidget(_resolveActiveTab(action_id, tabs), tabs), tabs)
-        UIManager:setDirty(fm, "ui")
+        M.showActiveTab(fm, _resolveActiveTab(action_id, tabs), tabs)
     end
 
     -- Fully delegated to QA.execute.
@@ -1654,7 +1587,6 @@ end
 
 function M.setTempTabActive(plugin, action_id, active, prev_action)
     local tabs    = Config.loadTabConfig()
-    local mode    = Config.getNavbarMode()
     local show_id = active and action_id or (prev_action or tabs[1] or "home")
     local seen    = {}
 
@@ -1663,13 +1595,9 @@ function M.setTempTabActive(plugin, action_id, active, prev_action)
     local function updateWidget(w)
         if not w or not w._navbar_container or seen[w] then return end
         seen[w] = true
-        M.replaceBar(w, M.buildBarWidget(show_id, tabs, nil, mode), tabs)
-        -- setDirty(w) covers the full screen and recurses into navbar_container
-        -- (see the identical note in onTabTap). Dirtying just the sub-container
-        -- was the previous approach here and is unreliable once a dialog is
-        -- about to be shown on top of w: the indicator update could silently
-        -- get dropped instead of repainting alongside the dialog.
-        UIManager:setDirty(w, "ui")
+        -- Dirtying the widget (not the bar container) keeps the update
+        -- reliable when a dialog is about to be shown on top of it.
+        M.showActiveTab(w, show_id, tabs)
     end
 
     local UI    = require("infra/sui_core")
@@ -1790,8 +1718,7 @@ function M.restoreTabInFM(plugin, tabs, prev_action)
     local restored = (fm.file_chooser and Patches._resolveTabForPath(fm.file_chooser.path, t))
                   or prev_action or (t[1])
     plugin.active_action = restored
-    M.replaceBar(fm, M.buildBarWidget(restored, t), t)
-    UIManager:setDirty(fm, "ui")
+    M.showActiveTab(fm, restored, t)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1938,7 +1865,7 @@ end
 -- window if called directly from somewhere else.
 function M.showFloatingBarWindow(fm)
     if M.isBarInjectedOnCurrentScreen() then
-        UI.Notify.toast(_("The navigation bar is already available on this screen."), 2)
+        _UI().Notify.toast(_("The navigation bar is already available on this screen."), 2)
         return
     end
 

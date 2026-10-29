@@ -1,11 +1,7 @@
 -- sui_library_scan.lua — Simple UI
 -- Shared, cached recursive filesystem scanner for "all books in the
--- library" style modules (module_library.lua — the "Flat Library" module).
---
--- Note: module_new_books.lua keeps its own lighter walk (collectBooks/
--- scanNewBooks) for its capped top-15/TTL-based scan — not migrated to this
--- module, since a "show everything" scan needs different invalidation
--- (below) rather than a plain TTL.
+-- library" style consumers (module_library.lua — the "Flat Library" module,
+-- the "new_books" source in sui_book_sources.lua, library search).
 --
 -- Instead of a blind TTL, this tracks the mtime of every directory visited
 -- during a walk and only re-walks when one of those mtimes has actually
@@ -17,6 +13,7 @@
 -- ----------
 --   LibraryScan.getFileList(home_dir) -> { fp, ... }              (cached)
 --   LibraryScan.getRaw(home_dir)      -> { {fp,mtime,size}, ... } (cached)
+--   LibraryScan.cachedContains(home_dir, fp) -> bool|nil          (no I/O)
 --   LibraryScan.invalidate(home_dir?) -- forces a re-walk; no arg = all
 --   LibraryScan.resolveHomeDir()      -> current KOReader library home dir
 --
@@ -34,7 +31,7 @@ local LibraryScan = {}
 --- Resolves the current library home directory: the user-configured
 --- "home_dir" setting, falling back to the device default when unset or
 --- empty. Single source of truth — module_stats_provider.lua,
---- module_library.lua and module_new_books.lua all need this.
+--- module_library.lua and sui_book_sources.lua all need this.
 function LibraryScan.resolveHomeDir()
     local home = G_reader_settings:readSetting("home_dir")
     if not home or home == "" then home = Device.home_dir end
@@ -42,8 +39,7 @@ function LibraryScan.resolveHomeDir()
 end
 
 
--- Extensions KOReader can open. Single source of truth — module_new_books.lua
--- keeps its own copy today (see the note above about a future migration).
+-- Extensions KOReader can open. Single source of truth.
 LibraryScan.BOOK_EXTS = {
     epub = true, mobi = true, azw3 = true, azw = true, kfx = true,
     pdf = true, djvu = true, fb2 = true, cbz = true, cbr = true,
@@ -170,6 +166,20 @@ function LibraryScan.getFileList(home_dir)
     local fps = {}
     for i = 1, #raw do fps[i] = raw[i].fp end
     return fps
+end
+
+--- Whether the last scan of `home_dir` listed `fp`, without validating or
+--- re-walking. Nil when `home_dir` has not been scanned.
+function LibraryScan.cachedContains(home_dir, fp)
+    local entry = _cache[home_dir]
+    if not entry then return nil end
+    local set = entry.set
+    if not set then
+        set = {}
+        for i = 1, #entry.list do set[entry.list[i].fp] = true end
+        entry.set = set
+    end
+    return set[fp] == true
 end
 
 --- Forces the next call to re-walk the filesystem, regardless of the

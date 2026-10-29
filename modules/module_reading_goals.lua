@@ -1,8 +1,8 @@
 -- Reading Goals module: annual / monthly / daily progress with tap-to-set dialogs.
 -- Layouts: Default (bar + detail), Compact (single inline row), Rings (circular progress).
 
-local Blitbuffer      = require("ffi/blitbuffer")
 local CenterContainer = require("ui/widget/container/centercontainer")
+local Memory          = require("infra/sui_memory")
 local Device          = require("device")
 local Font            = require("ui/font")
 local FrameContainer  = require("ui/widget/container/framecontainer")
@@ -16,7 +16,6 @@ local LineWidget      = require("ui/widget/linewidget")
 local OverlapGroup    = require("ui/widget/overlapgroup")
 local RightContainer  = require("ui/widget/container/rightcontainer")
 local TextWidget      = require("ui/widget/textwidget")
-local TextBoxWidget   = require("ui/widget/textboxwidget")
 local UIManager       = require("ui/uimanager")
 local VerticalGroup   = require("ui/widget/verticalgroup")
 local VerticalSpan    = require("ui/widget/verticalspan")
@@ -31,11 +30,13 @@ local AAPaint         = require("infra/sui_aa_paint")
 
 local UI           = require("infra/sui_core")
 local SUISettings  = require("infra/sui_store")
+local Goals        = require("infra/sui_goals")
+local ManualBooks  = require("features/sui_manual_books")
 local SUIStyle     = require("features/sui_style")
+local Chrome       = require("features/sui_module_chrome")
 local PAD          = UI.PAD
 local PAD2         = UI.PAD2
 local LABEL_H      = UI.LABEL_H
-local CLR_TEXT_SUB = UI.CLR_TEXT_SUB
 
 -- Colours
 
@@ -46,7 +47,7 @@ local _BASE_ROW_H   = Screen:scaleBySize(16)
 local _BASE_SUB_H   = Screen:scaleBySize(16)
 local _BASE_SUB_GAP = Screen:scaleBySize(2)
 local _BASE_ROW_GAP = Screen:scaleBySize(18)
-local _BASE_BAR_H   = Screen:scaleBySize(8)
+local _BASE_BAR_H   = SUIStyle.PROGRESS_BAR_H
 local _BASE_LBL_W   = Screen:scaleBySize(44)
 local _BASE_COL_GAP = Screen:scaleBySize(8)
 local _BASE_BOT_PAD = Screen:scaleBySize(18)
@@ -54,6 +55,10 @@ local _BASE_BOT_PAD = Screen:scaleBySize(18)
 -- Compact layout reuses the same _BASE_* constants as the default layout —
 -- _compactDims(scale) just applies them at a different scale. Callers
 -- already multiply scale by ctx.landscape_factor before it reaches here.
+
+local function _openFinishedBooks()
+    require("screens/sui_stats_launcher").open("finished_books")
+end
 
 -- Rounds a fraction to a whole percentage. Mirrors SH.pctStr from
 -- module_books_shared; duplicated here to avoid loading that module just
@@ -105,16 +110,18 @@ local function _getYearStr()  return os.date("%Y") end
 local function _getMonthStr() return os.date("%b") end
 
 -- Settings keys
-local SHOW_ANNUAL  = "simpleui_reading_goals_show_annual"
-local SHOW_MONTHLY = "simpleui_reading_goals_show_monthly"
-local SHOW_DAILY   = "simpleui_reading_goals_show_daily"
+local SHOW_KEYS = {
+    annual  = "simpleui_reading_goals_show_annual",
+    monthly = "simpleui_reading_goals_show_monthly",
+    daily   = "simpleui_reading_goals_show_daily",
+}
+local ELEM_ORDER_KEY = "reading_goals_elem_order"  -- per-instance (pfx-scoped)
 local LAYOUT_KEY   = "simpleui_reading_goals_layout"  -- "default" | "compact" | "rings"
 -- Ring colour style: "flat" (default, matches progress-bar track/fill) or
 -- "transparent" (legacy alpha-mask stroke). Hidden — not exposed in menus.
 local RING_STYLE_KEY = "simpleui_reading_goals_ring_style"
 
--- Rings layout appearance — per-instance (pfx-scoped), same convention as
--- reading_goals_show_frame / reading_goals_solid_bg below.
+-- Rings layout appearance — per-instance (pfx-scoped).
 -- RING_CONTENT: where the x/z detail text is drawn —
 --   "inside"  (default) inside the ring hole, under the percentage
 --   "outside" below the ring, above the year/month/day label
@@ -122,27 +129,10 @@ local RING_STYLE_KEY = "simpleui_reading_goals_ring_style"
 local RING_CONTENT_KEY   = "reading_goals_ring_content"
 local RING_ALIGN_KEY     = "reading_goals_ring_align"
 local RING_CONTENT_VALUES = { "inside", "outside" }
-local RING_ALIGN_VALUES   = { "left", "center", "right" }
 
--- Reads a setting and validates it against a fixed list of allowed values,
--- falling back to `default` for unset or corrupted entries.
-local function _readEnum(pfx, key, values, default)
-    local v = SUISettings:readSetting(pfx .. key)
-    for _, allowed in ipairs(values) do if allowed == v then return v end end
-    return default
-end
+local function getRingContent(pfx)   return Config.readChoice(pfx .. RING_CONTENT_KEY, RING_CONTENT_VALUES, "inside") end
 
-local function getRingContent(pfx)   return _readEnum(pfx, RING_CONTENT_KEY, RING_CONTENT_VALUES, "inside") end
-local function setRingContent(pfx, v) SUISettings:saveSetting(pfx .. RING_CONTENT_KEY, v) end
-
-local function getRingAlign(pfx)   return _readEnum(pfx, RING_ALIGN_KEY, RING_ALIGN_VALUES, "center") end
-local function setRingAlign(pfx, v) SUISettings:saveSetting(pfx .. RING_ALIGN_KEY, v) end
-
-local function _ringAlignLabel(align, _lc)
-    if align == "left"  then return _lc("Left")  end
-    if align == "right" then return _lc("Right") end
-    return _lc("Center")
-end
+local function getRingAlign(pfx)   return Config.getAlignment(pfx .. RING_ALIGN_KEY) end
 
 local function getLayout()
     local v = SUISettings:readSetting(LAYOUT_KEY)
@@ -158,35 +148,30 @@ local function getRingStyle()
     if v == "transparent" then return "transparent" end
     return "flat"
 end
-local function showAnnual()   return SUISettings:readSetting(SHOW_ANNUAL) ~= false end
-local function showMonthly()  return SUISettings:readSetting(SHOW_MONTHLY) ~= false end
-local function showDaily()    return SUISettings:readSetting(SHOW_DAILY)  ~= false end
+local function isGoalShown(kind)     return SUISettings:readSetting(SHOW_KEYS[kind]) ~= false end
+local function setGoalShown(kind, v) SUISettings:saveSetting(SHOW_KEYS[kind], v) end
 
--- Default annual goal, used when the user has never set one: 12 books
--- (one a month) is a reasonable, easy-to-reach starting target.
-local ANNUAL_GOAL_DEFAULT = 12
-
-local function getAnnualGoal()      return tonumber(SUISettings:readSetting("simpleui_reading_goal")) or ANNUAL_GOAL_DEFAULT end
-local function getAnnualPhysical()  return tonumber(SUISettings:readSetting("simpleui_reading_goal_physical")) or 0 end
-local function getMonthlyGoalSecs() return tonumber(SUISettings:readSetting("simpleui_monthly_reading_goal_secs")) or 0 end
-local function getDailyGoalSecs()   return tonumber(SUISettings:readSetting("simpleui_daily_reading_goal_secs")) or 0 end
-
+-- Display order of every goal kind, hidden ones included. Kinds missing from
+-- the stored order are appended so new goals appear in existing installs.
 local function _getElemOrder(pfx)
-    local saved = SUISettings:readSetting((pfx or "simpleui_hs_") .. "reading_goals_elem_order")
-    if type(saved) ~= "table" or #saved == 0 then return { "annual", "monthly", "daily" } end
+    local saved = SUISettings:readSetting((pfx or "simpleui_hs_") .. ELEM_ORDER_KEY)
     local seen, result = {}, {}
-    for _, v in ipairs(saved) do
-        if (v == "annual" or v == "monthly" or v == "daily") and not seen[v] then
-            seen[v] = true
-            result[#result+1] = v
+    if type(saved) == "table" then
+        for _, v in ipairs(saved) do
+            if SHOW_KEYS[v] and not seen[v] then
+                seen[v] = true
+                result[#result + 1] = v
+            end
         end
     end
-    -- append any element not yet in saved (forwards-compat: "monthly" appears
-    -- in a fresh install but not in settings written by an older version)
-    for _, v in ipairs({"annual", "monthly", "daily"}) do
-        if not seen[v] then result[#result+1] = v end
+    for _, v in ipairs(Goals.IDS) do
+        if not seen[v] then result[#result + 1] = v end
     end
     return result
+end
+
+local function _saveElemOrder(pfx, order)
+    SUISettings:saveSetting(pfx .. ELEM_ORDER_KEY, order)
 end
 
 -- Formats seconds as "Xh Ym" / "Xh" / "Ym"
@@ -279,25 +264,18 @@ local function _measureLblW(labels, face, bold, floor_w)
     return math.max(max_w, floor_w)
 end
 
-local function _buildInnerCompact(inner_w, lbl_w, pct_w, label_str, pct, pct_str, detail_str, cd, clr_sub, clr_blk)
+local function _buildInnerCompact(inner_w, lbl_w, pct_w, detail_w, label_str, pct, pct_str, detail_str, cd, ink)
     local ROW_H          = cd.row_h
     local LBL_BAR_GAP    = cd.col_gap
     local BAR_PCT_GAP    = cd.col_gap
     local PCT_DETAIL_GAP = cd.col_gap
-    -- right_w must be at least pct_w + gap + a minimum detail column.
-    local MIN_DETAIL_W = Screen:scaleBySize(32)
-    local right_w = math.max(
-        math.floor(inner_w * 0.28),
-        pct_w + PCT_DETAIL_GAP + MIN_DETAIL_W)
-    local available = inner_w - lbl_w - LBL_BAR_GAP - BAR_PCT_GAP - right_w
-    if available < Screen:scaleBySize(40) then
-        -- lbl_w grew — shrink right_w before the bar goes below minimum
-        available = Screen:scaleBySize(40)
-        right_w = math.max(0, inner_w - lbl_w - LBL_BAR_GAP - BAR_PCT_GAP - available)
-    end
-    local bar_w    = available
-    local PCT_W    = pct_w
-    local DETAIL_W = math.max(0, right_w - PCT_W - PCT_DETAIL_GAP)
+    local PCT_W          = pct_w
+    -- The detail column is as wide as its measured text; the bar takes the rest.
+    local fixed     = lbl_w + LBL_BAR_GAP + BAR_PCT_GAP + PCT_W + PCT_DETAIL_GAP
+    local min_bar_w = Screen:scaleBySize(40)
+    local bar_w     = math.max(min_bar_w, inner_w - fixed - detail_w)
+    -- When the bar is at its minimum the detail text is ellipsized to what is left.
+    local DETAIL_W  = math.max(0, math.min(detail_w, inner_w - fixed - bar_w))
 
     local function vcenter_left(child, col_w)
         return LeftContainer:new{ dimen = Geom:new{ w = col_w, h = ROW_H }, child }
@@ -306,35 +284,33 @@ local function _buildInnerCompact(inner_w, lbl_w, pct_w, label_str, pct, pct_str
         return RightContainer:new{ dimen = Geom:new{ w = col_w, h = ROW_H }, child }
     end
 
-    local eff_blk = clr_blk or SUIStyle.COLOR.text_primary
     return HorizontalGroup:new{
         align = "center",
         vcenter_left(UI.makeColoredText{
             text    = label_str,
             face    = cd.face_lbl,
             bold    = cd.bold_lbl,
-            fgcolor = eff_blk,
+            fgcolor = ink.blk,
             width   = lbl_w,
         }, lbl_w),
         HorizontalSpan:new{ width = LBL_BAR_GAP },
-        vcenter_left(UI.progressBar(bar_w, pct, cd.bar_h), bar_w),
+        vcenter_left(UI.progressBar(bar_w, pct, cd.bar_h, ink.bar_fg, ink.bar_bg), bar_w),
         HorizontalSpan:new{ width = BAR_PCT_GAP },
         vcenter_left(UI.makeColoredText{
             text    = pct_str,
             face    = cd.face_pct,
             bold    = cd.bold_pct,
-            fgcolor = eff_blk,
+            fgcolor = ink.blk,
             width   = PCT_W,
         }, PCT_W),
         HorizontalSpan:new{ width = PCT_DETAIL_GAP },
-        vcenter_right(UI.makeColoredText{
+        DETAIL_W > 0 and vcenter_right(UI.makeColoredText{
             text      = detail_str,
             face      = cd.face_det,
             bold      = cd.bold_det,
-            fgcolor   = clr_sub or CLR_TEXT_SUB,
-            width     = DETAIL_W,
-            alignment = "right",
-        }, DETAIL_W),
+            fgcolor   = ink.sub,
+            max_width = DETAIL_W,
+        }, DETAIL_W) or HorizontalSpan:new{ width = 0 },
     }
 end
 
@@ -363,22 +339,40 @@ end
 -- Builds a single inline row: Label [bar] XX%  detail
 -- Used by the Compact layout. All elements are horizontally laid out and vertically centred.
 -- lbl_w is pre-computed by _measureLblW so both rows share the same column width.
-local function buildCompactGoalRow(inner_w, lbl_w, pct_w, label_str, pct, pct_str, detail_str, on_tap, cd, clr_sub, clr_blk)
-    local row = _buildInnerCompact(inner_w, lbl_w, pct_w, label_str, pct, pct_str, detail_str, cd, clr_sub, clr_blk)
-
+local function buildCompactGoalRow(inner_w, lbl_w, pct_w, group, label_str, pct, pct_str, detail_str, on_tap, cd, ink)
+    local state = { pct = pct, pct_str = pct_str, detail = detail_str }
     local frame = FrameContainer:new{
         bordersize = 0, padding = 0,
         dimen      = Geom:new{ w = inner_w, h = cd.row_h },
-        row,
     }
+    local function rebuild()
+        frame[1] = _buildInnerCompact(inner_w, lbl_w, pct_w, group.detail_w, label_str,
+            state.pct, state.pct_str, state.detail, cd, ink)
+    end
+    rebuild()
+    group.rows[#group.rows + 1] = { state = state, rebuild = rebuild }
+
+    -- The detail column is shared: when the widest detail changes, every row
+    -- is rebuilt so the bars stay aligned.
     local update_fn = function(new_pct, new_pct_str, new_detail_str)
-        frame[1] = _buildInnerCompact(inner_w, lbl_w, pct_w, label_str, new_pct, new_pct_str, new_detail_str, cd, clr_sub, clr_blk)
+        state.pct, state.pct_str, state.detail = new_pct, new_pct_str, new_detail_str
+        local details = {}
+        for _, r in ipairs(group.rows) do
+            if r.state.detail ~= "" then details[#details + 1] = r.state.detail end
+        end
+        local w = _measureLblW(details, cd.face_det, cd.bold_det, 0)
+        if w ~= group.detail_w then
+            group.detail_w = w
+            for _, r in ipairs(group.rows) do r.rebuild() end
+        else
+            rebuild()
+        end
     end
 
     return _wrapTappable(frame, inner_w, cd.row_h, on_tap), update_fn
 end
 
-local function _buildInnerDefault(inner_w, label_str, pct, pct_str, detail_str, d, clr_sub_eff, clr_blk_eff)
+local function _buildInnerDefault(inner_w, label_str, pct, pct_str, detail_str, d, ink)
     local PCT_W       = _measureLblW({ pct_str }, d.face_pct, d.bold_pct, d.pct_w)
     local LBL_BAR_GAP = d.col_gap
     local BAR_PCT_GAP = d.col_gap
@@ -396,17 +390,17 @@ local function _buildInnerDefault(inner_w, label_str, pct, pct_str, detail_str, 
                 text    = label_str,
                 face    = d.face_lbl,
                 bold    = d.bold_lbl,
-                fgcolor = clr_blk_eff,
+                fgcolor = ink.blk,
                 width   = d.lbl_w,
             },
             HorizontalSpan:new{ width = LBL_BAR_GAP },
-        UI.progressBar(bar_w, pct, d.bar_h),
+        UI.progressBar(bar_w, pct, d.bar_h, ink.bar_fg, ink.bar_bg),
             HorizontalSpan:new{ width = BAR_PCT_GAP },
             UI.makeColoredText{
                 text      = pct_str,
                 face      = d.face_pct,
                 bold      = d.bold_pct,
-                fgcolor   = clr_blk_eff,
+                fgcolor   = ink.blk,
                 width     = PCT_W,
                 alignment = "right",
             },
@@ -416,7 +410,7 @@ local function _buildInnerDefault(inner_w, label_str, pct, pct_str, detail_str, 
             text    = detail_str,
             face    = d.face_det,
             bold    = d.bold_det,
-            fgcolor = clr_sub_eff,
+            fgcolor = ink.sub,
             width   = inner_w,
         },
     }
@@ -424,10 +418,8 @@ end
 
 -- Builds a two-line goal row: label + bar + pct on the first line, detail text below.
 -- Used by the Default layout. Accepts a pre-computed dims table from _scaledDims.
-local function buildGoalRow(inner_w, label_str, pct, pct_str, detail_str, on_tap, d, clr_sub_eff, clr_blk_eff)
-    clr_sub_eff = clr_sub_eff or CLR_TEXT_SUB
-    clr_blk_eff = clr_blk_eff or SUIStyle.COLOR.text_primary
-    local block = _buildInnerDefault(inner_w, label_str, pct, pct_str, detail_str, d, clr_sub_eff, clr_blk_eff)
+local function buildGoalRow(inner_w, label_str, pct, pct_str, detail_str, on_tap, d, ink)
+    local block = _buildInnerDefault(inner_w, label_str, pct, pct_str, detail_str, d, ink)
 
     local frame = FrameContainer:new{
         bordersize     = 0,
@@ -436,7 +428,7 @@ local function buildGoalRow(inner_w, label_str, pct, pct_str, detail_str, on_tap
         block,
     }
     local update_fn = function(new_pct, new_pct_str, new_detail_str)
-        frame[1] = _buildInnerDefault(inner_w, label_str, new_pct, new_pct_str, new_detail_str, d, clr_sub_eff, clr_blk_eff)
+        frame[1] = _buildInnerDefault(inner_w, label_str, new_pct, new_pct_str, new_detail_str, d, ink)
     end
 
     return _wrapTappable(frame, inner_w, d.goal_row_h, on_tap), update_fn
@@ -446,8 +438,7 @@ end
 -- Rings layout: one card per active goal with a progress ring.
 -- Sizing is relative to screen width: each card ≤ 25%, gap = 5% between cards.
 -- Content only — no frame, no solid background (wallpaper shows through).
--- Ring drawing uses AAPaint.paintRingProgress + UI.paintWithAlphaMask
--- (same pipeline as the analogue clock face).
+-- Rings are blitted from cached coverage masks (AAPaint.ringMask).
 -- ---------------------------------------------------------------------------
 
 -- Ring stroke as a fraction of outer radius — higher = smaller centre hole.
@@ -519,7 +510,7 @@ end
 -- flat (default): solid track + fill matching UI.progressBar flat colours
 --                 (COLOR.track / COLOR.gray), no translucent background stroke.
 -- transparent:    legacy single-colour alpha-mask stroke (fg_color).
-local function _buildRingWidget(diameter, fraction, thickness, fg_color)
+local function _buildRingWidget(diameter, fraction, thickness, ink)
     if diameter < 4 then return nil end
     local outer_r = diameter / 2 - 0.5
     local thick = thickness
@@ -534,7 +525,7 @@ local function _buildRingWidget(diameter, fraction, thickness, fg_color)
     widget.dimen = Geom:new{ w = diameter, h = diameter }
     widget._fraction = fraction or 0
     widget._thick = thick
-    widget._fg = fg_color
+    widget._ink = ink
     widget._style = style
 
     function widget:getSize()
@@ -543,49 +534,20 @@ local function _buildRingWidget(diameter, fraction, thickness, fg_color)
 
     function widget:paintTo(bb, x, y)
         self.dimen.x, self.dimen.y = x, y
-        local d = self.dimen.w
+        local d, t, frac = self.dimen.w, self._thick, self._fraction
         if d <= 0 then return end
-        if not self._tmp_bb or self._tmp_bb:getWidth() ~= d or self._tmp_bb:getHeight() ~= d then
-            if self._tmp_bb then self._tmp_bb:free() end
-            self._tmp_bb = Blitbuffer.new(d, d, Blitbuffer.TYPE_BB8)
-        end
-        local frac = self._fraction or 0
-        local t = self._thick
-        local r = d / 2 - 0.5
-        local cx, cy = d / 2, d / 2
 
         if self._style == "transparent" then
-            -- Legacy: progress + translucent track in one alpha-mask pass.
-            local paint_fn = function(_w, tmp_bb)
-                AAPaint.paintRingProgress(tmp_bb, cx, cy, r, t, frac, 0, 0, d - 1, d - 1)
-            end
-            UI.paintWithAlphaMask(widget, bb, x, y, d, d, self._fg, paint_fn, self._tmp_bb)
+            -- Progress and translucent track in one single-colour mask.
+            bb:colorblitFromRGB32(AAPaint.ringMask(d, t, frac), x, y, 0, 0, d, d, self._ink.blk)
             return
         end
 
-        -- Flat: opaque track (COLOR.track) then progress arc (COLOR.gray),
-        -- same pair UI.progressBar uses for style "flat".
-        local track_c = SUIStyle.COLOR.track
-        local fill_c  = SUIStyle.COLOR.gray
-        -- Full ring track (fraction 0, track_cov 1 → solid stroke).
-        local paint_track = function(_w, tmp_bb)
-            AAPaint.paintRingProgress(tmp_bb, cx, cy, r, t, 0, 0, 0, d - 1, d - 1, 1.0)
-        end
-        UI.paintWithAlphaMask(widget, bb, x, y, d, d, track_c, paint_track, self._tmp_bb)
+        -- Flat: opaque track (COLOR.track) then progress arc (accent colour
+        -- or COLOR.gray), the same pair UI.progressBar uses for style "flat".
+        bb:colorblitFromRGB32(AAPaint.ringMask(d, t, 0, 1), x, y, 0, 0, d, d, self._ink.bar_bg or SUIStyle.COLOR.track)
         if frac > 0 then
-            -- Progress only (track_cov 0).
-            local paint_fill = function(_w, tmp_bb)
-                AAPaint.paintRingProgress(tmp_bb, cx, cy, r, t, frac, 0, 0, d - 1, d - 1, 0)
-            end
-            UI.paintWithAlphaMask(widget, bb, x, y, d, d, fill_c, paint_fill, self._tmp_bb)
-        end
-    end
-
-    function widget:onCloseWidget() self:free() end
-    function widget:free()
-        if self._tmp_bb then
-            self._tmp_bb:free()
-            self._tmp_bb = nil
+            bb:colorblitFromRGB32(AAPaint.ringMask(d, t, frac, 0), x, y, 0, 0, d, d, self._ink.bar_fg or SUIStyle.accent(SUIStyle.COLOR.gray))
         end
     end
 
@@ -596,13 +558,13 @@ end
 --   "inside"  (default) — detail shares the ring hole with the percentage.
 --   "outside" — only the percentage sits in the hole (grows into the freed
 --               space); detail is drawn below the ring, above the label.
-local function _buildGoalCardInner(card_w, _card_h, label_str, pct, pct_str, detail_str, d, clr_blk, clr_sub, ring_content)
+local function _buildGoalCardInner(card_w, _card_h, label_str, pct, pct_str, detail_str, d, ink, ring_content)
     local ring_d = math.max(24, card_w)
     if ring_d % 2 == 1 then ring_d = ring_d - 1 end
 
     local ring_frac = _ringFraction(pct, pct_str)
     local thick = math.max(2, math.floor((ring_d / 2) * _RING_THICK_FRAC))
-    local ring = _buildRingWidget(ring_d, ring_frac, thick, clr_blk)
+    local ring = _buildRingWidget(ring_d, ring_frac, thick, ink)
 
     local center_txt = pct_str
     if not center_txt or center_txt == "" then center_txt = "—" end
@@ -626,7 +588,7 @@ local function _buildGoalCardInner(card_w, _card_h, label_str, pct, pct_str, det
         text    = center_txt,
         face    = face_pct,
         bold    = bold_pct,
-        fgcolor = clr_blk,
+        fgcolor = ink.blk,
         max_width = content_w,
         truncate_with_ellipsis = true,
     }
@@ -640,7 +602,7 @@ local function _buildGoalCardInner(card_w, _card_h, label_str, pct, pct_str, det
             text    = detail_str,
             face    = face_det,
             bold    = bold_det,
-            fgcolor = clr_sub,
+            fgcolor = ink.sub,
             max_width = content_w,
             truncate_with_ellipsis = true,
         }
@@ -670,7 +632,7 @@ local function _buildGoalCardInner(card_w, _card_h, label_str, pct, pct_str, det
             text    = detail_str,
             face    = d.face_det,
             bold    = d.bold_det,
-            fgcolor = clr_sub,
+            fgcolor = ink.sub,
             max_width = ring_d,
             truncate_with_ellipsis = true,
         }
@@ -683,7 +645,7 @@ local function _buildGoalCardInner(card_w, _card_h, label_str, pct, pct_str, det
             text    = label_str,
             face    = d.face_lbl,
             bold    = d.bold_lbl,
-            fgcolor = clr_blk,
+            fgcolor = ink.blk,
             max_width = ring_d,
             truncate_with_ellipsis = true,
         }
@@ -715,15 +677,13 @@ local function _ringTopGap(scale)
     return math.max(6, math.floor(_RING_TOP_GAP_BASE * scale))
 end
 
-local function buildGoalCardWidget(card_w, _card_h, label_str, pct, pct_str, detail_str, on_tap, d, clr_sub, clr_blk, ring_content)
-    clr_sub = clr_sub or CLR_TEXT_SUB
-    clr_blk = clr_blk or SUIStyle.COLOR.text_primary
+local function buildGoalCardWidget(card_w, _card_h, label_str, pct, pct_str, detail_str, on_tap, d, ink, ring_content)
     local host = WidgetContainer:new{}
     local ring_ref
     local side_w, side_h = card_w, card_w
     local function set_inner(p, ps, det)
         local inner, ring, ring_d, total_h = _buildGoalCardInner(
-            card_w, card_w, label_str, p, ps, det, d, clr_blk, clr_sub, ring_content)
+            card_w, card_w, label_str, p, ps, det, d, ink, ring_content)
         if ring_ref and ring_ref.free then ring_ref:free() end
         ring_ref = ring
         side_w = ring_d or card_w
@@ -740,81 +700,6 @@ end
 
 -- Triggers a homescreen refresh after a goal change.
 -- Invalidates StatsProvider so _buildCtx re-fetches with updated ctx.stats.
-local function _refreshHS()
-    local SP = package.loaded["modules/module_stats_provider"]
-    if SP then SP.invalidate() end
-    local HS = package.loaded["screens/sui_homescreen"]
-    if HS then HS.refresh(false) end
-end
-
--- Shows a SpinWidget bound to a settings key, refreshing the homescreen and
--- calling on_confirm after save. Shared by all four goal-setting dialogs
--- below — only the copy, value range, and settings key differ between them.
-local function _showGoalSpinDialog(opts, on_confirm)
-    local SpinWidget = require("ui/widget/spinwidget")
-    UIManager:show(SpinWidget:new{
-        title_text  = opts.title_text,
-        info_text   = opts.info_text,
-        value       = opts.value,
-        value_min   = opts.value_min or 0,
-        value_max   = opts.value_max,
-        value_step  = opts.value_step or 1,
-        ok_text     = _("Save"), cancel_text = _("Cancel"),
-        callback    = function(spin)
-            SUISettings:saveSetting(opts.setting_key, math.floor(spin.value) * (opts.value_multiplier or 1))
-            _refreshHS()
-            if on_confirm then on_confirm() end
-        end,
-    })
-end
-
--- Dialog: set the number of books to read this year
-local function showAnnualGoalDialog(on_confirm)
-    _showGoalSpinDialog({
-        title_text  = _("Annual Reading Goal"),
-        info_text   = string.format(_("Books to read in %s:"), _getYearStr()),
-        value       = getAnnualGoal(),
-        value_max   = 365,
-        setting_key = "simpleui_reading_goal",
-    }, on_confirm)
-end
-
--- Dialog: set the count of physical books read this year
-local function showAnnualPhysicalDialog(on_confirm)
-    _showGoalSpinDialog({
-        title_text  = string.format(_("Physical Books — %s"), _getYearStr()),
-        info_text   = _("Physical books read this year:"),
-        value       = getAnnualPhysical(),
-        value_max   = 365,
-        setting_key = "simpleui_reading_goal_physical",
-    }, on_confirm)
-end
-
--- Dialog: set the monthly reading goal in hours
-local function showMonthlySettingsDialog(on_confirm)
-    _showGoalSpinDialog({
-        title_text       = _("Monthly Reading Goal"),
-        info_text        = _("Hours per month:"),
-        value            = math.floor(getMonthlyGoalSecs() / 3600),
-        value_max        = 350,
-        setting_key      = "simpleui_monthly_reading_goal_secs",
-        value_multiplier = 3600,
-    }, on_confirm)
-end
-
--- Dialog: set the daily reading goal in minutes
-local function showDailySettingsDialog(on_confirm)
-    _showGoalSpinDialog({
-        title_text       = _("Daily Reading Goal"),
-        info_text        = _("Minutes per day:"),
-        value            = math.floor(getDailyGoalSecs() / 60),
-        value_max        = 720,
-        value_step       = 5,
-        setting_key      = "simpleui_daily_reading_goal_secs",
-        value_multiplier = 60,
-    }, on_confirm)
-end
-
 -- Formats a percentage/detail pair, falling back to a plain-text version if
 -- string.format raises (e.g. a translated plural form with mismatched
 -- placeholders) so a bad translation degrades gracefully instead of crashing
@@ -835,13 +720,9 @@ local function _goalPct(value, goal)
 end
 
 -- Returns pct, pct_str, detail for the annual goal row
-local function _annualData(books_read)
-    local goal = getAnnualGoal()
-    local read = books_read + getAnnualPhysical()
+local function _annualData(read)
+    local goal = Goals.get("annual")
     local pct, pct_str = _goalPct(read, goal)
-    logger.dbg("simpleui reading_goals: annual bar — goal=", goal,
-        "books_read=", books_read, "physical=", getAnnualPhysical(),
-        "read=", read, "pct=", pct, "pct_str=", pct_str)
     local detail_text = _safeDetail("annual",
         function()
             if goal > 0 then
@@ -858,7 +739,7 @@ end
 
 -- Returns pct, pct_str, detail for the monthly goal row
 local function _monthlyData(month_secs)
-    local goal_secs = getMonthlyGoalSecs()
+    local goal_secs = Goals.get("monthly")
     local pct, pct_str = _goalPct(month_secs, goal_secs)
     local detail_text = _safeDetail("monthly",
         function()
@@ -878,7 +759,7 @@ end
 
 -- Returns pct, pct_str, detail for the daily goal row
 local function _dailyData(today_secs)
-    local goal_secs = getDailyGoalSecs()
+    local goal_secs = Goals.get("daily")
     local pct, pct_str = _goalPct(today_secs, goal_secs)
     local detail_text = _safeDetail("daily",
         function()
@@ -921,15 +802,20 @@ local M = {}
 
 M.id          = "reading_goals"
 M.name        = _("Reading Goals")
+M.category    = "stats"
 M.label       = _("Reading Goals")
 M.enabled_key = "reading_goals_enabled"
 M.default_on  = true
 M.text_elems  = TEXT_ELEMS
 
-M.showAnnualGoalDialog      = showAnnualGoalDialog
-M.showAnnualPhysicalDialog  = showAnnualPhysicalDialog
-M.showMonthlySettingsDialog = showMonthlySettingsDialog
-M.showDailySettingsDialog   = showDailySettingsDialog
+-- Layout-editor summary: the visible goals, in order.
+function M.getSummary(_id, pfx)
+    local names = {}
+    for _i, kind in ipairs(_getElemOrder(pfx)) do
+        if isGoalShown(kind) then names[#names + 1] = Goals.label(kind) end
+    end
+    return #names > 0 and table.concat(names, "  ·  ") or nil
+end
 
 -- Delegate cache invalidation to StatsProvider (shared with reading_stats).
 function M.invalidateCache()
@@ -948,23 +834,15 @@ end
 
 -- Builds the widget. Branches on layout: compact, rings, or default.
 function M.build(w, ctx)
-    local show_ann = showAnnual()
-    local show_mon = showMonthly()
-    local show_day = showDaily()
+    local show_ann = isGoalShown("annual")
+    local show_mon = isGoalShown("monthly")
+    local show_day = isGoalShown("daily")
     if not show_ann and not show_mon and not show_day then return nil end
 
     local ok, res = pcall(function()
     local scale  = Config.getModuleScale("reading_goals", ctx.pfx) * (ctx.landscape_factor or 1)
     local styles = Config.resolveTextStyles(ctx, M.id, TEXT_ELEMS)
-    -- Frame border / solid background — same optional box every other
-    -- homescreen module offers (module_currently.lua, module_heatmap.lua):
-    -- a border, a filled background, or both, each adding PAD to every edge.
-    -- Computed up front so inner_w below already reserves room for the
-    -- border, keeping the box's real outer width equal to `w`.
-    local box = { inset_h = 0, inset_v = 0, outer_margin = 0 }
-    -- Always keep outer_margin so content lines up with sectionLabel and with
-    -- sibling modules that use computeBox/wrapBox (e.g. Currently Reading).
-    local inner_w = w - box.inset_h
+    local inner_w = w
     -- Stats pre-fetched by StatsProvider and passed via ctx.stats.
     local sp         = ctx.stats or {}
     local books_read = sp.books_year  or 0
@@ -977,8 +855,8 @@ function M.build(w, ctx)
     local show_rows = { annual = show_ann, monthly = show_mon, daily = show_day }
 
     local rg_update_funcs = {}
-    local CLR_TEXT_BLK_EFF = SUIStyle.COLOR.text_primary
-    local CLR_TEXT_SUB_EFF = CLR_TEXT_SUB
+    -- Content colours over the module fill.
+    local ink = ctx.ink or Chrome.PLAIN_INK
 
     if layout == "rings" then
         local active = {}
@@ -1003,28 +881,22 @@ function M.build(w, ctx)
             if k == "annual" then
                 label = year_str
                 pct, pct_str, detail = _annualData(books_read)
-                on_tap = function()
-                    local ok_sw, SW = pcall(require, "screens/sui_stats_windows")
-                    if ok_sw and SW and SW.showFinishedBooksDialog then
-                        if SW.showLoadingNotice then SW.showLoadingNotice() end
-                        SW.showFinishedBooksDialog()
-                    end
-                end
+                on_tap = _openFinishedBooks
                 cat = "books"
             elseif k == "monthly" then
                 label = month_str
                 pct, pct_str, detail = _monthlyData(month_secs)
-                on_tap = function() showMonthlySettingsDialog() end
+                on_tap = function() Goals.showDialog("monthly") end
                 cat = "timeseries"
             else
                 label = _("Today")
                 pct, pct_str, detail = _dailyData(today_secs)
-                on_tap = function() showDailySettingsDialog() end
+                on_tap = function() Goals.showDialog("daily") end
                 cat = "timeseries"
             end
             local card_widget, card_update_fn = buildGoalCardWidget(
                 card_w, card_h, label, pct, pct_str, detail, on_tap, cd,
-                CLR_TEXT_SUB_EFF, CLR_TEXT_BLK_EFF, ring_content)
+                ink, ring_content)
             row[#row + 1] = card_widget
             if k == "annual" then
                 table.insert(rg_update_funcs, { cat = cat, fn = function(books_r, _today_s, _month_s)
@@ -1065,6 +937,9 @@ function M.build(w, ctx)
         local month_str = _getMonthStr()
         local rows, pct_w = _collectRowData(show_rows, books_read, month_secs, today_secs,
             cd.face_pct, cd.bold_pct, Screen:scaleBySize(28))
+        local details = {}
+        for _id, r in pairs(rows) do if r.detail ~= "" then details[#details+1] = r.detail end end
+        local group = { detail_w = _measureLblW(details, cd.face_det, cd.bold_det, 0), rows = {} }
         local rendered_count = 0
         for _i, k in ipairs(_getElemOrder(ctx.pfx)) do
             if k == "annual" and show_ann then
@@ -1072,14 +947,8 @@ function M.build(w, ctx)
                 local lbl_w = _measureLblW({ year_str }, cd.face_lbl, cd.bold_lbl, cd.lbl_w)
                 cd.lbl_w = lbl_w
                 local row_widget, row_update_fn = buildCompactGoalRow(
-                    inner_w, lbl_w, pct_w, year_str, rows.annual.pct, rows.annual.pct_str, rows.annual.detail,
-                    function()
-                        local ok, SW = pcall(require, "screens/sui_stats_windows")
-                        if ok and SW and SW.showFinishedBooksDialog then
-                            if SW.showLoadingNotice then SW.showLoadingNotice() end
-                            SW.showFinishedBooksDialog()
-                        end
-                    end, cd, CLR_TEXT_SUB_EFF, CLR_TEXT_BLK_EFF)
+                    inner_w, lbl_w, pct_w, group, year_str, rows.annual.pct, rows.annual.pct_str, rows.annual.detail,
+                    _openFinishedBooks, cd, ink)
                 rows_children[#rows_children+1] = row_widget
                 table.insert(rg_update_funcs, { cat = "books", fn = function(books_r, _today_s, _month_s)
                     local n_pct, n_str, n_det = _annualData(books_r)
@@ -1091,8 +960,8 @@ function M.build(w, ctx)
                 local lbl_w = _measureLblW({ month_str }, cd.face_lbl, cd.bold_lbl, cd.lbl_w)
                 cd.lbl_w = lbl_w
                 local row_widget, row_update_fn = buildCompactGoalRow(
-                    inner_w, lbl_w, pct_w, month_str, rows.monthly.pct, rows.monthly.pct_str, rows.monthly.detail,
-                    function() showMonthlySettingsDialog() end, cd, CLR_TEXT_SUB_EFF, CLR_TEXT_BLK_EFF)
+                    inner_w, lbl_w, pct_w, group, month_str, rows.monthly.pct, rows.monthly.pct_str, rows.monthly.detail,
+                    function() Goals.showDialog("monthly") end, cd, ink)
                 rows_children[#rows_children+1] = row_widget
                 table.insert(rg_update_funcs, { cat = "timeseries", fn = function(_books_r, _today_s, month_s)
                     local n_pct, n_str, n_det = _monthlyData(month_s)
@@ -1103,8 +972,8 @@ function M.build(w, ctx)
                 if rendered_count > 0 then rows_children[#rows_children+1] = VerticalSpan:new{ width = cd.row_gap } end
                 local lbl_w = _measureLblW({ _("Today") }, cd.face_lbl, cd.bold_lbl, cd.lbl_w)
                 local row_widget, row_update_fn = buildCompactGoalRow(
-                    inner_w, lbl_w, pct_w, _("Today"), rows.daily.pct, rows.daily.pct_str, rows.daily.detail,
-                    function() showDailySettingsDialog() end, cd, CLR_TEXT_SUB_EFF, CLR_TEXT_BLK_EFF)
+                    inner_w, lbl_w, pct_w, group, _("Today"), rows.daily.pct, rows.daily.pct_str, rows.daily.detail,
+                    function() Goals.showDialog("daily") end, cd, ink)
                 rows_children[#rows_children+1] = row_widget
                 table.insert(rg_update_funcs, { cat = "timeseries", fn = function(_books_r, today_s, _month_s)
                     local n_pct, n_str, n_det = _dailyData(today_s)
@@ -1129,13 +998,7 @@ function M.build(w, ctx)
                 d.lbl_w = ann_lbl_w
                 local row_widget, row_update_fn = buildGoalRow(
                     inner_w, year_str, rows.annual.pct, rows.annual.pct_str, rows.annual.detail,
-                    function()
-                        local ok, SW = pcall(require, "screens/sui_stats_windows")
-                        if ok and SW and SW.showFinishedBooksDialog then
-                            if SW.showLoadingNotice then SW.showLoadingNotice() end
-                            SW.showFinishedBooksDialog()
-                        end
-                    end, d, CLR_TEXT_SUB_EFF, CLR_TEXT_BLK_EFF)
+                    _openFinishedBooks, d, ink)
                 rows_children[#rows_children+1] = row_widget
                 table.insert(rg_update_funcs, { cat = "books", fn = function(books_r, _today_s, _month_s)
                     local n_pct, n_str, n_det = _annualData(books_r)
@@ -1148,7 +1011,7 @@ function M.build(w, ctx)
                 d.lbl_w = mon_lbl_w
                 local row_widget, row_update_fn = buildGoalRow(
                     inner_w, month_str, rows.monthly.pct, rows.monthly.pct_str, rows.monthly.detail,
-                    function() showMonthlySettingsDialog() end, d, CLR_TEXT_SUB_EFF, CLR_TEXT_BLK_EFF)
+                    function() Goals.showDialog("monthly") end, d, ink)
                 rows_children[#rows_children+1] = row_widget
                 table.insert(rg_update_funcs, { cat = "timeseries", fn = function(_books_r, _today_s, month_s)
                     local n_pct, n_str, n_det = _monthlyData(month_s)
@@ -1161,7 +1024,7 @@ function M.build(w, ctx)
                 d.lbl_w = day_lbl_w
                 local row_widget, row_update_fn = buildGoalRow(
                     inner_w, _("Today"), rows.daily.pct, rows.daily.pct_str, rows.daily.detail,
-                    function() showDailySettingsDialog() end, d, CLR_TEXT_SUB_EFF, CLR_TEXT_BLK_EFF)
+                    function() Goals.showDialog("daily") end, d, ink)
                 rows_children[#rows_children+1] = row_widget
                 table.insert(rg_update_funcs, { cat = "timeseries", fn = function(_books_r, today_s, _month_s)
                     local n_pct, n_str, n_det = _dailyData(today_s)
@@ -1179,38 +1042,23 @@ function M.build(w, ctx)
     
     if not ok then
         logger.warn("simpleui reading_goals build error: " .. tostring(res))
-        -- Wrapping TextBoxWidget rather than the single-line TextWidget behind
-        -- makeColoredText, so this message wraps within the module's width
-        -- instead of overflowing past it (same pattern as the book modules'
-        -- empty-state placeholders).
+        -- Wrapping text box rather than the single-line TextWidget behind
+        -- makeColoredText, so the message wraps within the module's width.
         local err_h = require("device").screen:scaleBySize(60)
         local err_args = {
             text      = _("Error in Reading Goals: check crash.log"),
-            face      = Font:getFace(SUIStyle.FACE_REGULAR, 15),
+            face      = Font:getFace(SUIStyle.FACE_REGULAR, SUIStyle.FS_DETAIL),
             width     = w - PAD * 2,
             height    = err_h,
             height_adjust = true,
             height_overflow_show_ellipsis = true,
             alignment = "center",
-            fgcolor   = SUIStyle.COLOR.text_primary,
+            fgcolor   = (ctx.ink or Chrome.PLAIN_INK).blk,
         }
-
-        local err_w
-        if ctx.has_wallpaper then
-            local ok_tbx, tbx = pcall(UI.makeAlphaTextBox, err_args)
-            if ok_tbx then
-                err_w = tbx
-            else
-                logger.warn("simpleui: module_reading_goals: makeAlphaTextBox failed, falling back to TextBoxWidget: " .. tostring(tbx))
-                err_w = TextBoxWidget:new(err_args)
-            end
-        else
-            err_w = TextBoxWidget:new(err_args)
-        end
 
         return CenterContainer:new{
             dimen = Geom:new{ w = w, h = err_h },
-            err_w,
+            UI.makeTextBox(err_args, ctx.text_alpha),
         }
     end
     return res
@@ -1240,7 +1088,7 @@ end
 
 -- Returns the pixel height of the module including the section label
 function M.getHeight(_ctx)
-    local n = (showAnnual() and 1 or 0) + (showMonthly() and 1 or 0) + (showDaily() and 1 or 0)
+    local n = (isGoalShown("annual") and 1 or 0) + (isGoalShown("monthly") and 1 or 0) + (isGoalShown("daily") and 1 or 0)
     if n == 0 then return 0 end
     local pfx = _ctx and _ctx.pfx or ""
     local lf = (_ctx and _ctx.landscape_factor) or (UI.isLandscape() and UI.getLandscapeFactor() or 1)
@@ -1254,13 +1102,13 @@ function M.getHeight(_ctx)
         -- Approximate column width when the module is in a bento column so
         -- height tracks the same ring size build() will use.
         local approx_inner
-        local bw = Config.getBentoWidth("reading_goals", pfx)
-        if bw < 100 then
+        local fraction = Config.getBentoFraction("reading_goals", pfx)
+        if fraction < 1 then
             local content_w = UI.getInnerW()
             if UI.isLandscape() then
                 content_w = UI.getSpreadColWidth(content_w)
             end
-            approx_inner = math.max(1, math.floor(content_w * bw / 100))
+            approx_inner = math.max(1, math.floor(content_w * fraction))
         end
         local card_w, _, cd = _ringsCardW(scale, approx_inner, n, pfx, styles)
         h = top_gap + _ringCardApproxHeight(card_w, cd, getRingContent(pfx))
@@ -1270,20 +1118,8 @@ function M.getHeight(_ctx)
         local d = _scaledDims(scale, styles)
         h = n * d.goal_row_h + (n > 1 and (n - 1) * d.row_gap or 0)
     end
-    do
-        local ok, WP = pcall(require, "features/sui_wallpaper")
-        local strength = (ok and WP and WP.getModuleBackdropStrength and WP.getModuleBackdropStrength(pfx, "reading_goals"))
-            or (SUISettings:isTrue(pfx .. "reading_goals_solid_bg") and 100 or 0)
-        if SUISettings:isTrue(pfx .. "reading_goals_show_frame") or strength > 0 then
-            h = h + PAD * 2
-        end
-    end
-    -- Mirrors build()'s wrapped FrameContainer: bordersize is drawn outside
-    -- the padding, so the border itself (not just the padding) grows the
-    -- real widget by border_sz * 2 pixels whenever the frame is on.
-    if SUISettings:isTrue(pfx .. "reading_goals_show_frame") then
-        h = h + SUIStyle.BORDER_SZ * 2
-    end
+    -- The module chrome adds its padding and border around the content.
+    h = h + Chrome.boxInset(Chrome.resolve(pfx, M.id))
     return label_h + h
 end
 
@@ -1307,92 +1143,101 @@ function M.getMenuItems(ctx_menu)
     local refresh = ctx_menu.refresh
     local _lc     = ctx_menu._
     local N_lc    = ctx_menu.N_
+    local pfx     = ctx_menu.pfx
     local text_opts = {
         mod_id  = M.id,
         elems   = TEXT_ELEMS,
         labels  = { label = _lc("Label"), value = _lc("Percentage"), detail = _lc("Detail") },
         info    = _lc("Size of this text.\n100% is the default size."),
-        pfx     = ctx_menu.pfx,
+        pfx     = pfx,
         refresh = refresh,
         _lc     = _lc,
     }
-    -- Arrange-screen row for one goal. Tapping the row and the "Set Goal"
-    -- action both open the same value dialog.
-    local function goalArrangeItem(kind, label, subtitle, showDialog)
-        local function setGoal() showDialog(refresh) end
+    -- Short description of a goal's current target, shown under its name.
+    local function goalSubtitle(kind)
+        local value = Goals.get(kind)
+        if value <= 0 then return _lc("Not set") end
+        if kind == "annual" then
+            return string.format(N_lc("%d book in %s", "%d books in %s", value), value, _getYearStr())
+        elseif kind == "monthly" then
+            return string.format(_lc("%d hr/month"), math.floor(value / 3600))
+        end
+        return string.format(_lc("%d min/day"), math.floor(value / 60))
+    end
+
+    -- Classic-menu checklist entry that shows/hides one goal.
+    local function goalCheckItem(kind)
         return {
-            text       = label,
-            subtitle   = subtitle,
+            text           = Goals.label(kind),
+            checked_func   = function() return isGoalShown(kind) end,
+            keep_menu_open = true,
+            callback       = function()
+                setGoalShown(kind, not isGoalShown(kind))
+                refresh()
+            end,
+        }
+    end
+
+    -- Arrange-screen row for one goal: tapping the row or "Set Goal" opens the
+    -- value dialog; the eye icon shows/hides the goal without moving it.
+    local function goalArrangeItem(kind, repaint)
+        local function setGoal()
+            Goals.showDialog(kind, function() refresh(); repaint() end)
+        end
+        return Config.applyVisibilityToggle({
+            text       = Goals.label(kind),
+            subtitle   = goalSubtitle(kind),
             orig_item  = kind,
             on_tap     = setGoal,
             more_items = {
                 { text = _lc("Set Goal"), icon = "edit", on_tap = setGoal },
             },
-        }
+        }, {
+            is_visible  = function() return isGoalShown(kind) end,
+            set_visible = function(visible) setGoalShown(kind, visible) end,
+            on_change   = refresh,
+            repaint     = repaint,
+        })
     end
 
     local rows = {
         {
             text = _lc("Goals"),
             sub_item_table = {
-                {
-                    text         = _lc("Annual Goal"),
-                    checked_func = function() return showAnnual() end,
-                    keep_menu_open = true,
-                    callback = function()
-                        SUISettings:saveSetting(SHOW_ANNUAL, not showAnnual())
-                        refresh()
-                    end,
-                },
+                goalCheckItem("annual"),
                 {
                     text_func = function()
-                        local g = getAnnualGoal()
+                        local g = Goals.get("annual")
                         return g > 0
                             and string.format(N_lc("  Set Goal  (%d book in %s)", "  Set Goal  (%d books in %s)", g), g, _getYearStr())
                             or  string.format(_lc("  Set Goal  (%s)"), _getYearStr())
                     end,
                     keep_menu_open = true,
-                    callback = function() showAnnualGoalDialog(refresh) end,
+                    callback = function() Goals.showDialog("annual", refresh) end,
                 },
 
-                {
-                    text         = _lc("Monthly Goal"),
-                    checked_func = function() return showMonthly() end,
-                    keep_menu_open = true,
-                    callback = function()
-                        SUISettings:saveSetting(SHOW_MONTHLY, not showMonthly())
-                        refresh()
-                    end,
-                },
+                goalCheckItem("monthly"),
                 {
                     text_func = function()
-                        local secs = getMonthlyGoalSecs()
+                        local secs = Goals.get("monthly")
                         local h    = math.floor(secs / 3600)
                         if secs <= 0 then return _lc("  Set Goal  (disabled)")
                         else              return string.format(_lc("  Set Goal  (%d hr/month)"), h) end
                     end,
                     keep_menu_open = true,
-                    callback = function() showMonthlySettingsDialog(refresh) end,
+                    callback = function() Goals.showDialog("monthly", refresh) end,
                 },
 
-                {
-                    text         = _lc("Daily Goal"),
-                    checked_func = function() return showDaily() end,
-                    keep_menu_open = true,
-                    callback = function()
-                        SUISettings:saveSetting(SHOW_DAILY, not showDaily())
-                        refresh()
-                    end,
-                },
+                goalCheckItem("daily"),
                 {
                     text_func = function()
-                        local secs = getDailyGoalSecs()
+                        local secs = Goals.get("daily")
                         local m    = math.floor(secs / 60)
                         if secs <= 0 then return _lc("  Set Goal  (disabled)")
                         else              return string.format(_lc("  Set Goal  (%d min/day)"), m) end
                     end,
                     keep_menu_open = true,
-                    callback = function() showDailySettingsDialog(refresh) end,
+                    callback = function() Goals.showDialog("daily", refresh) end,
                 },
             },
             sui_build = ctx_menu.is_sui and function(ctx, _item)
@@ -1401,10 +1246,8 @@ function M.getMenuItems(ctx_menu)
                     title        = _lc("Goals"),
                     subtitle     = function()
                         local names = {}
-                        for _, k in ipairs(_getElemOrder(ctx_menu.pfx)) do
-                            if k == "annual"  and showAnnual()   then names[#names + 1] = _lc("Annual Goal")  end
-                            if k == "monthly" and showMonthly()  then names[#names + 1] = _lc("Monthly Goal") end
-                            if k == "daily"   and showDaily()    then names[#names + 1] = _lc("Daily Goal")   end
+                        for _, kind in ipairs(_getElemOrder(pfx)) do
+                            if isGoalShown(kind) then names[#names + 1] = Goals.label(kind) end
                         end
                         return #names > 0 and table.concat(names, "  ·  ") or _lc("No items selected.")
                     end,
@@ -1412,199 +1255,60 @@ function M.getMenuItems(ctx_menu)
                     show_chevron = true,
                     on_tap       = function()
                         ctx.push("arrange", {
-                            title = _lc("Goals"),
-                            empty_text = _lc("No items selected."),
-                            footer_text = _lc("Add Item"),
-                            footer_enabled = function()
-                                return not showAnnual() or not showMonthly() or not showDaily()
-                            end,
-                            footer_action = function(ctx2)
-                                local picker_items = {}
-                                -- Helper: enable a goal kind and append it to the stored order.
-                                local function _enable(key, flag_key, label)
-                                    picker_items[#picker_items + 1] = {
-                                        text   = label,
-                                        on_tap = function(picker_ctx)
-                                            SUISettings:saveSetting(flag_key, true)
-                                            local order     = _getElemOrder(ctx_menu.pfx)
-                                            local new_order = {}
-                                            for _, k in ipairs(order) do
-                                                if k ~= key then new_order[#new_order+1] = k end
-                                            end
-                                            new_order[#new_order+1] = key
-                                            SUISettings:saveSetting(ctx_menu.pfx .. "reading_goals_elem_order", new_order)
-                                            refresh()
-                                            picker_ctx.pop()
-                                            ctx2.repaint()
-                                        end
-                                    }
-                                end
-                                if not showAnnual()  then _enable("annual",  SHOW_ANNUAL,  _lc("Annual Goal"))  end
-                                if not showMonthly() then _enable("monthly", SHOW_MONTHLY, _lc("Monthly Goal")) end
-                                if not showDaily()   then _enable("daily",   SHOW_DAILY,   _lc("Daily Goal"))   end
-                                ctx2.push("item_picker", {
-                                    title = _lc("Add Item"),
-                                    items = picker_items,
-                                })
-                            end,
+                            title      = _lc("Goals"),
                             items_func = function()
-                                local sort_items = {}
-                                for _, k in ipairs(_getElemOrder(ctx_menu.pfx)) do
-                                    local item
-                                    if k == "annual" and showAnnual() then
-                                        local g = getAnnualGoal()
-                                        item = goalArrangeItem(k, _lc("Annual Goal"),
-                                            g > 0 and string.format(N_lc("%d book in %s", "%d books in %s", g), g, _getYearStr())
-                                                  or  _lc("Not set"),
-                                            showAnnualGoalDialog)
-                                    elseif k == "monthly" and showMonthly() then
-                                        local secs = getMonthlyGoalSecs()
-                                        item = goalArrangeItem(k, _lc("Monthly Goal"),
-                                            secs > 0 and string.format(_lc("%d hr/month"), math.floor(secs / 3600))
-                                                     or  _lc("Not set"),
-                                            showMonthlySettingsDialog)
-                                    elseif k == "daily" and showDaily() then
-                                        local secs = getDailyGoalSecs()
-                                        item = goalArrangeItem(k, _lc("Daily Goal"),
-                                            secs > 0 and string.format(_lc("%d min/day"), math.floor(secs / 60))
-                                                     or  _lc("Not set"),
-                                            showDailySettingsDialog)
-                                    end
-                                    if item then sort_items[#sort_items + 1] = item end
+                                local items = {}
+                                for _, kind in ipairs(_getElemOrder(pfx)) do
+                                    items[#items + 1] = goalArrangeItem(kind, ctx.repaint)
                                 end
-                                return sort_items
+                                return items
                             end,
-                            on_delete = function(item)
-                                local flag = item.orig_item == "annual"  and SHOW_ANNUAL
-                                          or item.orig_item == "monthly" and SHOW_MONTHLY
-                                          or SHOW_DAILY
-                                SUISettings:saveSetting(flag, false)
+                            on_change  = function(items_to_save)
+                                local order = {}
+                                for _, it in ipairs(items_to_save) do order[#order + 1] = it.orig_item end
+                                _saveElemOrder(pfx, order)
                                 refresh()
                             end,
-                            on_change = function(items_to_save)
-                                local new_order  = {}
-                                local active_set = {}
-                                for _, it in ipairs(items_to_save) do
-                                    new_order[#new_order + 1] = it.orig_item
-                                    active_set[it.orig_item]  = true
-                                end
-                                -- Append inactive elements so their saved position is preserved
-                                -- (they'll be filtered by showXxx() guards in _getElemOrder).
-                                for _, k in ipairs(_getElemOrder(ctx_menu.pfx)) do
-                                    if not active_set[k] then new_order[#new_order + 1] = k end
-                                end
-                                SUISettings:saveSetting(ctx_menu.pfx .. "reading_goals_elem_order", new_order)
-                                refresh()
-                            end
                         })
-                    end
+                    end,
                 }
             end or nil,
         },
-        {
-            text_func = function()
-                local p = getAnnualPhysical()
-                return p > 0
-                    and string.format(N_lc("Manually Tracked Books  (%d in %s)", "Manually Tracked Books  (%d in %s)", p), p, _getYearStr())
-                    or  string.format(_lc("Manually Tracked Books  (%s)"), _getYearStr())
-            end,
-            keep_menu_open = true,
-            callback = function() showAnnualPhysicalDialog(refresh) end,
-            sui_build = ctx_menu.is_sui and function(ctx, _item)
-                local SUIWindow = require("engines/sui_window")
-                local p = getAnnualPhysical()
-                local right = p > 0
-                    and string.format(N_lc("%d in %s", "%d in %s", p), p, _getYearStr())
-                    or  _getYearStr()
-                return SUIWindow.ListRow{
-                    inner_w     = ctx.inner_w,
-                    title       = _lc("Manually Tracked Books"),
-                    right_value = right,
-                    separator   = true,
-                    on_tap      = function() showAnnualPhysicalDialog(refresh) end,
-                }
-            end or nil,
-        },
+        ManualBooks.makeMenuItem(refresh),
         {
             text_func      = function() return _lc("Appearance") end,
             sub_item_table = {
-                { text = _lc("Layout"),
-                  sub_item_table = {
-                      { text         = _lc("Default"),
-                        radio        = true,
-                        checked_func = function() return getLayout() == "default" end,
-                        keep_menu_open = true,
-                        callback = function()
-                            SUISettings:saveSetting(LAYOUT_KEY, "default")
-                            refresh()
-                        end },
-                      { text         = _lc("Compact"),
-                        radio        = true,
-                        checked_func = function() return getLayout() == "compact" end,
-                        keep_menu_open = true,
-                        callback = function()
-                            SUISettings:saveSetting(LAYOUT_KEY, "compact")
-                            refresh()
-                        end },
-                      { text         = _lc("Rings"),
-                        radio        = true,
-                        checked_func = function() return getLayout() == "rings" end,
-                        keep_menu_open = true,
-                        callback = function()
-                            SUISettings:saveSetting(LAYOUT_KEY, "rings")
-                            refresh()
-                        end },
-                  },
-                },
-                {
-                    text_func    = function() return _lc("Ring Style") end,
-                    value_func   = function()
-                        return getRingContent(ctx_menu.pfx) == "outside"
-                            and _lc("Detail Below Ring") or _lc("Detail Inside Ring")
-                    end,
-                    enabled_func = function() return getLayout() == "rings" end,
-                    sub_item_table = {
-                        { text         = _lc("Detail Inside Ring"),
-                          radio        = true,
-                          checked_func = function() return getRingContent(ctx_menu.pfx) == "inside" end,
-                          keep_menu_open = true,
-                          callback = function()
-                              setRingContent(ctx_menu.pfx, "inside")
-                              refresh()
-                          end },
-                        { text         = _lc("Detail Below Ring"),
-                          radio        = true,
-                          checked_func = function() return getRingContent(ctx_menu.pfx) == "outside" end,
-                          keep_menu_open = true,
-                          callback = function()
-                              setRingContent(ctx_menu.pfx, "outside")
-                              refresh()
-                          end },
+                Config.makeRadioSubmenuItem{
+                    text    = _lc("Layout"),
+                    options = {
+                        { value = "default", label = _lc("Default") },
+                        { value = "compact", label = _lc("Compact") },
+                        { value = "rings",   label = _lc("Rings") },
                     },
+                    get     = getLayout,
+                    set     = function(v) SUISettings:saveSetting(LAYOUT_KEY, v) end,
+                    refresh = refresh,
                 },
-                {
-                    text_func    = function() return _lc("Ring Alignment") end,
-                    value_func   = function() return _ringAlignLabel(getRingAlign(ctx_menu.pfx), _lc) end,
+                Config.makeRadioSubmenuItem{
+                    text         = _lc("Ring Style"),
                     enabled_func = function() return getLayout() == "rings" end,
-                    sub_item_table = {
-                        { text         = _lc("Left"),
-                          radio        = true,
-                          checked_func = function() return getRingAlign(ctx_menu.pfx) == "left" end,
-                          keep_menu_open = true,
-                          callback = function() setRingAlign(ctx_menu.pfx, "left"); refresh() end },
-                        { text         = _lc("Center"),
-                          radio        = true,
-                          checked_func = function() return getRingAlign(ctx_menu.pfx) == "center" end,
-                          keep_menu_open = true,
-                          callback = function() setRingAlign(ctx_menu.pfx, "center"); refresh() end },
-                        { text         = _lc("Right"),
-                          radio        = true,
-                          checked_func = function() return getRingAlign(ctx_menu.pfx) == "right" end,
-                          keep_menu_open = true,
-                          callback = function() setRingAlign(ctx_menu.pfx, "right"); refresh() end },
+                    options      = {
+                        { value = "inside",  label = _lc("Detail Inside Ring") },
+                        { value = "outside", label = _lc("Detail Below Ring") },
                     },
+                    get          = function() return getRingContent(pfx) end,
+                    set          = function(v) SUISettings:saveSetting(pfx .. RING_CONTENT_KEY, v) end,
+                    refresh      = refresh,
+                },
+                Config.makeAlignmentItem{
+                    key          = pfx .. RING_ALIGN_KEY,
+                    text         = _lc("Ring Alignment"),
+                    enabled_func = function() return getLayout() == "rings" end,
+                    refresh      = refresh,
+                    _lc          = _lc,
                 },
                 Config.makeLabelToggleItem("reading_goals", refresh, _lc),
+                Config.makeLabelPlacementItem("reading_goals", refresh, _lc),
                                             },
         },
         {
@@ -1613,7 +1317,7 @@ function M.getMenuItems(ctx_menu)
             keep_menu_open = true,
             callback       = function()
                 local SP = package.loaded["modules/module_stats_provider"]
-                if SP and SP.invalidate then SP.invalidate() end
+                if SP and SP.rescanBooks then SP.rescanBooks() end
                 local SH = package.loaded["modules/module_books_shared"]
                 if SH and SH.invalidateSidecarCache then SH.invalidateSidecarCache() end
                 local MC = package.loaded["modules/module_currently"]
@@ -1660,5 +1364,7 @@ function M.getMenuItems(ctx_menu)
         behaviour = #behaviour_rows > 0 and behaviour_rows or nil,
     }, ctx_menu)
 end
+
+Memory.onReset(M.reset)
 
 return M

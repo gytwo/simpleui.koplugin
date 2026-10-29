@@ -61,8 +61,10 @@
 -- here would yank the C memory out from under those widgets' next partial
 -- repaint. Blitbuffer sets up an ffi.gc finalizer at allocation time (see
 -- ffi/blitbuffer.lua's setAllocated(1)), so the underlying C memory is
--- reclaimed automatically once every Lua reference is gone. Slight
--- memory-reclaim latency, never a use-after-free.
+-- reclaimed automatically once every Lua reference is gone. The dropped
+-- bytes are reported to infra/sui_memory.lua, which schedules the
+-- collection that actually returns them. Slight memory-reclaim latency,
+-- never a use-after-free.
 --
 -- clear() follows the same rule — it drops references, it doesn't free.
 --
@@ -79,113 +81,33 @@
 -- than the target slot.
 
 local logger = require("logger")
+local LRU    = require("infra/sui_lru")
+local Memory = require("infra/sui_memory")
 
--- Per-cover cache logging is verbose (one line per PUT/EVICT) and, because
--- Lua evaluates the string.format() argument before logger.dbg can discard
--- it at the info level, the format cost is paid on every cover even with
--- debug logging off. Gate it behind a constant so production pays nothing;
--- flip to true when diagnosing cache churn.
+-- Per-cover cache logging is verbose (one line per PUT) and, because Lua
+-- evaluates the string.format() argument before logger.dbg can discard it at
+-- the info level, the format cost is paid on every cover even with debug
+-- logging off. Gate it behind a constant so production pays nothing; flip to
+-- true when diagnosing cache churn.
 local _PERF_LOG = false
 
--- Resident byte size of a cached cover bb. `stride` is the bytes-per-row of
--- the underlying C allocation, so `stride * h` is the true RAM footprint
--- INCLUDING any row padding — and it scales correctly with both cover
--- dimensions and bit depth (1 byte/px on grayscale e-ink vs 4 bytes/px
--- RGB32 on a colour panel) without the cache needing to know the device
--- type. This is why the cache is bounded by BYTES, not entry count: "40
--- covers" is a few MiB of small grayscale thumbnails or tens of MiB of
--- large colour hero covers — same count, very different RAM.
-local function _bbBytes(bb)
-    if not bb then return 0 end
-    local ok, n = pcall(function()
-        local h = (bb.getHeight and bb:getHeight()) or tonumber(bb.h) or 0
-        local stride = tonumber(bb.stride)
-        if stride and h > 0 then return stride * h end
-        local w   = (bb.getWidth and bb:getWidth()) or 0
-        local bpp = (bb.getBpp and bb:getBpp()) or 8
-        return w * h * math.ceil(bpp / 8)
-    end)
-    return (ok and n) or 0
-end
+-- Entry-count backstop for pathological many-tiny-covers cases; the byte
+-- budget (sized to the device by infra/sui_memory.lua) binds first for
+-- normal covers.
+local MAX_ENTRIES = 512
+
+-- Entries are { bb, revision }. Revisions come from one session-wide counter,
+-- so a revision is never reused, even after its entry has left the cache.
+local _last_revision = 0
 
 local SUICoverCache = {
-    -- Bounded by RAM, in BYTES — see _bbBytes above. ~20 MiB default:
-    -- replaces the old exact-size cache (8 MiB) + the per-book duplication
-    -- a separate canonical-crop cache (4 MiB) existed to work around, at
-    -- roughly the same combined footprint, but without holding
-    -- near-duplicate entries for the same book at nearly the same size
-    -- across two separate tables.
-    --
-    -- _capacity is a non-user-facing entry-COUNT backstop, kept only to
-    -- bound the O(n) _order scans in get/put and guard against a
-    -- pathological many-tiny-covers case. Set high enough that the byte
-    -- budget always binds first for normal budgets.
-    _capacity    = 512,
-    _byte_budget = 20 * 1024 * 1024,
-    _bytes       = 0,   -- running sum of resident entry bytes (see _sizes)
-    _cache       = {},  -- filepath -> bb
-    _order       = {},  -- list of filepaths, oldest at front, MRU at back
-    _sizes       = {},  -- filepath -> bytes, so evict/replace adjust _bytes O(1)
-    _hits        = 0,   -- perf: cache hits this session
-    _puts        = 0,   -- perf: cache misses (fresh stretch) this session
-    _evictions   = 0,   -- perf: evictions this session
+    _lru  = LRU.new{ max_entries = MAX_ENTRIES, max_bytes = Memory.budgets().covers },
+    _hits = 0,   -- perf: cache hits this session
+    _puts = 0,   -- perf: cache misses (fresh stretch) this session
 }
 
--- setCapacity(n) — adjust the entry-COUNT backstop. Not user-facing: the
--- RAM bound is _byte_budget. Retained for completeness/tuning; raising it
--- lets more covers stay resident (until the byte budget binds), lowering
--- it evicts down immediately.
-function SUICoverCache:setCapacity(n)
-    n = tonumber(n)
-    if not n then return end
-    n = math.floor(n)
-    if n < 1 then n = 1 end
-    if n == self._capacity then return end
-    self._capacity = n
-    self:_evictIfNeeded()
-end
-
--- setByteBudget(bytes) — hard cap on total resident cover bytes. Evicts
--- immediately if the new budget is smaller than current usage.
-function SUICoverCache:setByteBudget(bytes)
-    bytes = tonumber(bytes)
-    if not bytes then return end
-    bytes = math.floor(bytes)
-    if bytes < 1 then return end
-    if bytes == self._byte_budget then return end
-    self._byte_budget = bytes
-    self:_evictIfNeeded()
-end
-
-function SUICoverCache:_removeKey(key)
-    for i, k in ipairs(self._order) do
-        if k == key then
-            table.remove(self._order, i)
-            return
-        end
-    end
-end
-
-function SUICoverCache:_evictIfNeeded()
-    -- Evict oldest until BOTH bounds hold: entry count <= capacity AND
-    -- resident bytes <= byte budget. Keep at least the most-recently
-    -- inserted entry (#order > 1 guard) so a single oversized cover can't
-    -- evict itself right after being cached.
-    while #self._order > 1
-          and (#self._order > self._capacity or self._bytes > self._byte_budget) do
-        local key = table.remove(self._order, 1)
-        -- Drop the cache's reference only. Don't call bb:free() — see the
-        -- lifetime note at the top of this file; ImageWidgets that still
-        -- hold this bb would render garbage pixels on their next paint.
-        self._cache[key] = nil
-        self._bytes = self._bytes - (self._sizes[key] or 0)
-        if self._bytes < 0 then self._bytes = 0 end
-        self._sizes[key] = nil
-        self._evictions = self._evictions + 1
-        if _PERF_LOG then logger.dbg(string.format(
-            "[simpleui perf] SUICoverCache: EVICT fp=%s size=%d/%d bytes=%d/%d",
-            key, #self._order, self._capacity, self._bytes, self._byte_budget)) end
-    end
+local function _pixels(bb)
+    return (bb.getWidth and bb:getWidth() or 0) * (bb.getHeight and bb:getHeight() or 0)
 end
 
 -- get(filepath) — returns the cached bb (at whatever dimensions it was last
@@ -194,12 +116,19 @@ end
 -- "Upscale safety" note at the top of this file.
 function SUICoverCache:get(filepath)
     if not filepath or filepath == "" then return nil end
-    local bb = self._cache[filepath]
-    if not bb then return nil end
+    local entry = self._lru:get(filepath)
+    if not entry then return nil end
     self._hits = self._hits + 1
-    self:_removeKey(filepath)
-    self._order[#self._order + 1] = filepath
-    return bb
+    return entry.bb
+end
+
+-- revision(filepath) — identifies the cover currently cached for filepath.
+-- It changes when a cover is installed into an empty slot (first load, or
+-- after an eviction or drop) and stays put when put() only enlarges it, so
+-- derived rasters stay valid across enlargements and are rebuilt otherwise.
+function SUICoverCache:revision(filepath)
+    local entry = self._lru:peek(filepath)
+    return entry and entry.revision or 0
 end
 
 -- has(filepath) — boolean probe. Doesn't touch MRU order or counters. Lets
@@ -208,7 +137,7 @@ end
 -- the bb — this is only for "is it worth trying the fast path at all").
 function SUICoverCache:has(filepath)
     if not filepath or filepath == "" then return false end
-    return self._cache[filepath] ~= nil
+    return self._lru:has(filepath)
 end
 
 -- put(filepath, bb) — insert or upgrade. Returns the bb now serving as the
@@ -229,48 +158,27 @@ end
 -- avoids a redundant get() round-trip and makes the discard case explicit
 -- at the call site.
 function SUICoverCache:put(filepath, bb)
-    if not filepath or filepath == "" then return bb end
-    if not bb then return bb end
-    local existing = self._cache[filepath]
-    if existing == bb then
-        return bb  -- identity put (no-op)
+    if not filepath or filepath == "" or not bb then return bb end
+    local existing = self._lru:peek(filepath)
+    if existing and existing.bb == bb then return bb end  -- identity put (no-op)
+    if existing and _pixels(existing.bb) >= _pixels(bb) then
+        self._lru:get(filepath)  -- keep existing; touch MRU
+        return existing.bb
     end
-    if existing then
-        local ex_px  = (existing.getWidth and existing:getWidth() or 0)
-                     * (existing.getHeight and existing:getHeight() or 0)
-        local new_px = (bb.getWidth      and bb:getWidth()      or 0)
-                     * (bb.getHeight     and bb:getHeight()     or 0)
-        if ex_px >= new_px then
-            -- Keep existing; touch MRU. Do NOT free the caller's bb — they
-            -- may have another use for it. Returning existing tells the
-            -- caller "use this instead".
-            self:_removeKey(filepath)
-            self._order[#self._order + 1] = filepath
-            return existing
-        end
-        -- New is larger; replace the cache reference. Do NOT free existing
-        -- — other live widgets may still hold it (see lifetime note at the
-        -- top of this file). Drop the old entry's byte accounting; the new
-        -- size is added below.
-        self:_removeKey(filepath)
-        self._bytes = self._bytes - (self._sizes[filepath] or 0)
-        if self._bytes < 0 then self._bytes = 0 end
-        self._sizes[filepath] = nil
+    -- A cover installed into an empty slot may differ from the previous one;
+    -- an upgrade only enlarges the same cover and keeps the revision.
+    local revision = existing and existing.revision
+    if not revision then
+        _last_revision = _last_revision + 1
+        revision = _last_revision
     end
-    self._cache[filepath] = bb
-    self._order[#self._order + 1] = filepath
-    local nbytes = _bbBytes(bb)
-    self._sizes[filepath] = nbytes
-    self._bytes = self._bytes + nbytes
     self._puts = self._puts + 1
+    self._lru:put(filepath, { bb = bb, revision = revision }, Memory.bbBytes(bb))
     if _PERF_LOG then logger.dbg(string.format(
         "[simpleui perf] SUICoverCache: PUT fp=%s %dx%d size=%d/%d bytes=%d/%d hits=%d puts=%d",
-        filepath,
-        (bb.getWidth and bb:getWidth() or 0),
-        (bb.getHeight and bb:getHeight() or 0),
-        #self._order, self._capacity, self._bytes, self._byte_budget,
+        filepath, bb:getWidth(), bb:getHeight(),
+        self._lru:count(), MAX_ENTRIES, self._lru:bytes(), Memory.budgets().covers,
         self._hits, self._puts)) end
-    self:_evictIfNeeded()
     return bb
 end
 
@@ -281,12 +189,7 @@ end
 -- drops the reference, doesn't bb:free().
 function SUICoverCache:drop(filepath)
     if not filepath or filepath == "" then return end
-    if self._cache[filepath] == nil then return end
-    self._bytes = self._bytes - (self._sizes[filepath] or 0)
-    if self._bytes < 0 then self._bytes = 0 end
-    self._cache[filepath] = nil
-    self._sizes[filepath] = nil
-    self:_removeKey(filepath)
+    self._lru:remove(filepath)
 end
 
 -- clear() — drop every cached reference. Same lifetime contract as put: we
@@ -294,15 +197,10 @@ end
 -- reclaims once every reference is gone.
 function SUICoverCache:clear()
     if _PERF_LOG then logger.dbg(string.format(
-        "[simpleui perf] SUICoverCache: clear hits=%d puts=%d evictions=%d",
-        self._hits, self._puts, self._evictions)) end
-    self._cache     = {}
-    self._order     = {}
-    self._sizes     = {}
-    self._bytes     = 0
-    self._hits      = 0
-    self._puts      = 0
-    self._evictions = 0
+        "[simpleui perf] SUICoverCache: clear hits=%d puts=%d", self._hits, self._puts)) end
+    self._lru:clear()
+    self._hits = 0
+    self._puts = 0
 end
 
 return SUICoverCache

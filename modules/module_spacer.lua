@@ -2,7 +2,7 @@
 -- Module: Spacer Row (dynamic instances).
 -- Blank space block to give extra spacing between modules.
 -- Exposes M.instanciable = true and M.makeInstance(id) for the registry.
--- The only configurable setting is the size (via SpinWidget, as a percentage),
+-- The only configurable setting is the size (a spin dialog, as a percentage),
 -- following the same mechanics as the other modules.
 
 local Device       = require("device")
@@ -110,8 +110,15 @@ end
 local M = {}
 M.id            = "spacer_row"
 M.name          = _("Spacer")
+M.category      = "extras"
 M.instanciable  = true
 M.makeInstance  = makeInstance
 M.instances_key = "simpleui_spacer_row_instances"
+M.menu_group    = "quick_actions"
+
+-- Layout-editor summary of an instance: its height as a scale percentage.
+function M.getSummary(inst_id, pfx)
+    return Config.getModuleScalePct(inst_id, pfx) .. "%"
+end
 
 return M

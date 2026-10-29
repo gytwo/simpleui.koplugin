@@ -1,17 +1,21 @@
 -- features/sui_wallpaper.lua — SimpleUI wallpaper feature module.
 --
 -- Owns all state and logic for the "Wallpaper" settings sub-page: the cached
--- background ImageWidget (plus its associated pre-scaled Blitbuffer used for
--- stretch mode), every simpleui_style_wallpaper_* / simpleui_wallpaper_*
+-- screen-sized raster of the wallpaper, every simpleui_style_wallpaper_* /
+-- simpleui_wallpaper_*
 -- setting getter/setter, the on-disk wallpaper directory scan, the
--- backdrop strength settings for bars, title bar, pagination and
+-- per-surface backdrop strength settings for bars, title bar, pagination and
 -- modules (they only ever have a visible effect while a wallpaper is
 -- active, so they live here next to the settings that gate them, as part of
--- the same sub-page), the shared backdrop / frame painters, and the
--- night-mode hook that invalidates the cache when night mode is toggled.
+-- the same sub-page), the tint / eraser painters, and the night-mode hook
+-- that invalidates the cache when night mode is toggled.
+--
+-- The 0–100 strength scale and the backdrop / frame painters themselves live
+-- in infra/sui_backdrop.lua; this module only stores the per-surface values
+-- and gates them on a wallpaper being active.
 --
 -- All settings live under the "simpleui_style_wallpaper_*" namespace (plus
--- the standalone "simpleui_wallpaper_show_in_fm" key) — unchanged from
+-- the standalone "simpleui_library_backdrop" key) — unchanged from
 -- before this module existed, since these are user-persisted keys.
 --
 -- Consumers:
@@ -19,39 +23,37 @@
 --     Homescreen / Custom Screens body, and derives ctx.has_wallpaper for
 --     content modules from styleGetBgWidget().
 --   * infra/sui_patches.lua — paints the same wallpaper behind FM,
---     Collections, History and other fullscreen overlays when
---     "Show in FM" is enabled.
+--     Collections, History and other fullscreen overlays unless the
+--     library scrim is fully solid.
 --   * modules/module_collections.lua, modules/module_currently.lua,
 --     modules/module_quote.lua, engines/sui_book_grid.lua — these never
 --     talk to this module directly; they just read ctx.has_wallpaper,
 --     which the homescreen engine computes from this module.
 --   * features/library/sui_foldercovers.lua — checks styleGetWallpaperShowInFM
---     / styleGetBgWidget directly to decide whether to mask its title strip.
+--     / styleGetBgWidget directly to decide whether to paint its title strip
+--     over the wallpaper, and reads the strip's backdrop strength.
 --   * screens/sui_menu.lua — builds the "Wallpaper" TouchMenu / MenuTable
 --     entries, consumed both from the native KOReader menu and from the
 --     SUIWindow-based Settings window (screens/sui_settings_window.lua).
---   * bars, title bar, pagination, module chrome and quick-action / card
---     renderers — read their strength and paint through paintBackdrop /
---     paintFrame.
+--   * bars, title bar, pagination and module chrome — read their strength
+--     from here and paint it through infra/sui_backdrop.lua.
 --
 -- Any wallpaper-image setter here that affects what is on screen frees the
--- cached ImageWidget/Blitbuffer and asks the homescreen engine to rebuild
--- its layout via screens/sui_homescreen's ScreenEngine.rebuildLayout() —
--- using a lazy require() inside the function body (never at file scope), the
--- same pattern already used by features/sui_style.lua for the same purpose.
--- This is required because engines/sui_screen_engine.lua requires this
--- module directly; requiring it back at file scope would create a
--- load-order cycle. Backdrop strength setters only store their value: the
--- image is unaffected, so the caller refreshes once with the wallpaper cache
+-- cached raster; the caller then refreshes the layout once (the menu's
+-- _applyFullLayoutRefresh). Backdrop strength setters only store their value:
+-- the image is unaffected, so the caller refreshes with the wallpaper cache
 -- kept (ScreenEngine.rebuildLayout({ keep_wallpaper = true })).
+-- The night-mode hook has no such caller, so it asks the homescreen engine to
+-- rebuild itself through a lazy require() inside the function body (never at
+-- file scope): engines/sui_screen_engine.lua requires this module directly, and
+-- requiring it back at file scope would create a load-order cycle.
 
 local Device      = require("device")
 local logger       = require("logger")
-local _            = require("infra/sui_i18n").translate
-local AA           = require("infra/sui_aa_paint")
 local SUISettings  = require("infra/sui_store")
+local Backdrop     = require("infra/sui_backdrop")
+local Memory       = require("infra/sui_memory")
 local ImageWidget  = require("ui/widget/imagewidget")
-local UIManager    = require("ui/uimanager")
 local lfs          = require("libs/libkoreader-lfs")
 local Screen       = Device.screen
 
@@ -60,30 +62,15 @@ local M = {}
 -- ---------------------------------------------------------------------------
 -- Cache state
 -- ---------------------------------------------------------------------------
-local _style_bg_cache     = nil   -- cached ImageWidget for the current wallpaper
-local _style_bg_cache_w   = 0     -- screen width  at cache-creation time
-local _style_bg_cache_h   = 0     -- screen height at cache-creation time
-local _style_bg_cache_nm  = nil   -- Screen.night_mode value at cache-creation time
+-- The wallpaper is decoded once and composed into a single screen-sized
+-- raster (white base, image, night-mode handling), so the decoded source and
+-- the ImageWidget are released right away. Painting and erasing are plain
+-- blits from this raster.
+local _raster     = nil   -- screen-sized Blitbuffer of the wallpaper, or nil
+local _raster_key = nil   -- (screen w/h, night mode) the raster was built for
+local _HANDLE     = {}    -- truthy token handed to callers while a raster exists
 
--- Stretch implementation note:
--- KOReader's ImageWidget has no native "fill ignoring aspect ratio" mode —
--- scale_factor=nil and scale_factor=0 both produce a proportional fit.
--- True stretch is achieved by decoding the source image into a Blitbuffer and
--- calling bb:scale(sw, sh), which scales X and Y independently.  The scaled
--- bitmap is kept in _style_bg_cache_bb and freed together with the widget.
-local _style_bg_cache_bb = nil   -- pre-scaled Blitbuffer for stretch mode (or nil)
-
--- Lazy reference to ffi/pic (used only for auto-rotate dimension probe).
-local _pic = nil
-local function _getPic()
-    if not _pic then
-        local ok, m = pcall(require, "ffi/pic")
-        if ok then _pic = m end
-    end
-    return _pic
-end
-
--- Setting readers — centralised so _styleGetBgWidget stays readable.
+-- Setting readers — centralised so _buildRaster stays readable.
 local function _wpStretch()     return SUISettings:isTrue("simpleui_style_wallpaper_stretch")        end
 local function _wpAutoRotate()  return SUISettings:nilOrTrue("simpleui_style_wallpaper_autorotate")  end
 local function _wpInvertNight() return SUISettings:isTrue("simpleui_style_wallpaper_invert_night")   end
@@ -100,6 +87,12 @@ local function _saveTint(key, val)
     SUISettings:saveSetting(key, math.max(_TINT_MIN, math.min(_TINT_MAX, val or _TINT_MIN)))
 end
 
+-- Opacity of the scrim over the wallpaper on the file manager and the
+-- fullscreen lists (History, Collections). Older versions stored a "show on
+-- all screens" flag instead: on → 0, off → 100 (the default).
+local KEY_LIBRARY = "simpleui_library_backdrop"
+local KEY_LEGACY_SHOW_IN_FM = "simpleui_wallpaper_show_in_fm"
+
 -- Returns DataStorage/simpleui/sui_wallpapers/, creating it if needed.
 local function _styleWallpapersDir()
     local ok_ds, DataStorage = pcall(require, "datastorage")
@@ -110,181 +103,86 @@ local function _styleWallpapersDir()
         local src = debug.getinfo(1, "S").source or ""
         dir = (src:match("^@(.+/)[^/]+/[^/]+$") or "./") .. "sui_wallpapers"
     end
-    if lfs.attributes(dir, "mode") ~= "directory" then lfs.mkdir(dir) end
+    require("util").makePath(dir)
     return dir
 end
 
--- Returns the cached bg ImageWidget, or nil when unset.
--- Cache is keyed on (path, screen w/h, night-mode state) — any change to those
--- values triggers a rebuild. Setting changes (stretch, rotate, invert) always
--- call _styleFreeBgCache() before asking the engine to rebuild its layout, so
--- the next _styleGetBgWidget() call always reflects the current options.
+-- Composes the wallpaper file into a screen-sized raster, or returns nil when
+-- it cannot be decoded. The image is rotated to match the screen orientation
+-- (auto-rotate), then either stretched to the whole screen or fitted with its
+-- aspect ratio kept and centred; the uncovered bands stay white.
+local function _buildRaster(path, sw, sh)
+    local RenderImage = require("ui/renderimage")
+    local bb = RenderImage:renderImageFile(path, false, nil, nil)
+    if not bb then return nil end
+
+    local rotation_angle = 0
+    local img_w, img_h = bb:getWidth(), bb:getHeight()
+    if _wpAutoRotate() and (img_w > img_h) ~= (sw > sh) then
+        rotation_angle = G_reader_settings:isTrue("imageviewer_rotation_landscape_invert")
+            and -90 or 90
+        img_w, img_h = img_h, img_w
+    end
+
+    -- Size the image is drawn at.
+    local tw, th = sw, sh
+    if not _wpStretch() then
+        local scale = math.min(sw / img_w, sh / img_h)
+        tw, th = math.floor(img_w * scale), math.floor(img_h * scale)
+    end
+
+    -- The widget owns `bb` from here and frees it with itself. The night-mode
+    -- inversion it applies covers only the image, so the bands stay white.
+    local widget = ImageWidget:new{
+        image                 = bb,
+        image_disposable      = true,
+        width                 = tw,
+        height                = th,
+        alpha                 = true,
+        original_in_nightmode = not _wpInvertNight(),
+        rotation_angle        = rotation_angle,
+    }
+    local Blitbuffer = require("ffi/blitbuffer")
+    local canvas = Blitbuffer.new(sw, sh, Screen.bb:getType())
+    canvas:fill(Blitbuffer.COLOR_WHITE)
+    local ok = pcall(widget.paintTo, widget, canvas, math.floor((sw - tw) / 2), math.floor((sh - th) / 2))
+    widget:free()
+    if not ok then
+        canvas:free()
+        return nil
+    end
+    return canvas
+end
+
+-- Returns a truthy handle while a wallpaper is enabled and decodable, else
+-- nil. Painters read the raster themselves, so a handle kept by a caller
+-- never points at freed memory. The raster is rebuilt when the screen size or
+-- night mode changes; a failed decode is remembered for the same key, so it
+-- is not retried on every call.
 local function _styleGetBgWidget()
     if not SUISettings:isTrue("simpleui_style_wallpaper_enabled") then return nil end
     local path = SUISettings:readSetting("simpleui_style_wallpaper")
     if not path then return nil end
 
     local sw, sh = Screen:getWidth(), Screen:getHeight()
-    local nm     = Screen.night_mode and true or false
-
-    if _style_bg_cache
-       and _style_bg_cache_w  == sw
-       and _style_bg_cache_h  == sh
-       and _style_bg_cache_nm == nm
-    then
-        return _style_bg_cache
-    end
-
-    -- Dimensions or night-mode state changed — rebuild.
-    if _style_bg_cache    then _style_bg_cache:free()    end
-    if _style_bg_cache_bb then _style_bg_cache_bb:free() end
-    _style_bg_cache    = nil
-    _style_bg_cache_bb = nil
-
-    -- original_in_nightmode: true  = image is never inverted by KOReader.
-    --                         false = KOReader inverts the image in night mode.
-    local orig_nm = not _wpInvertNight()
-
-    -- Auto-rotate: probe image dimensions and pick a rotation_angle so the
-    -- image orientation best matches the current screen orientation.
-    local rotation_angle = 0
-    local img_w, img_h   = nil, nil
-    local raw_bb         = nil
-    local pic = _getPic()
-    if pic then
-        local ok_d, doc = pcall(pic.openDocument, path)
-        if ok_d and doc then
-            img_w, img_h = doc.width, doc.height
-            doc:close()
+    local key = sw .. "x" .. sh .. (Screen.night_mode and "n" or "d")
+    if _raster_key ~= key then
+        if _raster then _raster:free(); _raster = nil end
+        local ok, canvas = pcall(_buildRaster, path, sw, sh)
+        if ok then _raster = canvas end
+        if not _raster then
+            logger.warn("sui_wallpaper: cannot load wallpaper:", path, ok and "" or canvas)
         end
+        _raster_key = key
     end
-    if not img_w or not img_h then
-    local ok_ri, RenderImage = pcall(require, "ui/renderimage")
-    if ok_ri and RenderImage then
-        local ok_bb, bb = pcall(RenderImage.renderImageFile, RenderImage, path, false, nil, nil)
-        if ok_bb and bb then
-            img_w = bb:getWidth()
-            img_h = bb:getHeight()
-            raw_bb = bb
-            end
-        end
-    end
-
-    if _wpAutoRotate() and img_w and img_h and img_w > 0 and img_h > 0 then
-        local img_landscape    = img_w > img_h
-        local screen_landscape = sw    > sh
-        if img_landscape ~= screen_landscape then
-            rotation_angle = G_reader_settings:isTrue("imageviewer_rotation_landscape_invert")
-                and -90 or 90
-        end
-    end
-
-    local widget_opts
-    if _wpStretch() and img_w and img_h and img_w > 0 and img_h > 0
-       and (img_w ~= sw or img_h ~= sh)
-    then
-        -- True stretch: decode the raw bitmap and scale it to exact screen
-        -- dimensions, distorting aspect ratio when necessary.
-        -- rotation_angle is applied manually so the dimension probe above
-        -- already accounts for it; we bake it into the bitmap here.
-        local eff_w, eff_h = sw, sh
-        if rotation_angle ~= 0 then eff_w, eff_h = sh, sw end
-
-        local ok_ri, RenderImage = pcall(require, "ui/renderimage")
-        if ok_ri and RenderImage then
-            local ok_bb = true
-            if not raw_bb then
-                -- Decode at native resolution (no max-bounds) so we get the raw
-                -- pixel data, then scale to exact eff_w×eff_h in one step.
-                -- Passing width/height to renderImageFile would do a proportional
-                -- fit first, producing a bitmap smaller than eff_w×eff_h, and
-                -- the subsequent :scale() call would then distort unevenly.
-                ok_bb, raw_bb = pcall(RenderImage.renderImageFile, RenderImage, path, false, nil, nil)
-            end
-            if ok_bb and raw_bb then
-                local ok_sc, scaled = pcall(function() return raw_bb:scale(eff_w, eff_h) end)
-                raw_bb:free()
-                raw_bb = nil
-                if ok_sc and scaled then
-                    _style_bg_cache_bb = scaled
-                    widget_opts = {
-                        image                 = scaled,
-                        width                 = sw,
-                        height                = sh,
-                        scale_factor          = 1,  -- bitmap is already exact sw×sh
-                        file_do_cache         = false,
-                        alpha                 = true,
-                        original_in_nightmode = orig_nm,
-                        rotation_angle        = rotation_angle,
-                    }
-                end
-            end
-        end
-    end
-
-    if raw_bb then
-        pcall(function() raw_bb:free() end)
-        raw_bb = nil
-    end
-
-    -- Fallback (stretch decode failed, or stretch disabled, or dimensions match):
-    -- proportional fit via ImageWidget's built-in scaling.
-    if not widget_opts then
-        widget_opts = {
-            file                  = path,
-            width                 = sw,
-            height                = sh,
-            scale_factor          = 0,    -- proportional fit (letterbox/pillarbox)
-            file_do_cache         = false,
-            alpha                 = true,
-            original_in_nightmode = orig_nm,
-            rotation_angle        = rotation_angle,
-        }
-    end
-
-    local ok, w = pcall(ImageWidget.new, ImageWidget, widget_opts)
-    if ok and w then
-        _style_bg_cache    = w
-        _style_bg_cache_w  = sw
-        _style_bg_cache_h  = sh
-        _style_bg_cache_nm = nm
-        -- Eraser cache: always rasterize through ImageWidget:paintTo so the
-        -- pixels match a full-frame wallpaper paint (night mode, letterbox,
-        -- rotation). Stretch mode may already hold the scaled source bitmap
-        -- shared with the widget — that source is not freed here.
-        local source_bb = _style_bg_cache_bb
-        local ok_bb, canvas = pcall(function()
-            local Blitbuffer = require("ffi/blitbuffer")
-            local c = Blitbuffer.new(sw, sh)
-            c:fill(Blitbuffer.COLOR_WHITE)
-            w:paintTo(c, 0, 0)
-            return c
-        end)
-        if ok_bb and canvas then
-            _style_bg_cache_bb = canvas
-        elseif not source_bb then
-            _style_bg_cache_bb = nil
-        end
-        return w
-    end
-    -- Build failed — clean up any decoded bitmap.
-    if _style_bg_cache_bb then _style_bg_cache_bb:free(); _style_bg_cache_bb = nil end
-    _style_bg_cache_w  = 0
-    _style_bg_cache_h  = 0
-    _style_bg_cache_nm = nil
-    logger.warn("sui_style: cannot load wallpaper: " .. tostring(path))
-    return nil
+    return _raster and _HANDLE or nil
 end
 
--- Frees the cached bg widget and any associated decode buffer.
+-- Frees the cached raster.
 local function _styleFreeBgCache()
-    if _style_bg_cache    then _style_bg_cache:free()    end
-    if _style_bg_cache_bb then _style_bg_cache_bb:free() end
-    _style_bg_cache    = nil
-    _style_bg_cache_bb = nil
-    _style_bg_cache_w  = 0
-    _style_bg_cache_h  = 0
-    _style_bg_cache_nm = nil
+    if _raster then _raster:free() end
+    _raster     = nil
+    _raster_key = nil
 end
 
 -- Lazily asks the homescreen engine to free the cache (redundant but
@@ -309,16 +207,14 @@ end
 
 -- Settings that only make sense while a wallpaper is active.
 local function _resetWallpaperDependents()
-    SUISettings:saveSetting("simpleui_statusbar_transparent", false)
-    SUISettings:saveSetting("simpleui_navbar_transparent", false)
-    SUISettings:saveSetting("simpleui_wallpaper_show_in_fm", false)
+    SUISettings:del(KEY_LEGACY_SHOW_IN_FM)
+    SUISettings:del(KEY_LIBRARY)
 end
 
 function M.styleSetWallpaper(path)
     SUISettings:saveSetting("simpleui_style_wallpaper", path)
     if not path then _resetWallpaperDependents() end
     _styleFreeBgCache()
-    _notifyLayoutChanged()
 end
 
 function M.styleGetWallpapersDir()
@@ -337,10 +233,8 @@ function M.styleScanWallpapers()
     local exts    = M.SUPPORTED_WALLPAPER_EXTS
     if lfs.attributes(dir, "mode") == "directory" then
         for fname in lfs.dir(dir) do
-            -- lfs.dir() always yields "." and ".." — skip them explicitly so
-            -- they are never matched against the extension table (a bare "."
-            -- has no extension, but guard unconditionally for clarity).
-            if fname ~= "." and fname ~= ".." then
+            -- Skip hidden entries: ".", "..", and metadata files such as "._name.jpg".
+            if fname:sub(1, 1) ~= "." then
                 local ext = fname:match("%.([^%.]+)$")
                 if ext and exts[ext:lower()] then
                     items[#items + 1] = {
@@ -355,21 +249,40 @@ function M.styleScanWallpapers()
     return items
 end
 
---- Returns the cached background ImageWidget (or nil).
---- Consumed by sui_patches.lua to paint the wallpaper into FM and fullscreen overlay surfaces.
+--- Returns a truthy handle while the wallpaper raster is available (or nil).
+--- Consumed by sui_patches.lua and the screen engine to decide whether to paint the wallpaper.
 function M.styleGetBgWidget()
     return _styleGetBgWidget()
 end
 
+function M.getLibraryStrength()
+    if SUISettings:get(KEY_LEGACY_SHOW_IN_FM) ~= nil then
+        if SUISettings:get(KEY_LIBRARY) == nil and SUISettings:isTrue(KEY_LEGACY_SHOW_IN_FM) then
+            Backdrop.saveBackdropStrength(KEY_LIBRARY, Backdrop.STRENGTH_MIN)
+        end
+        SUISettings:del(KEY_LEGACY_SHOW_IN_FM)
+    end
+    return Backdrop.readBackdropStrength(KEY_LIBRARY, Backdrop.STRENGTH_MAX)
+end
+
+function M.setLibraryStrength(n)
+    Backdrop.saveBackdropStrength(KEY_LIBRARY, n)
+end
+
 --- Consumed by sui_patches.lua to decide whether to paint the wallpaper into
---- fullscreen overlays (Collections, History, etc.) and the FM.
-function M.styleGetWallpaperShowInFM()
+--- fullscreen overlays (Collections, History, etc.) and the FM. A fully solid
+--- scrim hides it, so nothing is painted then.
+M.styleGetWallpaperShowInFM = SUISettings.memoize(function()
     if not M.styleGetWallpaperEnabled() or not M.styleGetWallpaper() then return false end
-    return SUISettings:isTrue("simpleui_wallpaper_show_in_fm")
-end
-function M.styleSetWallpaperShowInFM(on)
-    SUISettings:saveSetting("simpleui_wallpaper_show_in_fm", on and true or false)
-end
+    return M.getLibraryStrength() < Backdrop.STRENGTH_MAX
+end)
+-- True while a wallpaper is painted behind the file manager: it is shown there
+-- and its image could be loaded. Whether an image exists does not depend on
+-- the screen size or night mode, which only change the widget built for it, so
+-- the answer is kept until a setting changes.
+M.isWallpaperPaintedInFM = SUISettings.memoize(function()
+    return M.styleGetWallpaperShowInFM() and _styleGetBgWidget() ~= nil
+end)
 
 function M.styleGetWallpaperEnabled()
     return SUISettings:isTrue("simpleui_style_wallpaper_enabled")
@@ -379,7 +292,6 @@ function M.styleSetWallpaperEnabled(on)
     SUISettings:saveSetting("simpleui_style_wallpaper_enabled", is_on)
     if not is_on then _resetWallpaperDependents() end
     _styleFreeBgCache()
-    _notifyLayoutChanged()
 end
 
 function M.styleGetWallpaperStretch()
@@ -388,7 +300,6 @@ end
 function M.styleSetWallpaperStretch(on)
     SUISettings:saveSetting("simpleui_style_wallpaper_stretch", on ~= false and true or false)
     _styleFreeBgCache()
-    _notifyLayoutChanged()
 end
 
 function M.styleGetWallpaperAutoRotate()
@@ -397,7 +308,6 @@ end
 function M.styleSetWallpaperAutoRotate(on)
     SUISettings:saveSetting("simpleui_style_wallpaper_autorotate", on ~= false and true or false)
     _styleFreeBgCache()
-    _notifyLayoutChanged()
 end
 
 function M.styleGetWallpaperInvertNight()
@@ -406,11 +316,9 @@ end
 function M.styleSetWallpaperInvertNight(on)
     SUISettings:saveSetting("simpleui_style_wallpaper_invert_night", on and true or false)
     _styleFreeBgCache()
-    _notifyLayoutChanged()
 end
 
--- Tint strengths are applied at paint time (not baked into the ImageWidget
--- cache); the caller refreshes the layout with the cache kept.
+-- Tint strengths are applied at paint time (not baked into the raster); the caller refreshes the layout with the cache kept.
 function M.styleGetWallpaperLighten()
     return _readTint(KEY_LIGHTEN)
 end
@@ -425,10 +333,10 @@ function M.styleSetWallpaperDarken(val)
     _saveTint(KEY_DARKEN, val)
 end
 
---- Frees the internal wallpaper widget cache.
+--- Frees the internal wallpaper raster.
 --- Must be called after changing the simpleui_style_* keys directly
 --- in SUISettings (e.g. after applying a preset), so that the next paint
---- rebuilds the ImageWidget with the new wallpaper.
+--- rebuilds it with the new wallpaper.
 --- Consumed by engines/sui_screen_engine.lua (rotation handling,
 --- ScreenEngine.rebuildLayout()).
 function M.freeCache()
@@ -458,68 +366,46 @@ do
 end
 
 -- ---------------------------------------------------------------------------
--- Backdrop strength (0–100) for bars, chrome and modules:
---   0    = fully transparent (wallpaper shows through)
---   1–99 = scrim (semi-opaque surface blend)
---   100  = solid surface
+-- Surfaces that sit over the wallpaper (scale, tones and painters:
+-- infra/sui_backdrop.lua).
 --
--- Every setting has a single semantic default (BACKDROP_DEFAULT). Setters
--- only store the value; the caller refreshes the UI once afterwards.
--- Legacy booleans migrate once on first read:
---   status / navigation bar transparent true  → 0
---   status / navigation bar transparent false → default
---   module solid_bg true                      → 100
+-- Opacity applies only while a wallpaper is active; without one a surface
+-- keeps the opacity of its native look. Tone and frame always apply.
+-- Setters only store the value; the caller refreshes the UI once afterwards.
+-- Legacy settings migrate once on first read:
+--   status / navigation bar transparent true  → opacity 0
+--   module solid_bg true                      → opacity 100
 -- ---------------------------------------------------------------------------
-local _BACKDROP_MIN, _BACKDROP_MAX = 0, 100
+local STRENGTH_MIN, STRENGTH_MAX = Backdrop.STRENGTH_MIN, Backdrop.STRENGTH_MAX
 
--- Bars keep the solid look of a plain UI; cards and buttons start solid;
--- every other surface starts transparent over the wallpaper.
-M.BACKDROP_DEFAULT = {
-    statusbar       = 100,
-    navbar          = 100,
-    pagination      = 0,
-    titlebar        = 0,
-    module          = 0,
-    card            = 100,
-    button          = 100,
+local KEY_NAVBAR_STYLE = "simpleui_bar_style"
+local KEY_NAVBAR_LAYOUT = "simpleui_bar_layout"
+
+-- The full-width bars, keyed by kind. `legacy_transparent` is the flag older
+-- versions stored instead of an opacity; `native` is the opacity the bar has
+-- without a wallpaper: 100 where the bar paints its own fill, 0 where the
+-- host draws it.
+local BARS = {
+    statusbar  = { key = "simpleui_statusbar",  native = STRENGTH_MAX, legacy_transparent = "simpleui_statusbar_transparent" },
+    navbar     = { key = "simpleui_navbar",     native = STRENGTH_MAX, legacy_transparent = "simpleui_navbar_transparent" },
+    pagination = { key = "simpleui_pagination", native = STRENGTH_MIN },
+    titlebar   = { key = "simpleui_titlebar",   native = STRENGTH_MIN },
 }
 
-local KEY_STATUSBAR       = "simpleui_statusbar_backdrop"
-local KEY_NAVBAR          = "simpleui_navbar_backdrop"
-local KEY_PAGINATION      = "simpleui_pagination_backdrop"
-local KEY_TITLEBAR        = "simpleui_titlebar_backdrop"
-local KEY_MODULE          = "simpleui_module_backdrop"
-
--- Rounds and clamps n to 0–100; nil when n is not a number.
-local function _clampBackdrop(n)
-    n = tonumber(n)
-    if not n then return nil end
-    return math.max(_BACKDROP_MIN, math.min(_BACKDROP_MAX, math.floor(n + 0.5)))
-end
-M.clampBackdropStrength = _clampBackdrop
-
--- Reads a strength setting; `default` applies when it is unset or invalid.
-function M.readBackdropStrength(key, default)
-    return _clampBackdrop(SUISettings:readSetting(key)) or default
+local BAR_SURFACE = {}
+for kind, bar in pairs(BARS) do
+    BAR_SURFACE[kind] = Backdrop.surface(kind, bar.key)
 end
 
--- Stores a strength setting and returns the stored value. Invalid input is
--- ignored and returns nil.
-function M.saveBackdropStrength(key, n)
-    local v = _clampBackdrop(n)
-    if v then SUISettings:saveSetting(key, v) end
-    return v
+-- Surface descriptor of a bar kind, for the menu and for resetting.
+function M.barSurface(kind)
+    return BAR_SURFACE[kind]
 end
 
--- Human-readable strength label for menus: Transparent / N% / Solid.
--- `tr` overrides the translator for callers that carry their own.
-function M.formatBackdropStrength(s, tr)
-    tr = tr or _
-    s = tonumber(s) or 0
-    if s <= 0 then return tr("Transparent") end
-    if s >= 100 then return tr("Solid") end
-    return tostring(s) .. "%"
-end
+-- Surface of the title/author strip below Library covers and the global
+-- opacity of modules that set none of their own.
+M.COVER_STRIP = Backdrop.surface("cover_strip", "simpleui_cover_strip")
+local MODULE_SURFACE = Backdrop.surface("module", "simpleui_module")
 
 -- True while a wallpaper is enabled and selected. Surfaces that only exist
 -- over a wallpaper fall back to their native look otherwise.
@@ -527,178 +413,138 @@ function M.isWallpaperActive()
     return M.styleGetWallpaperEnabled() and M.styleGetWallpaper() ~= nil
 end
 
-local function _migrateBarStrength(bool_key, strength_key, default)
-    local stored = M.readBackdropStrength(strength_key)
+-- Opacity stored for a bar, whether or not a wallpaper is active.
+function M.getBarStrength(kind)
+    local surface, legacy = BAR_SURFACE[kind], BARS[kind].legacy_transparent
+    if legacy and SUISettings:get(legacy) ~= nil then
+        if SUISettings:get(surface.keys.strength) == nil and SUISettings:isTrue(legacy) then
+            Backdrop.saveStrength(surface, STRENGTH_MIN)
+        end
+        SUISettings:del(legacy)
+    end
+    return Backdrop.readStrength(surface)
+end
+
+function M.setBarStrength(kind, n)
+    Backdrop.saveStrength(BAR_SURFACE[kind], n)
+end
+
+local function _resolveBar(kind)
+    local surface = BAR_SURFACE[kind]
+    if M.isWallpaperActive() then
+        return Backdrop.resolve(surface, M.getBarStrength(kind))
+    end
+    local strength = BARS[kind].native
+    local customised = Backdrop.readTone(surface) ~= Backdrop.TONE.WHITE or Backdrop.readFrame(surface)
+    return Backdrop.resolve(surface, customised and STRENGTH_MAX or strength)
+end
+
+local _resolvedBars = {}  -- kind -> memoized _resolveBar
+
+-- Look of a bar as it is painted (see Backdrop.resolve). Without a wallpaper
+-- the opacity is the bar's native one, raised to solid when the user chose a
+-- tone or frame the native look does not have. Rebuilt only when a setting
+-- changes, so the returned table is shared and must not be modified.
+function M.resolveBar(kind)
+    local resolved = _resolvedBars[kind]
+    if not resolved then
+        resolved = SUISettings.memoize(function() return _resolveBar(kind) end)
+        _resolvedBars[kind] = resolved
+    end
+    return resolved()
+end
+
+-- True while a bar is fully transparent and the wallpaper image is loaded, so
+-- the bars show the wallpaper instead of a plain surface.
+function M.barsRevealWallpaper()
+    if M.resolveBar("navbar").strength > 0 and M.resolveBar("statusbar").strength > 0 then
+        return false
+    end
+    return _styleGetBgWidget() ~= nil
+end
+
+-- Look of a card or button surface as painted. Opacity applies only over a
+-- wallpaper; without one the surface is solid.
+function M.resolveSurface(surface)
+    return Backdrop.resolve(surface, not M.isWallpaperActive() and STRENGTH_MAX or nil)
+end
+
+-- Paints the pagination bar surface (tone, opacity and frame) across the full
+-- width of the rows y .. y + h. Nothing is painted while the surface is fully
+-- transparent and has no frame.
+function M.paintPaginationBar(bb, y, h)
+    local surface = M.resolveBar("pagination")
+    if surface.strength > 0 or surface.border_sz > 0 then
+        Backdrop.paintBar(bb, y, h, surface, "top")
+    end
+end
+
+-- True while a bar surface is painted behind native controls (the pagination
+-- bar and the title bar). Those controls must then draw without their own
+-- white background.
+M.paintsBehindNativeControls = SUISettings.memoize(function()
+    return M.resolveBar("pagination").strength > 0 or M.resolveBar("titlebar").strength > 0
+end)
+
+-- Navigation bar layouts. Older versions stored a style instead:
+--   default → full width; framed → floating with its frame; bare → floating
+--   without frame and fully transparent. A full-width bar keeps the rule it
+--   always had, except when it was transparent.
+M.NAVBAR_LAYOUT = { FULL = "full", FLOATING = "floating" }
+
+function M.getNavbarLayout()
+    local stored = SUISettings:readSetting(KEY_NAVBAR_LAYOUT)
     if stored then return stored end
-    local strength = SUISettings:isTrue(bool_key) and _BACKDROP_MIN or default
-    SUISettings:saveSetting(strength_key, strength)
-    return strength
+
+    local style = SUISettings:readSetting(KEY_NAVBAR_STYLE) or "default"
+    local surface = BAR_SURFACE.navbar
+    local layout = style == "default" and M.NAVBAR_LAYOUT.FULL or M.NAVBAR_LAYOUT.FLOATING
+    if style == "bare" then
+        Backdrop.saveStrength(surface, STRENGTH_MIN)
+        Backdrop.saveFrame(surface, false)
+    elseif style == "default" and M.getBarStrength("navbar") <= STRENGTH_MIN
+            and SUISettings:get(surface.keys.frame) == nil then
+        Backdrop.saveFrame(surface, false)
+    end
+    SUISettings:saveSetting(KEY_NAVBAR_LAYOUT, layout)
+    SUISettings:del(KEY_NAVBAR_STYLE)
+    return layout
 end
 
--- Stores a bar strength and keeps the legacy boolean in sync for any
--- external reader.
-local function _saveBarStrength(strength_key, bool_key, n)
-    local v = M.saveBackdropStrength(strength_key, n)
-    if v then SUISettings:saveSetting(bool_key, v <= _BACKDROP_MIN) end
+function M.setNavbarLayout(layout)
+    SUISettings:saveSetting(KEY_NAVBAR_LAYOUT, layout)
 end
 
-function M.getStatusbarBackdropStrength()
-    if not M.isWallpaperActive() then return _BACKDROP_MAX end
-    return _migrateBarStrength("simpleui_statusbar_transparent", KEY_STATUSBAR,
-        M.BACKDROP_DEFAULT.statusbar)
-end
-
-function M.setStatusbarBackdropStrength(n)
-    _saveBarStrength(KEY_STATUSBAR, "simpleui_statusbar_transparent", n)
-end
-
-function M.getNavbarBackdropStrength()
-    if not M.isWallpaperActive() then return _BACKDROP_MAX end
-    return _migrateBarStrength("simpleui_navbar_transparent", KEY_NAVBAR,
-        M.BACKDROP_DEFAULT.navbar)
-end
-
-function M.setNavbarBackdropStrength(n)
-    _saveBarStrength(KEY_NAVBAR, "simpleui_navbar_transparent", n)
-end
-
-function M.getPaginationBackdropStrength()
-    if not M.isWallpaperActive() then return _BACKDROP_MAX end
-    return M.readBackdropStrength(KEY_PAGINATION, M.BACKDROP_DEFAULT.pagination)
-end
-
-function M.setPaginationBackdropStrength(n)
-    M.saveBackdropStrength(KEY_PAGINATION, n)
-end
-
--- Without a wallpaper there is no backdrop to paint.
-function M.getTitlebarBackdropStrength()
-    if not M.isWallpaperActive() then return _BACKDROP_MIN end
-    return M.readBackdropStrength(KEY_TITLEBAR, M.BACKDROP_DEFAULT.titlebar)
-end
-
-function M.setTitlebarBackdropStrength(n)
-    M.saveBackdropStrength(KEY_TITLEBAR, n)
-end
-
--- Module backdrop strength.
--- With (pfx, id): per-module override, migrating legacy solid_bg once.
+-- Module opacity; without a wallpaper there is no backdrop to paint.
+-- With (pfx, id): per-module override, migrating legacy solid_bg once. Without
+-- an override the result is `default`, or the global default when that is nil.
 -- With no args: global default.
-function M.getModuleBackdropStrength(pfx, id)
+function M.getModuleBackdropStrength(pfx, id, default)
+    if not M.isWallpaperActive() then return STRENGTH_MIN end
     if type(pfx) ~= "string" or not id then
-        return M.readBackdropStrength(KEY_MODULE, M.BACKDROP_DEFAULT.module)
+        return Backdrop.readStrength(MODULE_SURFACE)
     end
     local key = pfx .. id .. "_backdrop"
     local solid_key = pfx .. id .. "_solid_bg"
-    local n = M.readBackdropStrength(key)
+    local n = Backdrop.readBackdropStrength(key)
     -- A stored 0 next to an explicit solid_bg=false is a stale migration
     -- result (meaning "not solid", not "force transparent"): drop it.
-    if n == 0 and SUISettings:get(solid_key) ~= nil and not SUISettings:isTrue(solid_key) then
+    if n == STRENGTH_MIN and SUISettings:get(solid_key) ~= nil and not SUISettings:isTrue(solid_key) then
         SUISettings:del(key)
         n = nil
     end
     if n then return n end
     -- Only solid_bg=true is a positive legacy signal; false means inherit.
     if SUISettings:isTrue(solid_key) then
-        SUISettings:saveSetting(key, _BACKDROP_MAX)
-        return _BACKDROP_MAX
+        SUISettings:saveSetting(key, STRENGTH_MAX)
+        return STRENGTH_MAX
     end
-    return M.getModuleBackdropStrength()
+    return default or M.getModuleBackdropStrength()
 end
 
 function M.setModuleBackdropStrength(n, pfx, id)
-    local key = (type(pfx) == "string" and id) and (pfx .. id .. "_backdrop") or KEY_MODULE
-    M.saveBackdropStrength(key, n)
-end
-
--- Tile a rounded rect into non-overlapping horizontal spans so each pixel is
--- written once (blending corners separately would double-tint them).
-local _SQUARE_SPAN = { {} }
-local function _roundedSpans(x, y, w, h, r)
-    r = math.min(r or 0, math.floor(w / 2), math.floor(h / 2))
-    if r <= 0 then
-        local sp = _SQUARE_SPAN[1]
-        sp.x, sp.y, sp.w, sp.h = x, y, w, h
-        return _SQUARE_SPAN
-    end
-    local spans = {}
-    for i = 0, r - 1 do
-        local dy = r - i - 0.5
-        local inset = math.floor(r - math.sqrt(r * r - dy * dy) + 0.5)
-        local sw = w - inset * 2
-        if sw > 0 then
-            spans[#spans + 1] = { x = x + inset, y = y + i,         w = sw, h = 1 }
-            spans[#spans + 1] = { x = x + inset, y = y + h - 1 - i, w = sw, h = 1 }
-        end
-    end
-    local mid_h = h - r * 2
-    if mid_h > 0 then
-        spans[#spans + 1] = { x = x, y = y + r, w = w, h = mid_h }
-    end
-    return spans
-end
-
-local function _surfaceColor()
-    return require("features/sui_style").COLOR.surface
-end
-
--- Runs fn with the buffer's inverse flag cleared on Android, where night
--- mode may set it: the logical colour is then written exactly once and
--- frame inversion turns it into its night-mode counterpart. Returns pcall's
--- results.
-function M.withInverseGuard(bb, fn)
-    local suppress = Device:isAndroid() and bb.getInverse and bb:getInverse() == 1
-    if suppress then bb:setInverse(0) end
-    local ok, result = pcall(fn)
-    if suppress then bb:setInverse(1) end
-    return ok, result
-end
-
--- Paint a backdrop into bb.
--- strength: 0 no-op, 1–99 scrim (wallpaper shows through), 100 solid surface.
--- radius: optional corner radius, drawn with anti-aliased corners.
--- Optional `color` overrides the default surface fill (e.g. surface_flat for
--- flat cards/buttons).
---
--- No day/night colour branch: always paint the light-mode surface colour
--- (white by default). Frame inversion turns it black in night mode while
--- preserving the same alpha — same approach as chrome scrims elsewhere.
-function M.paintBackdrop(bb, x, y, w, h, strength, radius, color)
-    strength = _clampBackdrop(strength) or 0
-    if strength <= 0 or w <= 0 or h <= 0 then return end
-    local alpha = math.floor(255 * strength / 100 + 0.5)
-    local c = color or _surfaceColor()
-    radius = math.max(0, math.floor(tonumber(radius) or 0))
-
-    local ok, drawn = M.withInverseGuard(bb, function()
-        return AA.fillRoundedRect(bb, x, y, w, h, radius, c, alpha)
-    end)
-    if ok and drawn then return end
-
-    -- Corners without anti-aliasing.
-    M.withInverseGuard(bb, function()
-        for _, sp in ipairs(_roundedSpans(x, y, w, h, radius)) do
-            AA.fillRect(bb, sp.x, sp.y, sp.w, sp.h, c, alpha)
-        end
-    end)
-end
-
--- Paint an opaque rounded border of `thickness` inside (x, y, w, h), with
--- anti-aliased corners where the radius allows it.
-function M.paintFrame(bb, x, y, w, h, thickness, radius, color)
-    thickness = math.max(1, math.floor(tonumber(thickness) or 1))
-    radius = math.max(0, math.floor(tonumber(radius) or 0))
-
-    local ok, drawn = M.withInverseGuard(bb, function()
-        return AA.strokeRoundedRect(bb, x, y, w, h, radius, thickness, color)
-    end)
-    if ok and drawn then return end
-
-    if type(bb.paintBorderRGB32) == "function" then
-        M.withInverseGuard(bb, function()
-            bb:paintBorderRGB32(x, y, w, h, thickness, color, radius, true)
-        end)
-    end
+    local key = (type(pfx) == "string" and id) and (pfx .. id .. "_backdrop") or MODULE_SURFACE.keys.strength
+    Backdrop.saveBackdropStrength(key, n)
 end
 
 -- Applies the lighten / darken tint over a region that already holds the
@@ -709,37 +555,50 @@ end
 -- in night mode so each setting keeps its on-screen meaning.
 function M.paintTint(bb, x, y, w, h)
     local lighten, darken = _readTint(KEY_LIGHTEN), _readTint(KEY_DARKEN)
-    if Screen.night_mode then lighten, darken = darken, lighten end
+    -- 蒙版不参与夜间反相，不需要互换
     if lighten > 0 then bb:lightenRect(x, y, w, h, lighten / 100) end
     if darken  > 0 then bb:darkenRect(x, y, w, h, darken / 100) end
+end
+
+-- Paints the library scrim over the rect (x, y, w, h); nothing while it is
+-- fully transparent.
+function M.paintLibraryScrim(bb, x, y, w, h)
+    Backdrop.paintBackdrop(bb, x, y, w, h, M.getLibraryStrength())
+end
+
+-- Paints the wallpaper full-screen, anchored at y=0, then its tint. The raster
+-- is opaque, so whatever the buffer held before (e.g. a closed book page) is
+-- replaced.
+function M.paintBackground(bb, x)
+    if not _styleGetBgWidget() then return end
+    local sw, sh = Screen:getWidth(), Screen:getHeight()
+    bb:blitFrom(_raster, x, 0, 0, 0, sw, sh)
+    M.paintTint(bb, x, 0, sw, sh)
 end
 
 -- Restore a dirty rect to the same appearance module chrome leaves behind:
 -- wallpaper (or solid surface) plus an optional backdrop scrim.
 --
--- strength / radius are optional. Omit them (or pass 0) for a plain base
--- restore — the historical paintEraser behaviour. Pass the module's chrome
--- strength so gaps inside a card keep the configured opacity after a
--- partial redraw (pagination, swipe).
+-- strength / radius / color are optional. Omit them (or pass strength 0) for
+-- a plain base restore. Pass the module's chrome strength and colour so gaps
+-- inside a card keep the configured opacity and tone after a partial redraw
+-- (pagination, swipe).
 --
--- The eraser cache is a screen-sized raster produced by ImageWidget:paintTo
--- (see _styleGetBgWidget), so it already matches full-frame wallpaper paint
--- including night-mode handling. No extra invert is applied here.
-function M.paintEraser(bb, x, y, w, h, strength, radius)
+-- The raster is the one paintBackground blits, so it already matches
+-- full-frame wallpaper paint including night-mode handling. No extra invert
+-- is applied here.
+function M.paintEraser(bb, x, y, w, h, strength, radius, color)
     if w <= 0 or h <= 0 then return end
-    strength = _clampBackdrop(strength) or 0
+    strength = Backdrop.clampBackdropStrength(strength) or STRENGTH_MIN
 
     -- Opaque chrome: surface fill alone is the final pixel state.
-    if strength >= 100 then
-        M.paintBackdrop(bb, x, y, w, h, 100, radius or 0)
+    if strength >= STRENGTH_MAX then
+        Backdrop.paintBackdrop(bb, x, y, w, h, STRENGTH_MAX, radius or 0, color)
         return
     end
 
     -- Base layer: wallpaper sub-rect, or solid surface when none is set.
-    if not _style_bg_cache_bb then
-        _styleGetBgWidget()
-    end
-    local src = _style_bg_cache_bb
+    local src = _styleGetBgWidget() and _raster
     local restored = false
     if src then
         local sw = src:getWidth()
@@ -760,35 +619,24 @@ function M.paintEraser(bb, x, y, w, h, strength, radius)
     end
     if not restored then
         local SUIStyle = require("features/sui_style")
-        M.withInverseGuard(bb, function()
+        Backdrop.withInverseGuard(bb, function()
             bb:paintRect(x, y, w, h, SUIStyle.COLOR.surface)
         end)
     end
 
-    if strength > 0 then
-        M.paintBackdrop(bb, x, y, w, h, strength, radius or 0)
-    end
+    Backdrop.paintBackdrop(bb, x, y, w, h, strength, radius or 0, color)
 end
 
 -- ---------------------------------------------------------------------------
--- Night-mode hook — free the wallpaper cache whenever night mode is toggled
--- so the next _styleGetBgWidget() call rebuilds with the correct inversion
--- state (original_in_nightmode reflects the new setting).
+-- Night-mode change — free the wallpaper cache and rebuild the layout so the
+-- next _styleGetBgWidget() call rebuilds the raster with the new inversion
+-- state. Called by the night-mode hook in infra/sui_patches.lua.
 -- ---------------------------------------------------------------------------
-local _orig_UIManager_ToggleNightMode = UIManager.ToggleNightMode
-function UIManager:ToggleNightMode()
-    _orig_UIManager_ToggleNightMode(self)
+function M.onNightModeChanged()
     _styleFreeBgCache()
     _notifyLayoutChanged()
 end
 
-local _orig_UIManager_SetNightMode = UIManager.SetNightMode
-if _orig_UIManager_SetNightMode then
-    function UIManager:SetNightMode(nightmode)
-        _orig_UIManager_SetNightMode(self, nightmode)
-        _styleFreeBgCache()
-        _notifyLayoutChanged()
-    end
-end
+Memory.onReset(M.freeCache)
 
 return M

@@ -25,11 +25,11 @@
 -- ----------
 --   LibrarySearch.show()
 
-local InputDialog    = require("ui/widget/inputdialog")
-local UIManager      = require("ui/uimanager")
 local _              = require("gettext")
 local T              = require("ffi/util").template
+local util           = require("util")
 
+local VirtualPaths   = require("infra/sui_virtual_paths")
 local LibraryScan    = require("engines/sui_library_scan")
 local MetadataSource = require("features/library/sui_metadata_source")
 local SUIWindow      = require("engines/sui_window")
@@ -40,7 +40,7 @@ local LibrarySearch = {}
 local MAX_RESULTS = 400 -- keeps result collection/sorting bounded on e-readers
 
 -- Opens a book by path. Mirrors engines/sui_screen_engine.lua's openBook():
--- normalizes a kobo virtual path (when the kobo integration is active) and
+-- resolves the virtual path (when a virtual library is active) and
 -- respects the "confirm before opening" setting. ReaderUI:showReader()
 -- closes whatever is on screen (this results list included) atomically
 -- before its first paint, so no explicit close is needed here.
@@ -48,28 +48,16 @@ local function _openBook(filepath)
     local function doOpen()
         local ReaderUI = package.loaded["apps/reader/readerui"]
             or require("apps/reader/readerui")
-        local path = filepath
-        local ok, PluginLoader = pcall(require, "pluginloader")
-        local kobo = ok and PluginLoader and PluginLoader:getPluginInstance("kobo_plugin")
-        if kobo and kobo.virtual_library then
-            local vl = kobo.virtual_library
-            if not next(vl.virtual_to_real) then
-                pcall(function() vl:buildPathMappings() end)
-            end
-            if not vl:isVirtualPath(path) then
-                path = vl:getVirtualPath(path) or path
-            end
-        end
-        ReaderUI:showReader(path)
+        ReaderUI:showReader(VirtualPaths.toVirtual(filepath))
     end
     if G_reader_settings:isTrue("file_ask_to_open") then
-        local ConfirmBox = require("ui/widget/confirmbox")
-        UIManager:show(ConfirmBox:new{
+        local Dialogs = require("features/dialogs/sui_dialogs")
+        Dialogs.confirm{
             text        = _("Open this file?") .. "\n\n" .. (filepath:match("([^/]+)$") or filepath),
             ok_text     = _("Open"),
             cancel_text = _("Cancel"),
             ok_callback = doOpen,
-        })
+        }
     else
         doOpen()
     end
@@ -77,18 +65,18 @@ end
 
 local function splitWords(query)
     local words = {}
-    for w in query:gmatch("%S+") do words[#words + 1] = w:lower() end
+    for w in query:gmatch("%S+") do words[#words + 1] = util.stringLower(w) end
     return words
 end
 
 -- One haystack string per candidate so each query word is checked with a
 -- single find() rather than once per field.
 local function buildHaystack(filename, row)
-    local parts = { filename:lower() }
+    local parts = { util.stringLower(filename) }
     if row then
-        if row.title   then parts[#parts + 1] = row.title:lower()   end
-        if row.authors then parts[#parts + 1] = row.authors:lower() end
-        if row.series  then parts[#parts + 1] = row.series:lower()  end
+        if row.title   then parts[#parts + 1] = util.stringLower(row.title)   end
+        if row.authors then parts[#parts + 1] = util.stringLower(row.authors) end
+        if row.series  then parts[#parts + 1] = util.stringLower(row.series)  end
     end
     return table.concat(parts, " ")
 end
@@ -126,7 +114,7 @@ local function search(home_dir, query)
             if #results >= MAX_RESULTS then break end
         end
     end
-    table.sort(results, function(a, b) return a.text:lower() < b.text:lower() end)
+    table.sort(results, function(a, b) return util.stringLower(a.text) < util.stringLower(b.text) end)
     return results
 end
 
@@ -171,6 +159,7 @@ end
 local function showResults(query, results)
     local win = SUIWindow:new{
         name          = "sui_win_library_search_results",
+        icon          = "search",
         title         = T(_("Search results: %1"), query),
         position      = "bottom",
         navpager_mode = require("infra/sui_config").isNavpagerEnabled(),
@@ -188,29 +177,18 @@ function LibrarySearch.show()
         return
     end
 
-    local search_dialog
-    local function doSearch()
-        local query = search_dialog:getInputText()
-        if query == "" then return end
-        UIManager:close(search_dialog)
-        local results = search(home_dir, query)
-        if #results == 0 then
-            UI.Notify.toast(T(_("No results for: %1"), query))
-        else
-            showResults(query, results)
-        end
-    end
-    search_dialog = InputDialog:new{
-        title = _("Search library"),
-        buttons = {
-            {
-                { text = _("Cancel"), id = "close", callback = function() UIManager:close(search_dialog) end },
-                { text = _("Search"), is_enter_default = true, callback = doSearch },
-            },
-        },
+    require("features/dialogs/sui_dialogs").prompt{
+        title     = _("Search library"),
+        ok_text   = _("Search"),
+        on_submit = function(query)
+            local results = search(home_dir, query)
+            if #results == 0 then
+                UI.Notify.toast(T(_("No results for: %1"), query))
+            else
+                showResults(query, results)
+            end
+        end,
     }
-    UIManager:show(search_dialog)
-    search_dialog:onShowKeyboard()
 end
 
 return LibrarySearch
