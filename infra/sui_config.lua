@@ -10,8 +10,14 @@ local Blitbuffer        = require("ffi/blitbuffer")
 local DataStorage       = require("datastorage")
 local SUISettings       = require("infra/sui_store")
 local SUICoverCache     = require("infra/sui_cover_cache")
+local LRU               = require("infra/sui_lru")
+local Memory            = require("infra/sui_memory")
+local Backdrop          = require("infra/sui_backdrop")
+local SUIFonts          = require("infra/sui_fonts")
 local logger            = require("logger")
 local _ = require("infra/sui_i18n").translate
+local Text = require("infra/sui_text")
+local util = require("util")
 local T = require("ffi/util").template
 
 local M = {}
@@ -58,36 +64,37 @@ if _ko_root == "" then
 end
 local _KO = _ko_root .. "resources/icons/mdlight/"
 
--- Icon path registry.
+-- Icon registry (Nerd Font glyphs via "nerd:XXXX"; custom_dir remains a path).
+-- Codepoints match SUIStyle.ICON (outline set used in SUI windows) so QA
+-- icons share the same weight and shape as the rest of the UI.
 M.ICON = {
-    library        = _P .. "library.svg",
-    collections    = _P .. "collections.svg",
-    history        = _P .. "history.svg",
-    recent         = _P .. "recent.svg",
-    random         = _P .. "random.svg",
-    continue_      = _P .. "continue.svg",       -- trailing _ avoids clash with Lua keyword
-    frontlight     = _P .. "frontlight.svg",
-    night          = _P .. "night.svg",
-    stats          = _P .. "stats.svg",
-    power          = _P .. "power.svg",
-    plus_alt       = _P .. "plus_alt.svg",
-    custom         = _P .. "custom.svg",
+    library        = "nerd:F405",  -- book
+    collections    = "nerd:E257",  -- stacked layers   (SUIStyle.collections)
+    history        = "nerd:E9D9",  -- clock with arrow (SUIStyle.history)
+    recent         = "nerd:E385",  -- clock outline    (SUIStyle.clock)
+    random         = "nerd:EB30",  -- random
+    continue_      = "nerd:E28B",  -- open book        (SUIStyle.book_open)
+    frontlight     = "nerd:ECA7",  -- sun              (SUIStyle.brightness)
+    night          = "nerd:23FE",  -- power sleep symbol
+    stats          = "nerd:E829",  -- chart-line
+    power          = "nerd:EB24",  -- power symbol     (SUIStyle.power)
+    plus_alt       = "nerd:E145",  -- add / plus       (SUIStyle.add)
+    custom         = "nerd:E955",  -- folder outline (default for path/collection QAs)
     custom_dir     = _P .. "custom",
-    group          = _P .. "group.svg",
-    plugin         = _P .. "plugin.svg",
-    author         = _P .. "author.svg",
-    series         = _P .. "series.svg",
-    tags           = _P .. "tags.svg",
-    back           = _P .. "back.svg",
-    menu           = _P .. "more-options.svg",
-    nav_prev       = _KO .. "chevron.left.svg",
-    nav_next       = _KO .. "chevron.right.svg",
-    ko_home        = _KO .. "home.svg",
-    ko_star        = _KO .. "star.empty.svg",
-    ko_wifi        = _KO .. "wifi.open.100.svg",
-    ko_settings    = _KO .. "appbar.settings.svg",
-    ko_search      = _KO .. "appbar.search.svg",
-    ko_bookmark    = _KO .. "bookmark.svg",
+    group          = "nerd:E73A",  -- 3x3 grid         (SUIStyle.group)
+    plugin         = "nerd:EB30",  -- puzzle piece     (SUIStyle.plugin)
+    author         = "nerd:E712",  -- person           (SUIStyle.author)
+    series         = "nerd:E7BA",  -- stacked books    (SUIStyle.series)
+    tags           = "nerd:EBF8",  -- tag              (SUIStyle.tags)
+    nav_prev       = "nerd:E840",  -- chevron left
+    nav_next       = "nerd:E841",  -- chevron right
+    ko_home        = "nerd:ED9F",  -- house outline
+    ko_star        = "nerd:E838",  -- star outline
+    ko_wifi        = "nerd:ECA8",  -- wifi             (SUIStyle.wifi)
+    ko_settings    = "nerd:F462",  -- settings
+    ko_search      = "nerd:F422",  -- magnifier        (SUIStyle.search)
+    ko_bookmark    = "nerd:F097",  -- bookmark outline (SUIStyle.bookmark)
+    backup         = "nerd:F0C7",  -- save / floppy
 }
 
 M.CUSTOM_ICON            = M.ICON.custom
@@ -213,16 +220,7 @@ end
 
 function M.setTopbarCustomText(s)
     if type(s) == "string" then
-        local count, i, out = 0, 1, {}
-        while i <= #s do
-            local byte = s:byte(i)
-            local clen = byte >= 240 and 4 or byte >= 224 and 3 or byte >= 192 and 2 or 1
-            count = count + 1
-            if count > TOPBAR_CUSTOM_TEXT_MAX then break end
-            out[#out + 1] = s:sub(i, i + clen - 1)
-            i = i + clen
-        end
-        s = table.concat(out)
+        s = Text.cut(s, TOPBAR_CUSTOM_TEXT_MAX)
     else
         s = ""
     end
@@ -517,7 +515,7 @@ function M.getActionById(id)
     if entry and not entry.id then
         -- entry.dim carries the resolved on/off state for actions with an
         -- is_active hook (e.g. wifi_toggle, night_mode) — keep it so callers
-        -- can dim the icon via UI.wrapDimmable, same as every other QA
+        -- can dim the icon, same as every other QA
         -- consumer (see features/sui_quickactions.lua header comment).
         return { id = id, label = entry.label, icon = entry.icon, dim = entry.dim }
     end
@@ -543,10 +541,8 @@ end
 
 function M.sanitizeLabel(s)
     if type(s) ~= "string" then return nil end
-    s = s:match("^%s*(.-)%s*$")
-    if #s == 0 then return nil end
-    if #s > M.MAX_LABEL_LEN then s = s:sub(1, M.MAX_LABEL_LEN) end
-    return s
+    s = Text.cut(util.trim(s), M.MAX_LABEL_LEN)
+    return s ~= "" and s or nil
 end
 
 -- Converts a "nerd:XXXX" hex string to a UTF-8 character.
@@ -841,9 +837,16 @@ function M.getScaledLabelH(landscape_factor)
         local base_fs = (ok and SUIStyle and SUIStyle.FS_BODY) or 18  -- FS_BODY (18)
         _BASE_LABEL_TEXT_H = require("device").screen:scaleBySize(base_fs)
     end
-    local PAD2  = require("infra/sui_core").PAD2
+    local UI    = require("infra/sui_core")
     local scale = M.getLabelScale() * (landscape_factor or 1)
-    return PAD2 + math_max(8, math_floor(_BASE_LABEL_TEXT_H * scale))
+
+    -- A label reserves what it draws: its line height (font, variant and
+    -- size are the user's) plus the gap below it.
+    local ok_ls, LabelStyle = pcall(require, "features/sui_label_style")
+    if ok_ls and LabelStyle then
+        return LabelStyle.textHeight(scale) + UI.LABEL_PAD_BOT + LabelStyle.extraGap(scale)
+    end
+    return UI.PAD2 + math_max(8, math_floor(_BASE_LABEL_TEXT_H * scale))
 end
 
 -- Item Label Scale
@@ -859,15 +862,18 @@ function M.setItemLabelScale(pct, mod_id, pfx)
     _writePct(pct, _itemLabelKey(mod_id, pfx))
 end
 
--- Per-element text style: a font family, a size scale and a variant (regular,
--- bold, italic, bold italic) for one text element (title, author, ...) of a
--- module. An unset family means the default UI font; an unset scale means
--- 100%; an unset variant means the element's default variant, "regular"
--- unless the module declares otherwise (M.declareTextVariants).
+-- Per-element text style: a font family, a size scale, a variant (regular,
+-- bold, italic, bold italic) and a colour for one text element (title, author,
+-- ...) of a module. An unset family means the default UI font; an unset scale
+-- means 100%; an unset variant means the element's default variant, "regular"
+-- unless the module declares otherwise (M.declareTextVariants); an unset colour
+-- means the plain text colour, a palette choice ("accent", "secondary") only
+-- for the elements a module declares (M.declareTextColors).
 local TEXT_FONT_INFIX    = "_text_font_"
 local TEXT_SCALE_INFIX   = "_text_scale_"
 local TEXT_VARIANT_INFIX = "_text_variant_"
-local TEXT_INFIXES       = { TEXT_FONT_INFIX, TEXT_SCALE_INFIX, TEXT_VARIANT_INFIX }
+local TEXT_COLOR_INFIX   = "_text_color_"
+local TEXT_INFIXES       = { TEXT_FONT_INFIX, TEXT_SCALE_INFIX, TEXT_VARIANT_INFIX, TEXT_COLOR_INFIX }
 
 local function _textKey(infix, mod_id, elem, pfx)
     return (pfx or "simpleui_hs_") .. mod_id .. infix .. elem
@@ -881,22 +887,65 @@ function M.declareTextVariants(mod_id, defaults)
     _variant_defaults[mod_id] = defaults
 end
 
+local _family_defaults = {}   -- module id → { element id → family, or function(pfx) → family? }
+
+-- Declares the font family the elements of `mod_id` take until the user picks
+-- one. A default may be a function of the screen prefix that returns the family
+-- name, or nil for the UI font.
+function M.declareTextFamilies(mod_id, defaults)
+    _family_defaults[mod_id] = defaults
+end
+
+local function _defaultFamily(mod_id, elem, pfx)
+    local default = _family_defaults[mod_id] and _family_defaults[mod_id][elem]
+    if type(default) == "function" then default = default(pfx or "simpleui_hs_") end
+    return type(default) == "string" and default or nil
+end
+
+local _color_elems    = {}   -- module id → { element id → true }
+local _color_defaults = {}   -- module id → { element id → palette choice }
+
+-- Declares the elements of `mod_id` that can take a palette colour, e.g.
+-- { "author" }. `defaults` maps an element to the palette choice it takes until
+-- the user picks another (or "None"), e.g. { author = "accent" }.
+function M.declareTextColors(mod_id, elems, defaults)
+    local set = {}
+    for _i, elem in ipairs(elems) do set[elem] = true end
+    _color_elems[mod_id]    = set
+    _color_defaults[mod_id] = defaults
+end
+
+local function _defaultColor(mod_id, elem)
+    local defaults = _color_defaults[mod_id]
+    return defaults and defaults[elem]
+end
+
 local function _defaultVariant(mod_id, elem)
     local defaults = _variant_defaults[mod_id]
     return defaults and defaults[elem] or "regular"
 end
 
+-- Font family the user picked for the element, nil for the default.
+local function _storedFamily(mod_id, elem, pfx)
+    local family = SUISettings:get(_textKey(TEXT_FONT_INFIX, mod_id, elem, pfx))
+    return type(family) == "string" and family ~= "" and family or nil
+end
+
 function M.getTextStyle(mod_id, elem, pfx)
-    local family  = SUISettings:get(_textKey(TEXT_FONT_INFIX, mod_id, elem, pfx))
+    local family  = _storedFamily(mod_id, elem, pfx) or _defaultFamily(mod_id, elem, pfx)
     local n       = tonumber(SUISettings:get(_textKey(TEXT_SCALE_INFIX, mod_id, elem, pfx)))
     local variant = SUISettings:get(_textKey(TEXT_VARIANT_INFIX, mod_id, elem, pfx))
-    if not require("features/sui_style").isVariant(variant) then
+    local SUIStyle = require("features/sui_style")
+    if not SUIStyle.isVariant(variant) then
         variant = _defaultVariant(mod_id, elem)
     end
+    local color = SUISettings:get(_textKey(TEXT_COLOR_INFIX, mod_id, elem, pfx))
+    if color == nil then color = _defaultColor(mod_id, elem) end
     return {
-        family  = (type(family) == "string" and family ~= "") and family or nil,
+        family  = family,
         scale   = n and _clamp(n) / 100 or 1.0,
         variant = variant,
+        color   = SUIStyle.isPaletteChoice(color) and color or nil,
     }
 end
 
@@ -937,6 +986,13 @@ function M.setTextStyleVariant(variant, mod_id, elem, pfx)
     if variant then SUISettings:set(key, variant) else SUISettings:del(key) end
 end
 
+-- color == nil clears the choice (back to the element's default colour); "none"
+-- keeps the element plain even where a default colour is declared.
+function M.setTextStyleColor(color, mod_id, elem, pfx)
+    local key = _textKey(TEXT_COLOR_INFIX, mod_id, elem, pfx)
+    if color then SUISettings:set(key, color) else SUISettings:del(key) end
+end
+
 -- Drops every stored text choice of the listed elements, returning them to
 -- their defaults.
 function M.resetTextStyles(mod_id, elems, pfx)
@@ -949,7 +1005,8 @@ end
 
 -- Menu entry for one text element: "Font" and "Style" pickers (regular, bold,
 -- italic, bold italic), plus a "Size" spinner unless the size is controlled
--- elsewhere.
+-- elsewhere, and a "Color" picker for an element declared with
+-- M.declareTextColors while a palette colour is on screen.
 -- opts: { title, info, mod_id, elem, pfx, refresh, _lc, family_only }
 function M.makeTextStyleItem(opts)
     local mod_id, elem, pfx, refresh = opts.mod_id, opts.elem, opts.pfx, opts.refresh
@@ -957,10 +1014,11 @@ function M.makeTextStyleItem(opts)
     local SUIStyle = require("features/sui_style")
 
     local function family() return M.getTextStyle(mod_id, elem, pfx).family end
-    local function familyLabel() return family() or _lc("Default") end
+    local function chosenFamily() return _storedFamily(mod_id, elem, pfx) end
+    local function familyLabel() return chosenFamily() or _lc("Default") end
     local function familyMenuItems()
         return SUIStyle.makeFamilyMenuItems(
-            family,
+            chosenFamily,
             function(name) M.setTextStyleFont(name, mod_id, elem, pfx) end,
             refresh)
     end
@@ -980,28 +1038,70 @@ function M.makeTextStyleItem(opts)
         })
     end
 
-    local entries = {
-        { text = _lc("Font"), value_func = familyLabel, sub_item_table_func = familyMenuItems },
-        {
-            text                = _lc("Style"),
-            value_func          = function() return SUIStyle.variantLabel(variant()) end,
-            sub_item_table_func = variantMenuItems,
-        },
-    }
-    if not opts.family_only then
-        table.insert(entries, 2, M.makeScaleItem({
-            text_func = function() return _lc("Size") end,
-            title     = opts.title,
-            info      = opts.info,
-            get       = function() return M.getTextStyleScalePct(mod_id, elem, pfx) end,
-            set       = function(v) M.setTextStyleScale(v, mod_id, elem, pfx) end,
-            refresh    = refresh,
-            value_step = 5,
-        }))
+    -- `family_only` may be a function, evaluated each time the submenu opens.
+    local function buildEntries()
+        local entries = {
+            { text = _lc("Font"), value_func = familyLabel, sub_item_table_func = familyMenuItems },
+            {
+                text                = _lc("Style"),
+                value_func          = function() return SUIStyle.variantLabel(variant()) end,
+                sub_item_table_func = variantMenuItems,
+            },
+        }
+        local family_only = opts.family_only
+        if type(family_only) == "function" then family_only = family_only() end
+        if not family_only then
+            table.insert(entries, 2, M.makeScaleItem({
+                text_func = function() return _lc("Size") end,
+                title     = opts.title,
+                info      = opts.info,
+                get       = function() return M.getTextStyleScalePct(mod_id, elem, pfx) end,
+                set       = function(v) M.setTextStyleScale(v, mod_id, elem, pfx) end,
+                refresh    = refresh,
+                value_step = 5,
+            }))
+        end
+        return entries
     end
-    -- The controls are independent: no value on the parent row (chevron
-    -- only), so the user is not shown a single ambiguous summary.
-    return { text = opts.title, sub_item_table = entries }
+    local color_declared = _color_elems[mod_id] and _color_elems[mod_id][elem]
+    if not color_declared then
+        -- The controls are independent: no value on the parent row (chevron
+        -- only), so the user is not shown a single ambiguous summary.
+        if type(opts.family_only) == "function" then
+            return { text = opts.title, sub_item_table_func = buildEntries }
+        end
+        return { text = opts.title, sub_item_table = buildEntries() }
+    end
+
+    -- The colour picker exists only while a palette colour is on screen, so
+    -- the rows are listed when the submenu opens.
+    return {
+        text = opts.title,
+        sub_item_table_func = function()
+            local entries = buildEntries()
+            local palette = SUIStyle.paletteOptions(_lc)
+            if #palette == 0 then return entries end
+            local default_color = _defaultColor(mod_id, elem)
+            local options = { { value = "none", label = default_color and _lc("None") or _lc("Default") } }
+            for _i, option in ipairs(palette) do options[#options + 1] = option end
+            local rows = {}
+            for _i, entry in ipairs(entries) do rows[#rows + 1] = entry end
+            rows[#rows + 1] = M.makeRadioSubmenuItem{
+                text    = _lc("Color"),
+                options = options,
+                get     = function()
+                    local color = M.getTextStyle(mod_id, elem, pfx).color
+                    return color and SUIStyle.paletteChoiceAvailable(color) and color or "none"
+                end,
+                set     = function(v)
+                    if v == "none" and not default_color then v = nil end
+                    M.setTextStyleColor(v, mod_id, elem, pfx)
+                end,
+                refresh = refresh,
+            }
+            return rows
+        end,
+    }
 end
 
 -- Item of one element of a text section; `opts` are the section's options.
@@ -1227,40 +1327,102 @@ M.LABEL_SCALE_MAX   = SCALE_MAX
 M.LABEL_SCALE_STEP  = SCALE_STEP
 M.LABEL_SCALE_DEF   = SCALE_DEF
 
--- SpinWidget Menu-Item Factory
-function M.makeScaleItem(opts)
-    local enabled_func = opts.enabled_func
+-- Spin Menu-Item Factories
+-- One menu entry whose tap opens the spin dialog (features/dialogs/sui_dialogs),
+-- and presets of it for the common ranges.
+
+-- `fn` called without arguments, or nil when there is none.
+local function withoutArgs(fn)
+    return fn and function() fn() end or nil
+end
+
+-- A value row that opens the spin dialog on tap.
+-- opts: {
+--   text / text_func — entry text
+--   separator, enabled_func — as in any menu item
+--   guard         — optional; called first, the dialog opens only when it
+--                   returns true
+--   title, info   — dialog title and description (`info` may be a function
+--                   returning it when the dialog opens)
+--   get / set     — value accessors
+--   refresh       — optional; called with the touch menu after `set`
+--   value_min, value_max, value_step, value_hold_step, default_value
+--   unit          — suffix of the value, "" by default
+--   value_func    — optional override of the value label
+--   live          — optional; each value that settles in the dialog is applied
+--                   (`set` + `refresh`) at once to show the result behind it,
+--                   and Cancel restores the value the dialog opened with
+-- }
+function M.makeSpinItem(opts)
+    local unit = opts.unit or ""
     return {
+        text           = opts.text,
         text_func      = opts.text_func,
         separator      = opts.separator or nil,
+        enabled_func   = opts.enabled_func,
         keep_menu_open = true,
-        value_func     = function() return opts.get() .. "%" end,
-        callback       = function()
-            if enabled_func and not enabled_func() then
-                local UIManager   = require("ui/uimanager")
-                UI.Notify.toast(_("Disable \"Lock Scale\" first to set a per-module scale."))
-                return
+        value_func     = opts.value_func or function() return tostring(opts.get()) .. unit end,
+        callback       = function(touchmenu)
+            if opts.guard and not opts.guard() then return end
+            local info = opts.info
+            if type(info) == "function" then info = info() end
+            local initial = opts.get()
+            local applied, previewed = initial, false
+            local function commit(value)
+                applied = value
+                opts.set(value)
+                if opts.refresh then opts.refresh(touchmenu) end
             end
-            local SpinWidget = require("ui/widget/spinwidget")
-            local UIManager  = require("ui/uimanager")
-            UIManager:show(SpinWidget:new{
-                title_text    = opts.title,
-                info_text     = opts.info,
-                value         = opts.get(),
-                value_min       = opts.value_min      or SCALE_MIN,
-                value_max       = opts.value_max      or SCALE_MAX,
-                value_step      = opts.value_step     or SCALE_STEP,
-                value_hold_step = opts.value_hold_step,
-                unit            = "%",
-                ok_text       = _("Apply"),
-                cancel_text   = _("Cancel"),
-                default_value = opts.default_value or SCALE_DEF,
-                callback      = function(spin)
-                    opts.set(spin.value)
-                    opts.refresh()
+            require("features/dialogs/sui_dialogs").spin{
+                title     = opts.title,
+                info      = info,
+                value     = initial,
+                min       = opts.value_min,
+                max       = opts.value_max,
+                step      = opts.value_step,
+                hold_step = opts.value_hold_step,
+                unit      = unit,
+                default   = opts.default_value,
+                on_preview = opts.live and function(value)
+                    if value == applied then return end
+                    previewed = true
+                    commit(value)
+                end or nil,
+                on_apply  = function(value)
+                    if previewed and value == applied then return end
+                    commit(value)
                 end,
-            })
+                on_cancel = opts.live and function()
+                    if applied ~= initial then commit(initial) end
+                end or nil,
+            }
         end,
+    }
+end
+
+-- Percentage of the module scale range.
+-- opts: { get, set, refresh, title, info, text_func, separator, enabled_func,
+--         value_min, value_max, value_step, value_hold_step, default_value }
+function M.makeScaleItem(opts)
+    local enabled_func = opts.enabled_func
+    return M.makeSpinItem{
+        text_func       = opts.text_func,
+        separator       = opts.separator,
+        guard           = enabled_func and function()
+            if enabled_func() then return true end
+            require("infra/sui_core").Notify.toast(_("Disable \"Lock Scale\" first to set a per-module scale."))
+        end,
+        title           = opts.title,
+        info            = opts.info,
+        get             = opts.get,
+        set             = opts.set,
+        refresh         = withoutArgs(opts.refresh),
+        value_min       = opts.value_min  or SCALE_MIN,
+        value_max       = opts.value_max  or SCALE_MAX,
+        value_step      = opts.value_step or SCALE_STEP,
+        value_hold_step = opts.value_hold_step,
+        default_value   = opts.default_value or SCALE_DEF,
+        unit            = "%",
     }
 end
 
@@ -1301,111 +1463,179 @@ function M.makeBackdropStrengthItem(opts)
     local _lc = opts._lc or _
     local function label(strength)
         if opts.format then return opts.format(strength) end
-        return require("features/sui_wallpaper").formatBackdropStrength(strength, _lc)
+        return Backdrop.formatBackdropStrength(strength, _lc)
     end
-    return {
-        text           = opts.title,
-        enabled_func   = opts.enabled_func,
-        keep_menu_open = true,
-        value_func     = opts.value_func or function() return label(opts.get()) end,
-        callback       = function(touchmenu)
-            local SpinWidget = require("ui/widget/spinwidget")
-            local UIManager  = require("ui/uimanager")
+    return M.makeSpinItem{
+        text          = opts.title,
+        enabled_func  = opts.enabled_func,
+        separator     = opts.separator,
+        value_func    = opts.value_func or function() return label(opts.get()) end,
+        live          = true,
+        title         = opts.title,
+        info          = function()
             local info = opts.info
                 or _lc("0% transparent, 100% solid. Values in between add a scrim over the wallpaper.")
-            UIManager:show(SpinWidget:new{
-                title_text    = opts.title,
-                info_text     = info .. "\n" .. T(_lc("Default: %1"), label(opts.default_value)),
-                value         = opts.get(),
-                value_min     = 0,
-                value_max     = opts.value_max or 100,
-                value_step    = 5,
-                unit          = "%",
-                ok_text       = _("Apply"),
-                cancel_text   = _("Cancel"),
-                default_value = opts.default_value,
-                callback      = function(spin)
-                    opts.set(spin.value)
-                    opts.refresh(touchmenu)
-                end,
-            })
+            return info .. "\n" .. T(_lc("Default: %1"), label(opts.default_value))
         end,
+        get           = opts.get,
+        set           = opts.set,
+        refresh       = opts.refresh,
+        value_min     = Backdrop.STRENGTH_MIN,
+        value_max     = opts.value_max or Backdrop.STRENGTH_MAX,
+        value_step    = 5,
+        default_value = opts.default_value,
+        unit          = "%",
     }
 end
 
--- Generic integer stepper (SpinWidget, no "%" suffix) — for small bounded
+-- Rows editing a surface (see infra/sui_backdrop.lua), the same on every
+-- surface: Color (white or gray, plus the accent and secondary colours that are
+-- set where the surface supports them), Frame and Background Opacity.
+-- opts: {
+--   surface      — surface descriptor (Backdrop.surface)
+--   refresh      — called once a value is applied
+--   with_strength — false, or a function returning false when the menu is
+--                  opened, leaves out the Opacity row. Default: the row is
+--                  listed only while a wallpaper is active, the only case
+--                  where opacity shows
+--   get_strength — optional opacity getter, instead of the stored value
+--   set_strength — optional opacity setter, instead of the stored value
+--   _lc          — optional translator (defaults to the plugin translator)
+-- }
+function M.makeSurfaceItems(opts)
+    local _lc, surface, refresh = opts._lc or _, opts.surface, opts.refresh
+    local with_strength = opts.with_strength
+    if with_strength == nil then
+        with_strength = require("features/sui_wallpaper").isWallpaperActive
+    end
+    if type(with_strength) == "function" then with_strength = with_strength() end
+    local tones = {
+        { value = Backdrop.TONE.WHITE, label = _lc("White") },
+        { value = Backdrop.TONE.GRAY,  label = _lc("Gray") },
+    }
+    if Backdrop.supportsTint(surface) then
+        for _i, option in ipairs(require("features/sui_style").paletteOptions(_lc)) do
+            tones[#tones + 1] = option
+        end
+    end
+    local items = {
+        M.makeRadioSubmenuItem{
+            text    = _lc("Color"),
+            options = tones,
+            get     = function() return Backdrop.readTone(surface) end,
+            set     = function(tone) Backdrop.saveTone(surface, tone) end,
+            refresh = refresh,
+        },
+    }
+    items[#items + 1] = {
+        text           = _lc("Frame"),
+        checked_func   = function() return Backdrop.readFrame(surface) end,
+        keep_menu_open = true,
+        callback       = function()
+            Backdrop.saveFrame(surface, not Backdrop.readFrame(surface))
+            refresh()
+        end,
+    }
+    if with_strength ~= false then
+        items[#items + 1] = M.makeBackdropStrengthItem{
+            title         = _lc("Background Opacity"),
+            get           = opts.get_strength or function() return Backdrop.readStrength(surface) end,
+            set           = opts.set_strength or function(n) Backdrop.saveStrength(surface, n) end,
+            refresh       = refresh,
+            default_value = surface.defaults.strength,
+            _lc           = _lc,
+        }
+    end
+    return items
+end
+
+-- The "Background" submenu holding the rows of makeSurfaceItems. `opts` is as
+-- there, plus
+--   enabled_func — optional enabled state of the submenu
+function M.makeSurfaceMenu(opts)
+    return {
+        text           = (opts._lc or _)("Background"),
+        enabled_func        = opts.enabled_func,
+        sub_item_table_func = function() return M.makeSurfaceItems(opts) end,
+    }
+end
+
+-- Integer setting kept within [lo, hi]. Reads give `default` (clamped too)
+-- when nothing is saved, and nil when there is no default either.
+function M.readClampedInt(key, lo, hi, default)
+    local v = SUISettings:readSetting(key)
+    if v == nil then v = default end
+    if v == nil then return nil end
+    return math_max(lo, math_min(hi, math_floor(tonumber(v) or lo)))
+end
+
+function M.saveClampedInt(key, n, lo, hi)
+    SUISettings:saveSetting(key, math_max(lo, math_min(hi, math_floor(tonumber(n) or lo))))
+end
+
+-- Generic integer stepper (spin dialog, no "%" suffix) — for small bounded
 -- counts like grid rows/columns, where makeScaleItem's fixed "%" unit and
 -- SCALE_MIN/MAX defaults don't apply. opts.unit defaults to "" (no suffix
 -- shown after the number).
 function M.makeStepperItem(opts)
-    local unit = opts.unit or ""
-    return {
-        text_func      = opts.text_func,
-        separator      = opts.separator or nil,
-        keep_menu_open = true,
-        value_func     = function() return tostring(opts.get()) .. unit end,
-        callback       = function()
-            local SpinWidget = require("ui/widget/spinwidget")
-            local UIManager  = require("ui/uimanager")
-            UIManager:show(SpinWidget:new{
-                title_text    = opts.title,
-                info_text     = opts.info,
-                value         = opts.get(),
-                value_min     = opts.value_min,
-                value_max     = opts.value_max,
-                value_step    = opts.value_step or 1,
-                unit          = unit,
-                ok_text       = _("Apply"),
-                cancel_text   = _("Cancel"),
-                default_value = opts.default_value,
-                callback      = function(spin)
-                    opts.set(spin.value)
-                    opts.refresh()
-                end,
-            })
-        end,
+    return M.makeSpinItem{
+        text_func       = opts.text_func,
+        separator       = opts.separator,
+        title           = opts.title,
+        info            = opts.info,
+        get             = opts.get,
+        set             = opts.set,
+        refresh         = withoutArgs(opts.refresh),
+        value_min       = opts.value_min,
+        value_max       = opts.value_max,
+        value_step      = opts.value_step or 1,
+        value_hold_step = opts.value_hold_step,
+        default_value   = opts.default_value,
+        unit            = opts.unit,
     }
 end
 
--- Two integer steppers shown in the same dialog at once (DoubleSpinWidget) —
--- same widget/convention KOReader's own CoverBrowser plugin uses for
--- "Items per page in portrait/landscape mosaic mode" (columns + rows
--- together, one Apply). Prefer this over two separate makeStepperItem
--- entries whenever the two numbers are only meaningful as a pair.
+-- Two integer steppers shown in the same dialog at once (Dialogs.spin2) —
+-- "Items per page" style pairs (columns + rows together, one Apply). Prefer
+-- this over two separate makeStepperItem entries whenever the two numbers are
+-- only meaningful as a pair.
 function M.makeDoubleStepperItem(opts)
+    local function side(spec)
+        return {
+            text      = spec.text,
+            value     = spec.get(),
+            min       = spec.value_min,
+            max       = spec.value_max,
+            step      = spec.value_step,
+            hold_step = spec.value_hold_step,
+            default   = spec.default_value,
+            auto      = spec.auto_func and spec.auto_func(),
+            auto_text = spec.auto_text,
+        }
+    end
     return {
         text_func      = opts.text_func,
         value_func     = opts.value_func,
         mandatory_func = opts.mandatory_func,
         separator      = opts.separator or nil,
-        -- Just like KOReader's own native item: no keep_menu_open, so you can
-        -- see the result applying in the view behind.
+        -- No keep_menu_open: Apply closes the sheet (same as single spin).
         callback       = function()
-            local DoubleSpinWidget = require("ui/widget/doublespinwidget")
-            local UIManager        = require("ui/uimanager")
-            local left_value, right_value = opts.left.get(), opts.right.get()
-            UIManager:show(DoubleSpinWidget:new{
-                title_text      = opts.title,
-                width_factor    = opts.width_factor or 0.6,
-                left_text       = opts.left.text,
-                left_value      = left_value,
-                left_min        = opts.left.value_min,
-                left_max        = opts.left.value_max,
-                left_default    = opts.left.default_value,
-                left_precision  = "%01d",
-                right_text      = opts.right.text,
-                right_value     = right_value,
-                right_min       = opts.right.value_min,
-                right_max       = opts.right.value_max,
-                right_default   = opts.right.default_value,
-                right_precision = "%01d",
-                keep_shown_on_apply = true,
-                callback        = function(lv, rv)
-                    opts.left.set(lv)
-                    opts.right.set(rv)
+            require("features/dialogs/sui_dialogs").spin2{
+                title     = opts.title,
+                left      = side(opts.left),
+                right     = side(opts.right),
+                on_apply  = function(left, right, auto)
+                    -- A value still automatic is reset, not stored.
+                    for i, spec in ipairs{ opts.left, opts.right } do
+                        if auto[i] and spec.reset then
+                            spec.reset()
+                        else
+                            spec.set(i == 1 and left or right)
+                        end
+                    end
                     opts.refresh()
                 end,
-            })
+            }
         end,
     }
 end
@@ -1454,115 +1684,165 @@ function M.setModuleGap(pct, mod_id, pfx)
 end
 
 function M.makeGapItem(opts)
-    return {
-        text_func      = opts.text_func,
-        separator      = opts.separator or nil,
-        keep_menu_open = true,
-        value_func     = function() return opts.get() .. "%" end,
-        callback       = function()
-            local SpinWidget = require("ui/widget/spinwidget")
-            local UIManager  = require("ui/uimanager")
-            UIManager:show(SpinWidget:new{
-                title_text    = opts.title,
-                info_text     = opts.info,
-                value         = opts.get(),
-                value_min     = GAP_MIN,
-                value_max     = GAP_MAX,
-                value_step    = GAP_STEP,
-                unit          = "%",
-                ok_text       = _("Apply"),
-                cancel_text   = _("Cancel"),
-                default_value = GAP_DEF,
-                callback      = function(spin)
-                    opts.set(spin.value)
-                    opts.refresh()
-                end,
-            })
-        end,
+    return M.makeSpinItem{
+        text_func     = opts.text_func,
+        separator     = opts.separator,
+        title         = opts.title,
+        info          = opts.info,
+        get           = opts.get,
+        set           = opts.set,
+        refresh       = withoutArgs(opts.refresh),
+        value_min     = GAP_MIN,
+        value_max     = GAP_MAX,
+        value_step    = GAP_STEP,
+        default_value = GAP_DEF,
+        unit          = "%",
     }
 end
 
 
--- Per-module column width (bento grid). Percent of the homescreen row
--- this module occupies in portrait. 100 = full width (default). Modules
--- under 100% whose widths fit side-by-side share a row automatically.
-local BENTO_MIN  = 20
-local BENTO_MAX  = 100
-local BENTO_STEP = 5
-local BENTO_DEF  = 100
+-- Per-module column width (bento grid). Stored as a percent of the row
+-- (33 / 50 / 67 / 100, 100 = full width, the default) and handled as spans in
+-- sixths by infra/sui_bento. Modules whose spans fit in a row share it.
+local Bento = require("infra/sui_bento")
 
 local function _bentoKey(mod_id, pfx)
     return (pfx or "simpleui_hs_") .. "bento_width_" .. (mod_id or "")
 end
 
-local function _clampBento(n)
-    n = math_floor(tonumber(n) or BENTO_DEF)
-    if n < BENTO_MIN then n = BENTO_MIN elseif n > BENTO_MAX then n = BENTO_MAX end
-    -- Snap to step.
-    n = math_floor((n + BENTO_STEP / 2) / BENTO_STEP) * BENTO_STEP
-    if n < BENTO_MIN then n = BENTO_MIN elseif n > BENTO_MAX then n = BENTO_MAX end
-    return n
-end
-
-function M.getBentoWidth(mod_id, pfx)
-    if not mod_id then return BENTO_DEF end
+-- Span of the module; stored values from before the fixed widths snap to the
+-- nearest one.
+function M.getBentoSpan(mod_id, pfx)
+    if not mod_id then return Bento.FULL end
     local v = SUISettings:get(_bentoKey(mod_id, pfx))
     if v == nil then
-        -- One-shot migration from the old userpatch key (G_reader_settings).
+        -- One-shot migration from the legacy key (G_reader_settings).
         local legacy = _G.G_reader_settings and _G.G_reader_settings:readSetting("simpleui_bento_width_" .. mod_id)
         if legacy ~= nil then
-            local n = _clampBento(legacy)
-            M.setBentoWidth(n, mod_id, pfx)
-            return n
+            local span = Bento.pctToSpan(legacy)
+            M.setBentoSpan(span, mod_id, pfx)
+            return span
         end
-        return BENTO_DEF
+        return Bento.FULL
     end
-    return _clampBento(v)
+    return Bento.pctToSpan(v)
 end
 
-function M.setBentoWidth(pct, mod_id, pfx)
+function M.setBentoSpan(span, mod_id, pfx)
     if mod_id and pfx then
-        SUISettings:set(_bentoKey(mod_id, pfx), _clampBento(pct))
+        SUISettings:set(_bentoKey(mod_id, pfx), Bento.spanToPct(span))
     end
 end
 
-function M.makeBentoWidthItem(opts)
+-- Width as a percent of the row, for modules that size their content by it.
+function M.getBentoWidth(mod_id, pfx)
+    if M.isBentoClassic(pfx) then return M.getBentoPct(mod_id, pfx) end
+    return Bento.spanToPct(M.getBentoSpan(mod_id, pfx))
+end
+
+-- Width as a fraction of the row, in the layout mode of the screen.
+function M.getBentoFraction(mod_id, pfx)
+    return M.getBentoWidth(mod_id, pfx) / 100
+end
+
+-- Stores a percent width, snapped to the nearest fixed width.
+function M.setBentoWidth(pct, mod_id, pfx)
+    M.setBentoSpan(Bento.pctToSpan(pct), mod_id, pfx)
+end
+
+local function _bentoModeKey(pfx)
+    return (pfx or "simpleui_hs_") .. "bento_mode"
+end
+
+-- Layout mode of a screen: "grid" (fixed widths) or "classic" (free widths in
+-- percent, a module that does not fit stacks under a column of its width).
+function M.isBentoClassic(pfx)
+    return M.readChoice(_bentoModeKey(pfx), { "grid", "classic" }, "grid") == "classic"
+end
+
+function M.setBentoClassic(on, pfx)
+    SUISettings:set(_bentoModeKey(pfx), on and "classic" or "grid")
+end
+
+-- Percent snapped to the steps of the classic mode.
+local function _snapPct(v)
+    local step = Bento.CLASSIC_STEP
+    v = math.floor(v / step + 0.5) * step
+    return math.max(Bento.CLASSIC_MIN, math.min(Bento.CLASSIC_MAX, v))
+end
+
+-- Free width in percent for the classic mode, kept in the same setting as the
+-- fixed widths so switching mode keeps it.
+function M.getBentoPct(mod_id, pfx)
+    local v = mod_id and SUISettings:get(_bentoKey(mod_id, pfx))
+    if type(v) ~= "number" then return Bento.spanToPct(M.getBentoSpan(mod_id, pfx)) end
+    return _snapPct(v)
+end
+
+function M.setBentoPct(pct, mod_id, pfx)
+    if mod_id and pfx then
+        SUISettings:set(_bentoKey(mod_id, pfx), _snapPct(pct))
+    end
+end
+
+-- Radio options for the module widths.
+function M.bentoSpanOptions()
     return {
-        text_func      = opts.text_func or function() return _("Column Width (Bento Grid)") end,
-        separator      = opts.separator or nil,
-        keep_menu_open = true,
-        value_func     = function() return opts.get() .. "%" end,
-        callback       = function()
-            local SpinWidget = require("ui/widget/spinwidget")
-            local UIManager  = require("ui/uimanager")
-            UIManager:show(SpinWidget:new{
-                title_text    = opts.title or _("Column Width (Bento Grid)"),
-                info_text     = opts.info or _("Share of the row this module occupies.\n100% = full width. Modules under 100% share a row when their widths fit (bento grid)."),
-                value         = opts.get(),
-                value_min     = BENTO_MIN,
-                value_max     = BENTO_MAX,
-                value_step    = BENTO_STEP,
-                unit          = "%",
-                ok_text       = _("Apply"),
-                cancel_text   = _("Cancel"),
-                default_value = BENTO_DEF,
-                callback      = function(spin)
-                    opts.set(spin.value)
-                    opts.refresh()
-                end,
-            })
-        end,
+        { value = 2, label = _("1/3") },
+        { value = 3, label = _("1/2") },
+        { value = 4, label = _("2/3") },
+        { value = 6, label = _("Full") },
     }
 end
 
+function M.bentoSpanLabel(span)
+    for _i, option in ipairs(M.bentoSpanOptions()) do
+        if option.value == span then return option.label end
+    end
+    return ""
+end
+
+-- Width of the module as shown to the user, in the layout mode of the screen.
+function M.bentoWidthLabel(mod_id, pfx)
+    if M.isBentoClassic(pfx) then return M.getBentoPct(mod_id, pfx) .. "%" end
+    return M.bentoSpanLabel(M.getBentoSpan(mod_id, pfx))
+end
+
+local function _bentoAutofitKey(pfx)
+    return (pfx or "simpleui_hs_") .. "bento_autofit"
+end
+
+-- Whether changing a module width also adjusts a neighbour so the row stays
+-- full. On by default.
+function M.isBentoAutofit(pfx)
+    return SUISettings:nilOrTrue(_bentoAutofitKey(pfx))
+end
+
+function M.setBentoAutofit(on, pfx)
+    SUISettings:set(_bentoAutofitKey(pfx), on)
+end
+
+local function _bentoStackKey(pfx)
+    return (pfx or "simpleui_hs_") .. "bento_stack"
+end
+
+-- Whether a module that does not fit in its row goes under a column of the
+-- row with the same width, instead of starting a new row. On by default.
+function M.isBentoStack(pfx)
+    return SUISettings:nilOrTrue(_bentoStackKey(pfx))
+end
+
+function M.setBentoStack(on, pfx)
+    SUISettings:set(_bentoStackKey(pfx), on)
+end
 
 -- ---------------------------------------------------------------------------
--- Module Settings Chrome — Top Margin + Column Width
--- Every module's settings screen ends with these two items, regardless of
--- which window built that screen (long-press on a module vs the Settings ▸
--- Modules screen). Single source of truth for the pair, so the different
--- windows that show module settings can't drift out of sync on which items
--- are shown or how they're wired.
+-- Module Settings Chrome — Top Margin + Width and Position
+-- Every module's settings screen ends with these items, regardless of which
+-- window built that screen (long-press on a module vs the Settings ▸ Modules
+-- screen). Single source of truth, so the different windows that show module
+-- settings can't drift out of sync on which items are shown or how they're
+-- wired.
 --
 -- opts: {
 --   mod       — module descriptor (id, name, no_top_margin)
@@ -1570,8 +1850,11 @@ end
 --   refresh   — ctx_menu-style refresh; must already repaint the caller's
 --               window (see SUIWindow.withRepaint) or the new value won't
 --               show until the window is reopened
---   on_change — optional extra work to run after either value is set,
+--   on_change — optional extra work to run after the margin is set,
 --               e.g. invalidating a live screen's module-list cache
+--   layout_sheet — optional function opening the layout sheet of the module;
+--               when set, the screen gets a "Width and Position" row. Left
+--               out by windows that already offer the sheet themselves.
 -- }
 -- ---------------------------------------------------------------------------
 function M.appendModuleChromeItems(items, opts)
@@ -1600,14 +1883,18 @@ function M.appendModuleChromeItems(items, opts)
             refresh   = refresh,
         })
     end
-    items[#items + 1] = M.makeBentoWidthItem({
-        get     = function() return M.getBentoWidth(mod.id, pfx) end,
-        set     = function(v)
-            M.setBentoWidth(v, mod.id, pfx)
-            if on_change then on_change() end
-        end,
-        refresh = refresh,
-    })
+    if opts.layout_sheet then
+        local function currentWidth()
+            return M.bentoWidthLabel(mod.id, pfx)
+        end
+        items[#items + 1] = {
+            text           = _("Width and Position"),
+            value_func     = currentWidth,
+            mandatory_func = currentWidth,
+            keep_menu_open = true,
+            callback       = opts.layout_sheet,
+        }
+    end
     return items
 end
 
@@ -1618,6 +1905,16 @@ end
 
 function M.isLabelHidden(mod_id)
     return SUISettings:get(_labelHideKey(mod_id)) == true
+end
+
+-- A module's section label sits inside its background box unless the user
+-- moved it above the box.
+local function _labelOutsideKey(mod_id)
+    return "simpleui_label_outside_" .. (mod_id or "")
+end
+
+function M.isLabelOutside(mod_id)
+    return SUISettings:get(_labelOutsideKey(mod_id)) == true
 end
 
 -- ===========================================================================
@@ -1695,64 +1992,172 @@ function M.makeCoverHoldModeItem(opts)
     }
 end
 
--- Generic N-way radio submenu: a row with a static label and the current
--- choice shown as its right-side value, opening a list of radio choices.
--- Extracted from the get/set/refresh shape already used above by
--- makeCoverHoldModeItem. Any settings-menu consumer with more than an on/off
--- toggle (a style/type/color picker) can reuse this instead of hand-rolling
--- its own sub_item_table_func.
+-- ---------------------------------------------------------------------------
+-- Radio choice lists
+-- ---------------------------------------------------------------------------
+-- A choice list is described once (options + get/set) and rendered either as
+-- a flat list of radio entries (appendRadioItems) or as a submenu row that
+-- shows the current choice on its right side (makeRadioSubmenuItem).
+--
+-- Option fields:
+--   value               any        stored value the option represents
+--   label               string     entry text
+--   help_text           string?    long-press help for the entry
+--   enabled_func        function?  disables the entry
+--   separator           bool?      separator below the entry
+--   selected            function?  (current) -> bool; replaces the default
+--                                  `current == value` check, for options that
+--                                  stand for a group of values
+--   sub_item_table_func function?  opens a nested list instead of storing
+--                                  `value`; the entry stays a radio, checked
+--                                  while the option is selected
+
+-- Static option list, or one built lazily by a function.
+local function _resolveOptions(options)
+    if type(options) == "function" then return options() end
+    return options
+end
+
+local function _isSelected(option, current)
+    if option.selected then return option.selected(current) end
+    return option.value == current
+end
+
+-- Appends one radio entry per option to `items` and returns `items`.
+-- opts:
+--   options     table|function  option list, or a function building it when
+--                               the entries are needed (required)
+--   get         function()      current value (required)
+--   set         function(value) (required)
+--   refresh     function?       called after set()
+--   empty_text  string?         disabled entry shown when there are no options
+function M.appendRadioItems(items, opts)
+    local get, set, refresh = opts.get, opts.set, opts.refresh
+    local options = _resolveOptions(opts.options)
+    if #options == 0 and opts.empty_text then
+        items[#items + 1] = { text = opts.empty_text, enabled = false }
+        return items
+    end
+    for _i, option in ipairs(options) do
+        local item = {
+            text         = option.label,
+            help_text    = option.help_text,
+            enabled_func = option.enabled_func,
+            separator    = option.separator,
+            radio        = true,
+            checked_func = function() return _isSelected(option, get()) end,
+        }
+        if option.sub_item_table_func then
+            item.sub_item_table_func = option.sub_item_table_func
+        else
+            item.keep_menu_open = true
+            item.callback = function()
+                set(option.value)
+                if refresh then refresh() end
+            end
+        end
+        items[#items + 1] = item
+    end
+    return items
+end
+
+-- A row with a static label and the current choice shown as its right-side
+-- value, opening the radio list. Any settings-menu consumer with more than an
+-- on/off toggle (a style/type/color picker) can reuse this instead of
+-- hand-rolling its own sub_item_table_func.
 --
 -- The label never embeds the current choice (no "Type: X"); the choice is
 -- exposed only through value_func / mandatory_func.
 --
--- opts:
+-- opts: the appendRadioItems fields, plus
 --   text          string    static row label (ignored if text_func given)
 --   text_func     function? () -> string, overrides `text`
 --   help_text     string?   long-press help for the row
---   options       { { value = any, label = string }, ... }  (required,
---                 ordered — this order is also the menu order)
---   get           function() -> current value (required)
---   set           function(value)  (required)
---   refresh       function?  called after set()
---   enabled_func  function?  disables the whole row (e.g. "Color" greyed out
---                 while the parent "Type" is "None")
+--   current_label function? () -> string, the text shown for the current
+--                           choice. Required when `options` is a function or
+--                           a nested option stands for several values, so the
+--                           option list is not rebuilt on every render.
+--   enabled_func  function? disables the whole row (e.g. "Color" greyed out
+--                           while the parent "Type" is "None")
 --   separator     bool?
--- Both the row's value_func and mandatory_func show the current option's
--- label, matching the convention already used for "Long Press" above and
--- for Sort/native KOReader radio rows in general.
+-- Both value_func and mandatory_func show the current choice, matching the
+-- convention used for "Long Press" above and for native radio rows.
 function M.makeRadioSubmenuItem(opts)
-    local get     = opts.get
-    local set     = opts.set
-    local refresh = opts.refresh
-    local function _labelFor(v)
-        for _, o in ipairs(opts.options) do
-            if o.value == v then return o.label end
+    local get = opts.get
+    local function currentLabel()
+        if opts.current_label then return opts.current_label() or "" end
+        local current = get()
+        for _i, option in ipairs(_resolveOptions(opts.options)) do
+            if _isSelected(option, current) then return option.label end
         end
         return ""
     end
     return {
         text_func      = opts.text_func or function() return opts.text end,
-        value_func     = function() return _labelFor(get()) end,
-        mandatory_func = function() return _labelFor(get()) end,
+        value_func     = currentLabel,
+        mandatory_func = currentLabel,
         help_text      = opts.help_text,
         enabled_func   = opts.enabled_func,
         separator      = opts.separator,
-        sub_item_table_func = function()
-            local items = {}
-            for _, o in ipairs(opts.options) do
-                items[#items + 1] = {
-                    text           = o.label,
-                    radio          = true,
-                    checked_func   = function() return get() == o.value end,
-                    keep_menu_open = true,
-                    callback       = function()
-                        set(o.value)
-                        if refresh then refresh() end
-                    end,
-                }
-            end
-            return items
-        end,
+        sub_item_table_func = function() return M.appendRadioItems({}, opts) end,
+    }
+end
+
+-- Returns `stored` when it is one of `values`, otherwise `default`.
+-- Guards against unset or corrupted persisted enum values.
+function M.resolveChoice(stored, values, default)
+    for _i, allowed in ipairs(values) do
+        if allowed == stored then return stored end
+    end
+    return default
+end
+
+-- Reads the persisted enum under `key` and validates it with resolveChoice.
+function M.readChoice(key, values, default)
+    return M.resolveChoice(SUISettings:readSetting(key), values, default)
+end
+
+-- Horizontal alignment ids; the default set is left / center / right.
+local ALIGN_VALUES  = { "left", "center", "right" }
+local ALIGN_DEFAULT = "center"
+
+-- Persisted alignment under `key`. `values` and `default` fall back to
+-- left / center / right and "center".
+function M.getAlignment(key, values, default)
+    return M.readChoice(key, values or ALIGN_VALUES, default or ALIGN_DEFAULT)
+end
+
+-- Alignment picker row built on makeRadioSubmenuItem.
+-- opts:
+--   key           string    full settings key (required)
+--   values        string[]? ordered ids among left, center, right, justify
+--                           (default: left, center, right)
+--   default       string?   id used while nothing valid is stored (default: center)
+--   text          string?   row label (default: "Alignment")
+--   enabled_func  function? disables the row
+--   separator     bool?
+--   refresh       function? called after a change
+--   _lc           function? translator
+function M.makeAlignmentItem(opts)
+    local _lc = opts._lc or _
+    local labels = {
+        left    = _lc("Left"),
+        center  = _lc("Center"),
+        right   = _lc("Right"),
+        justify = _lc("Justified"),
+    }
+    local options = {}
+    for _i, id in ipairs(opts.values or ALIGN_VALUES) do
+        options[#options + 1] = { value = id, label = labels[id] }
+    end
+    return M.makeRadioSubmenuItem{
+        text         = opts.text or _lc("Alignment"),
+        enabled_func = opts.enabled_func,
+        separator    = opts.separator,
+        options      = options,
+        get          = function() return M.getAlignment(opts.key, opts.values, opts.default) end,
+        set          = function(v) SUISettings:saveSetting(opts.key, v) end,
+        refresh      = opts.refresh,
     }
 end
 
@@ -1769,6 +2174,213 @@ function M.makeLabelToggleItem(mod_id, refresh, _lc)
     }
 end
 
+function M.makeLabelPlacementItem(mod_id, refresh, _lc)
+    return {
+        text           = _lc("Label inside background"),
+        enabled_func   = function() return not M.isLabelHidden(mod_id) end,
+        checked_func   = function() return not M.isLabelOutside(mod_id) end,
+        keep_menu_open = true,
+        callback       = function()
+            SUISettings:set(_labelOutsideKey(mod_id),
+                not M.isLabelOutside(mod_id) and true or nil)
+            refresh()
+        end,
+    }
+end
+
+-- Turns an Arrange-screen item into a show/hide row. The eye icon reflects
+-- the current state and flips it in place; a hidden row is dimmed and keeps
+-- its position in the list.
+--   opts.is_visible   function() -> bool
+--   opts.set_visible  function(visible) -> false|nil   (false vetoes the change)
+--   opts.on_change    function|nil   runs after an accepted change
+--   opts.repaint      function       redraws the Arrange screen
+function M.applyVisibilityToggle(item, opts)
+    local function sync()
+        local visible = opts.is_visible()
+        item.dim_row     = not visible or nil
+        item.toggle_icon = visible and "show" or "hide"
+    end
+    item.on_toggle = function()
+        if opts.set_visible(not opts.is_visible()) == false then return end
+        sync()
+        if opts.on_change then opts.on_change() end
+        opts.repaint()
+    end
+    sync()
+    return item
+end
+
+-- A fixed set of items the user can hide and reorder. Returns a list with:
+--   list.rows()       menu rows: an entry opening the arrange screen (an eye
+--                     toggle per item in the SUI menu, a reorder-only
+--                     SortWidget in the classic menu) plus, in the classic
+--                     menu, one checklist row per item for visibility.
+--   list.arrange(ctx) pushes the arrange screen onto a SUI settings window.
+-- Options:
+--   opts.ids           default order of every item id
+--   opts.order_key     setting key holding the saved order
+--   opts.label         function(id) -> display text
+--   opts.is_visible    function(id) -> boolean
+--   opts.set_visible   function(id, visible)
+--   opts.refresh       function run after every change
+--   opts.ctx           menu context (is_sui, UIManager, SortWidget, translate)
+--   opts.title         title of the arrange screen (default "Items")
+--   opts.text          label of the classic row (default "Arrange")
+--   opts.toggle_label  function(id) -> classic checklist text (default: label)
+--   opts.empty_text    text shown when no item is visible
+--   opts.enabled_func  function() -> boolean (default: always enabled)
+--   opts.nested        { [id] = list }: tapping that item on the arrange
+--                      screen opens the arrange screen of another list
+--   opts.is_available  function(id) -> boolean: items reporting false are left
+--                      out of the menus and keep their slot in the saved order
+--   opts.anchors       { [id] = true }: fixed items that are always shown. They
+--                      can be moved but not hidden, and appear as a divider
+function M.makeOrderedItems(opts)
+    local ctx        = opts.ctx or {}
+    local _lc        = ctx._ or _
+    local title      = opts.title or _lc("Items")
+    local empty_text = opts.empty_text or _lc("No items selected.")
+    local enabled    = opts.enabled_func or function() return true end
+    local nested     = opts.nested or {}
+    local anchors    = opts.anchors or {}
+    local available  = opts.is_available or function() return true end
+
+    local function fullOrder()
+        return M.mergeOrder(SUISettings:readSetting(opts.order_key), opts.ids)
+    end
+
+    local function order()
+        local out = {}
+        for _i, id in ipairs(fullOrder()) do
+            if available(id) then out[#out + 1] = id end
+        end
+        return out
+    end
+
+    local function visibleIds()
+        local out = {}
+        for _i, id in ipairs(order()) do
+            if not anchors[id] and opts.is_visible(id) then out[#out + 1] = id end
+        end
+        return out
+    end
+
+    -- Sort entries in saved order; `decorate(entry, id)` may extend each one.
+    local function sortItems(decorate)
+        local items = {}
+        for _i, id in ipairs(order()) do
+            local entry = { text = opts.label(id), orig_item = id }
+            if anchors[id] then
+                entry.text       = entry.text:upper()
+                entry.is_divider = true
+            elseif decorate then
+                entry = decorate(entry, id)
+            end
+            items[#items + 1] = entry
+        end
+        return items
+    end
+
+    -- Saves the arranged available items; the others keep their slot.
+    local function saveOrder(items)
+        local arranged, n, ids = {}, 0, {}
+        for _i, it in ipairs(items) do arranged[#arranged + 1] = it.orig_item end
+        for _i, id in ipairs(fullOrder()) do
+            if available(id) then
+                n = n + 1
+                ids[#ids + 1] = arranged[n]
+            else
+                ids[#ids + 1] = id
+            end
+        end
+        SUISettings:saveSetting(opts.order_key, ids)
+        opts.refresh()
+    end
+
+    local list = {}
+
+    function list.arrange(ctx2)
+        ctx2.push("arrange", {
+            title      = title,
+            items      = sortItems(function(entry, id)
+                M.applyVisibilityToggle(entry, {
+                    is_visible  = function() return opts.is_visible(id) end,
+                    set_visible = function(visible) opts.set_visible(id, visible) end,
+                    on_change   = opts.refresh,
+                    repaint     = ctx2.repaint,
+                })
+                local child = nested[id]
+                if child then
+                    entry.show_chevron = true
+                    entry.on_tap       = function() child.arrange(ctx2) end
+                end
+                return entry
+            end),
+            empty_text = empty_text,
+            on_change  = saveOrder,
+        })
+    end
+
+    function list.rows()
+        local row = {
+            text           = opts.text or _lc("Arrange"),
+            keep_menu_open = true,
+            enabled_func   = enabled,
+            callback       = function()
+                local items = sortItems()
+                if #items < 2 then return end
+                local SortWidget = ctx.SortWidget or require("ui/widget/sortwidget")
+                local uim        = ctx.UIManager or require("ui/uimanager")
+                uim:show(SortWidget:new{
+                    title             = title,
+                    item_table        = items,
+                    covers_fullscreen = true,
+                    callback          = function() saveOrder(items) end,
+                })
+            end,
+            sui_build = ctx.is_sui and function(ctx2, _item)
+                local SUIWindow = require("engines/sui_window")
+                return SUIWindow.ListRow{
+                    title        = title,
+                    subtitle     = function()
+                        local names = {}
+                        for _i, id in ipairs(visibleIds()) do names[#names + 1] = opts.label(id) end
+                        return #names > 0 and table.concat(names, "  ·  ") or empty_text
+                    end,
+                    inner_w      = ctx2.inner_w,
+                    item_count   = function() return #visibleIds() end,
+                    enabled      = enabled(),
+                    show_chevron = true,
+                    on_tap       = function() list.arrange(ctx2) end,
+                }
+            end or nil,
+        }
+
+        local rows = { row }
+        if not ctx.is_sui then
+            local toggle_label = opts.toggle_label or opts.label
+            for _i, id in ipairs(opts.ids) do
+                if available(id) and not anchors[id] then
+                    rows[#rows + 1] = {
+                        text           = toggle_label(id),
+                        checked_func   = function() return opts.is_visible(id) end,
+                        enabled_func   = enabled,
+                        keep_menu_open = true,
+                        callback       = function()
+                            opts.set_visible(id, not opts.is_visible(id))
+                            opts.refresh()
+                        end,
+                    }
+                end
+            end
+        end
+        return rows
+    end
+
+    return list
+end
+
 -- ===========================================================================
 -- 6. Cover Management & Caching
 -- ===========================================================================
@@ -1779,20 +2391,47 @@ M._cover_extract_pending = {}
 M._cover_extract_specs   = {}
 
 local _BookInfoManager = nil
+local _bbBytes = Memory.bbBytes
 
--- Makes the book info store drop this module's cached cover state for a book
--- whenever it forgets that book (cover or metadata changes, manual refresh).
--- Wrapped from the store's original method, so repeated calls never stack.
-local function _hookBookInfoDeletion(bim)
-    local orig = bim._sui_orig_deleteBookInfo or bim.deleteBookInfo
-    if type(orig) ~= "function" then return bim end
-    bim._sui_orig_deleteBookInfo = orig
-    bim.deleteBookInfo = function(self, filepath)
-        if filepath then M.dropCoverCaches(filepath) end
-        return orig(self, filepath)
+-- Listeners told when a book's record in the book info store changes:
+-- fn(filepath, method, ...), where `...` are the arguments the method was
+-- called with. Records written by background extraction happen in a separate
+-- process and are not reported.
+local _bookinfo_listeners = {}
+
+function M.onBookInfoChanged(fn)
+    _bookinfo_listeners[#_bookinfo_listeners + 1] = fn
+end
+
+local _BOOKINFO_MUTATORS = { "deleteBookInfo", "setBookInfoProperties", "extractBookInfo" }
+
+-- Wraps the store's methods that change a book's record so that listeners
+-- hear about it before the change is applied. Wrapped from the original
+-- methods, so repeated calls never stack.
+local function _hookBookInfoChanges(bim)
+    for _, name in ipairs(_BOOKINFO_MUTATORS) do
+        local orig = bim["_sui_orig_" .. name] or bim[name]
+        if type(orig) == "function" then
+            bim["_sui_orig_" .. name] = orig
+            bim[name] = function(self, filepath, ...)
+                if filepath then
+                    for _, fn in ipairs(_bookinfo_listeners) do fn(filepath, name, ...) end
+                end
+                return orig(self, filepath, ...)
+            end
+        end
     end
     return bim
 end
+
+-- The store forgetting a book (cover or metadata changes, manual refresh), or
+-- the cover being ignored or restored, invalidates the cover state cached here.
+M.onBookInfoChanged(function(filepath, method, props)
+    if method == "deleteBookInfo"
+            or (method == "setBookInfoProperties" and props and props.ignore_cover ~= nil) then
+        M.dropCoverCaches(filepath)
+    end
+end)
 
 function M.getBookInfoManager()
     if _BookInfoManager then return _BookInfoManager end
@@ -1801,7 +2440,7 @@ function M.getBookInfoManager()
         ok, bim = pcall(require, "plugins/coverbrowser.koplugin/bookinfomanager")
     end
     if ok and bim and type(bim) == "table" and bim.getBookInfo then
-        _BookInfoManager = _hookBookInfoDeletion(bim)
+        _BookInfoManager = _hookBookInfoChanges(bim)
         return _BookInfoManager
     end
     return nil
@@ -1818,8 +2457,7 @@ end
 -- very different sizes. Entries here are just filepath strings — tiny and
 -- roughly uniform — so a simple count cap is the right unit.
 local _NO_COVER_MAX_ENTRIES = 2000
-local _no_cover_probe = {}   -- filepath -> true
-local _no_cover_order = {}   -- filepaths, oldest at front, MRU at back
+local _no_cover = LRU.new{ max_entries = _NO_COVER_MAX_ENTRIES }   -- filepath -> true
 local _RenderImage = nil
 local _lfs_cover   = nil  -- lazy-loaded lfs for filepath validation
 
@@ -1832,43 +2470,17 @@ local function _lfsMode(fp)
     return _lfs_cover.attributes(fp, "mode")
 end
 
--- Resident byte size of a cached cover bb. stride * height is the true RAM
--- footprint of the underlying C allocation (including row padding), and it
--- scales correctly with bit depth (1 B/px grayscale e-ink vs 4 B/px RGB32)
--- without this cache needing to know the device/panel type.
-local function _bbBytes(bb)
-    if not bb then return 0 end
-    local ok, n = pcall(function()
-        local h = (bb.getHeight and bb:getHeight()) or tonumber(bb.h) or 0
-        local stride = tonumber(bb.stride)
-        if stride and h > 0 then return stride * h end
-        local w   = (bb.getWidth and bb:getWidth()) or 0
-        local bpp = (bb.getBpp and bb:getBpp()) or 8
-        return w * h * math.ceil(bpp / 8)
-    end)
-    return (ok and n) or 0
-end
-
 -- isCoverMissing(filepath) is queried from both cover APIs below on every
 -- request, so it must be a plain, correct membership test.
-function M.isCoverMissing(filepath) return _no_cover_probe[filepath] == true end
+function M.isCoverMissing(filepath) return _no_cover:has(filepath) end
 
 local function _markNoCover(filepath)
-    if _no_cover_probe[filepath] then return end
-    _no_cover_probe[filepath] = true
-    _no_cover_order[#_no_cover_order + 1] = filepath
-    if #_no_cover_order > _NO_COVER_MAX_ENTRIES then
-        local oldest = table.remove(_no_cover_order, 1)
-        _no_cover_probe[oldest] = nil
-    end
+    if _no_cover:has(filepath) then return end
+    _no_cover:put(filepath, true)
 end
 
 local function _unmarkNoCover(filepath)
-    if not _no_cover_probe[filepath] then return end
-    _no_cover_probe[filepath] = nil
-    for i, k in ipairs(_no_cover_order) do
-        if k == filepath then table.remove(_no_cover_order, i); break end
-    end
+    _no_cover:remove(filepath)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1899,29 +2511,13 @@ end
 -- visible in several crop-shaped slots only pays that decode/downscale
 -- once per session, not once per slot.
 -- ---------------------------------------------------------------------------
-local _REF_MAX_DIM     = 480               -- long-side cap in px; plenty for any on-screen slot
-local _REF_BYTE_BUDGET = 4 * 1024 * 1024   -- small: bounded per-entry size, few concurrent books need it
-local _bim_ref_cache = {}   -- filepath -> { bb, bytes }
-local _bim_ref_order = {}   -- filepaths, oldest at front, MRU at back
-local _bim_ref_bytes = 0
+local _REF_MAX_DIM = 480   -- long-side cap in px; plenty for any on-screen slot
 
-local function _removeRefOrderKey(key)
-    for i, k in ipairs(_bim_ref_order) do
-        if k == key then table.remove(_bim_ref_order, i); return end
-    end
-end
-
-local function _evictRefIfNeeded()
-    while #_bim_ref_order > 1 and _bim_ref_bytes > _REF_BYTE_BUDGET do
-        local key = table.remove(_bim_ref_order, 1)
-        local entry = _bim_ref_cache[key]
-        _bim_ref_cache[key] = nil
-        if entry then
-            _bim_ref_bytes = _bim_ref_bytes - (entry.bytes or 0)
-            if _bim_ref_bytes < 0 then _bim_ref_bytes = 0 end
-        end
-    end
-end
+-- filepath -> reference bb. Small budget: bounded per-entry size, few
+-- concurrent books need it. A reference bb can be handed back to a caller
+-- when it cannot be scaled further, so evicted entries are dereferenced, not
+-- freed.
+local _ref_cache = LRU.new{ max_bytes = Memory.budgets().ref }
 
 local function _ensureRenderImage()
     if not _RenderImage then
@@ -1931,23 +2527,13 @@ local function _ensureRenderImage()
     return _RenderImage
 end
 
--- Returns the cached reference bb for `filepath` (refreshing its LRU
--- position), or nil on a miss.
-local function _cachedRefCoverBB(filepath)
-    local cached = _bim_ref_cache[filepath]
-    if not cached then return nil end
-    _removeRefOrderKey(filepath)
-    _bim_ref_order[#_bim_ref_order + 1] = filepath
-    return cached.bb
-end
-
 -- Returns a bb that's safe to use as _scaleBBToSlot's source for `filepath`:
 -- the raw bb itself when it's already small (no point caching a second copy
 -- no bigger than the reference would be), or a cached downscaled copy
 -- otherwise. Never crops -- only ever a uniform scale-to-fit within
 -- _REF_MAX_DIM -- so the result stays a valid source for ANY target shape.
 local function _getRefCoverBB(filepath, raw_bb)
-    local cached = _cachedRefCoverBB(filepath)
+    local cached = _ref_cache:get(filepath)
     if cached then return cached end
 
     local src_w, src_h = raw_bb:getWidth(), raw_bb:getHeight()
@@ -1974,12 +2560,7 @@ local function _getRefCoverBB(filepath, raw_bb)
     if ref_bb ~= cp_bb then pcall(cp_bb.free, cp_bb) end
     if not (ok_sc and ref_bb) then return raw_bb end
 
-    local nbytes = _bbBytes(ref_bb)
-    _bim_ref_cache[filepath] = { bb = ref_bb, bytes = nbytes }
-    _bim_ref_order[#_bim_ref_order + 1] = filepath
-    _bim_ref_bytes = _bim_ref_bytes + nbytes
-    _evictRefIfNeeded()
-    return ref_bb
+    return _ref_cache:put(filepath, ref_bb, _bbBytes(ref_bb))
 end
 
 local function _scaleBBToSlot(bb, target_w, target_h, align)
@@ -2112,16 +2693,32 @@ local function _coverTooSmall(bim, bookinfo, w, h)
     }) and true or false
 end
 
--- Drop stretch + ref entries so a later put after re-extract can install the
+-- Cropped slot cache: the result of cropping a book's reference cover to one
+-- slot shape (width, height, alignment). Slots are small, so a few MiB hold
+-- every visible peek and Quad quadrant. Entries are shared with live
+-- ImageWidgets (image_disposable = false), so evicting only drops the
+-- reference and never frees the buffer. Scoped by file path, so one call
+-- drops every slot of a book.
+local _crop_cache = LRU.new{ max_bytes = Memory.budgets().crop }
+
+local function _cropSlotKey(w, h, align)
+    return w .. "x" .. h .. (align or "")
+end
+
+local function _cropGet(filepath, slot_key)
+    return _crop_cache:get(slot_key, filepath)
+end
+
+local function _cropPut(filepath, slot_key, bb)
+    _crop_cache:put(slot_key, bb, _bbBytes(bb), filepath)
+end
+
+-- Drop stretch, crop and ref entries so a later put after re-extract can install the
 -- higher-quality bb (prefer-larger alone keeps same pixel-count upscales).
 local function _dropLocalCoverCaches(filepath)
     SUICoverCache:drop(filepath)
-    local entry = _bim_ref_cache[filepath]
-    if not entry then return end
-    _removeRefOrderKey(filepath)
-    _bim_ref_cache[filepath] = nil
-    _bim_ref_bytes = _bim_ref_bytes - (entry.bytes or 0)
-    if _bim_ref_bytes < 0 then _bim_ref_bytes = 0 end
+    _crop_cache:removeScope(filepath)
+    _ref_cache:remove(filepath)
 end
 
 -- Forgets all locally cached cover state for one book (stretched bitmap,
@@ -2161,6 +2758,12 @@ local function _stretchBBToSize(raw_bb, target_w, target_h)
     return stretched_bb
 end
 
+-- Stretches `bb` to exactly w x h, aspect not preserved, for consumers that
+-- reshape a cover themselves. Returns a new buffer owned by the caller, or
+-- `bb` itself when it could not be scaled; callers free the result only when
+-- it differs from `bb`.
+M.stretchBBToSize = _stretchBBToSize
+
 -- Decodes the cover bitmap held by the book info store. The decode is
 -- comparatively expensive, so callers first validate through metadata-only
 -- lookups and call this only when no local cache entry can serve the request.
@@ -2185,6 +2788,12 @@ local function _getCoverInfo(bim, filepath, w, h)
     return nil
 end
 
+-- True when the record holds a cover that may be shown: the book has one and
+-- the user has not chosen to ignore it.
+local function _hasShowableCover(bookinfo)
+    return bookinfo.has_cover and not bookinfo.ignore_cover
+end
+
 function M.getStretchedCoverBB(filepath, w, h)
     if M.isCoverMissing(filepath) then return nil end
 
@@ -2195,7 +2804,7 @@ function M.getStretchedCoverBB(filepath, w, h)
     if not bim then return nil end
     local bookinfo = _getCoverInfo(bim, filepath, w, h)
     if not bookinfo then return nil end
-    if not bookinfo.has_cover then return _noCover(filepath) end
+    if not _hasShowableCover(bookinfo) then return _noCover(filepath) end
 
     -- Undersized book info thumbnail: serve a stretched placeholder and
     -- re-extract larger. Local caches are dropped so the upgraded bitmap can
@@ -2223,6 +2832,12 @@ function M.getStretchedCoverBB(filepath, w, h)
     return SUICoverCache:put(filepath, _stretchBBToSize(raw_bb, w, h))
 end
 
+-- Revision of the stretched cover cached for `filepath`: stable while the
+-- cover is only enlarged, different once another cover replaces it.
+function M.getCoverRevision(filepath)
+    return SUICoverCache:revision(filepath)
+end
+
 function M.getCroppedCoverBB(filepath, w, h, align)
     if M.isCoverMissing(filepath) then return nil end
 
@@ -2232,7 +2847,7 @@ function M.getCroppedCoverBB(filepath, w, h, align)
     if not bim then return nil end
     local bookinfo = _getCoverInfo(bim, filepath, w, h)
     if not bookinfo then return nil end
-    if not bookinfo.has_cover then return _noCover(filepath) end
+    if not _hasShowableCover(bookinfo) then return _noCover(filepath) end
 
     if _coverTooSmall(bim, bookinfo, w, h) then
         _dropLocalCoverCaches(filepath)
@@ -2244,47 +2859,33 @@ function M.getCroppedCoverBB(filepath, w, h, align)
     end
 
     M._cover_extract_pending[filepath] = nil
-    -- Shared uncropped ref; crop fresh so callers can differ on align.
-    local ref_bb = _cachedRefCoverBB(filepath)
+    local slot_key = _cropSlotKey(w, h, align)
+    local cropped = _cropGet(filepath, slot_key)
+    if cropped then return cropped end
+
+    -- Shared uncropped ref; each slot shape is cropped from it once.
+    local ref_bb = _ref_cache:get(filepath)
     if not ref_bb then
         local raw_bb = _loadCoverBB(bim, filepath)
         if not raw_bb then return _noCover(filepath) end
         ref_bb = _getRefCoverBB(filepath, raw_bb)
     end
-    return _scaleBBToSlot(ref_bb, w, h, align)
+    cropped = _scaleBBToSlot(ref_bb, w, h, align)
+    -- _scaleBBToSlot hands back its source when it cannot scale; that buffer
+    -- belongs to the reference cache and must not be cached here.
+    if cropped and cropped ~= ref_bb then _cropPut(filepath, slot_key, cropped) end
+    return cropped
 end
 
 function M.clearCoverCache()
-    -- Stretch-only cache (infra/sui_cover_cache.lua) — cheap, unconditional:
-    -- clear()'s own contract is already "drop references, don't free()"
-    -- (see that module), so no deferred-sweep coordination is needed here.
+    -- Every cover cache drops its references and reports the released bytes
+    -- to infra/sui_memory.lua; widgets may still hold some of these buffers,
+    -- so none is freed explicitly.
     SUICoverCache:clear()
-
-    -- No-cover probes hold no bb payload (just filepath markers) — nothing
-    -- to free, reset synchronously.
-    _no_cover_probe = {}
-    _no_cover_order = {}
-
-    -- Reference cover cache (backs Config.getCroppedCoverBB) is the only
-    -- remaining table here that holds real blitbuffers. It's never handed
-    -- to any ImageWidget outside this module (see _getRefCoverBB) — it only
-    -- ever serves as _scaleBBToSlot's source, and that call already
-    -- copies/crops the pixels it needs before returning, so nothing outside
-    -- holds a reference to these entries. Safe to free on a deferred sweep.
-    if next(_bim_ref_cache) == nil then return end
-
-    local to_free = _bim_ref_cache
-    _bim_ref_cache = {}; _bim_ref_order = {}; _bim_ref_bytes = 0
+    _crop_cache:clear()
+    _ref_cache:clear()
+    _no_cover:clear()
     _RenderImage = nil
-
-    local UIManager = require("ui/uimanager")
-    local function freeNext()
-        local k, entry = next(to_free)
-        if not k then return end
-        pcall(function() entry.bb:free() end); to_free[k] = nil
-        if next(to_free) then UIManager:scheduleIn(0.1, freeNext) end
-    end
-    UIManager:scheduleIn(0.1, freeNext)
 end
 
 function M.flushCoverQueue()
@@ -2386,6 +2987,23 @@ function M.checkpointStatsDB()
     end)
 end
 
+-- Cheap change token for the statistics database: size and mtime of the main
+-- file and its WAL. Returns nil when the database cannot be inspected or was
+-- written within the last two seconds — mtime has one-second resolution, so
+-- an unchanged token that fresh could still hide a later write.
+function M.getStatsDbStamp()
+    if not _ensureSqlite() then return nil end
+    local path = M.getStatsDbPath()
+    local main = _lfs_mod.attributes(path)
+    if not main then return nil end
+    local wal      = _lfs_mod.attributes(path .. "-wal")
+    local newest   = math.max(main.modification, wal and wal.modification or 0)
+    if os.time() - newest < 2 then return nil end
+    return string.format("%d:%d|%d:%d",
+        main.size, main.modification,
+        wal and wal.size or 0, wal and wal.modification or 0)
+end
+
 function M.beginStatsSyncGuard()
     _stats_sync_guard = true
 end
@@ -2473,6 +3091,7 @@ end
 
 -- Navpager
 function M.isNavpagerEnabled() return SUISettings:isTrue("simpleui_bar_navpager_enabled") end
+
 function M.isDotPagerEnabled() return SUISettings:nilOrTrue("simpleui_bar_dotpager_always") end
 function M.effectiveMaxTabs() return M.isNavpagerEnabled() and M.MAX_TABS_NAVPAGER or M.MAX_TABS end
 
@@ -2599,6 +3218,13 @@ function M.applyFirstRunDefaults()
     -- wallpaper
     def("simpleui_style_wallpaper_opacity", 85)
     
+
+    -- UI font: installs that never picked a font start with the bundled family.
+    if SUISettings:get(SUIFonts.KEY_ENABLED) == nil then
+        SUISettings:set(SUIFonts.KEY_ENABLED, true)
+        SUISettings:set(SUIFonts.KEY_NAME, SUIFonts.FAMILY)
+    end
+
     -- Navbar
     def("simpleui_bar_enabled", false)
     def("simpleui_topbar_enabled", true)
@@ -2647,6 +3273,7 @@ function M.applyFirstRunDefaults()
     def(PFX .. "currently_show_title",         true)
     def(PFX .. "currently_show_author",        true)
     def(PFX .. "currently_show_progress",      true)
+    def(PFX .. "currently_show_stats",         true)
     def(PFX .. "currently_show_percent",       false)
     def(PFX .. "currently_show_book_days",     true)
     def(PFX .. "currently_show_book_time",     true)
@@ -2655,6 +3282,9 @@ function M.applyFirstRunDefaults()
     def(PFX .. "currently_show_description",   true)
     def(PFX .. "currently_bar_style",           "with_pct")
     def(PFX .. "currently_stats_style",         "compact")
+    def(PFX .. "currently_stats_icon",          true)
+    -- Module labels: classic by default (Style ▸ Module Labels).
+    def(PFX .. "section_label_caps",            false)
     def(PFX .. "coverdeck_show_title",          true)
     def(PFX .. "coverdeck_show_author",         false)
     def(PFX .. "coverdeck_show_progress",       true)
@@ -2662,7 +3292,7 @@ function M.applyFirstRunDefaults()
     def(PFX .. "coverdeck_show_book_days",      false)
     def(PFX .. "coverdeck_show_book_time",      false)
     def(PFX .. "coverdeck_show_book_remaining", false)
-    def(PFX .. "coverdeck_show_stats",          true)  -- was previously undefaulted; relied silently on nilOrTrue's true fallback
+    def(PFX .. "coverdeck_show_stats",          true)
     def(PFX .. "recent_show_finished",          true)
 
     -- Updater
@@ -2689,9 +3319,11 @@ function M.applyFirstRunDefaults()
     -- Folder covers / browse meta
     def("simpleui_fc_enabled",          false)
     def("simpleui_fc_folder_style",     "auto")
+    def("simpleui_style_folder_type",   "auto")
     def("simpleui_fc_cover_mode",       "2_3")
     def("simpleui_fc_subfolder_cover",  true)
     def("simpleui_browsemeta_enabled",  true)
+    def("simpleui_browsemeta_show_empty", false)
 
     -- Titlebar: search visible, browse visible left of menu
     def("simpleui_tb_item_fm_search", true)
@@ -2710,8 +3342,11 @@ function M.applyFirstRunDefaults()
     def("simpleui_qs_bar_frontlight",       false)
     def("simpleui_qs_bar_warmth",           false)
     def("simpleui_qs_bar_shape",            "round")
-    def("simpleui_qs_bar_bg",              "flat")
     def("simpleui_qs_bar_settings_on_hold", true)
+    def("simpleui_qs_bar_open_reader",      true)
+    def("simpleui_qs_bar_open_fm",          true)
+    def("simpleui_qs_bar_reader_layout",    "book")
+    def("simpleui_qs_bar_slider_style",     "bar")
     def("simpleui_qs_bar_slots",            { "wifi_toggle", "bookmark_browser", "frontlight", "night_mode", "power", "sui_settings" })
 
     SUISettings:flush()
@@ -2724,8 +3359,8 @@ end
 function M.applyFirstRunLibraryDefaults()
     if SUISettings:get("simpleui_library_defaults_applied") ~= nil then return end
     SUISettings:set("simpleui_library_defaults_applied", true)
-    SUISettings:set("simpleui_fc_show_title_strip",  true)
-    SUISettings:set("simpleui_fc_show_author_strip", true)
+    SUISettings:set("simpleui_fc_captions_show",    true)
+    SUISettings:set("simpleui_fc_captions_content", "title_author")
     SUISettings:flush()
 
     local bim = M.getBookInfoManager()

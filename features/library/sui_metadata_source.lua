@@ -24,14 +24,17 @@
 --   MetadataSource.getMatchingFiles(bim, base_dir, filter_state)
 --       -> { {fullpath, filename, title=, authors=, series=, series_key=,
 --             series_index=, keywords=}, ... }  sorted by directory, filename
---   MetadataSource.getFacetValues(bim, base_dir, dimension, filter_state)
---       -> { {value, count, key=, _first=row}, ... } sorted for display
+--   MetadataSource.getFacetValues(bim, base_dir, dimension, filter_state, include_empty)
+--       -> { {value, count, key=, _first=row}, ... } sorted for display;
+--          the "no value" group (key == false) is only listed when
+--          include_empty is truthy
 --   MetadataSource.getValidRows(bim, base_dir, filter_state, variant, accept)
 --       -> rows matching the trail for which accept(row) is true (cached,
 --          read-only; `variant` identifies what accept depends on)
 --   MetadataSource.getValidFacetCounts(bim, base_dir, dimension, filter_state, variant, accept)
---       -> counts, reprs: per facet key, the number of accepted rows and the
---          path of the first one (cached, read-only)
+--       -> counts, firsts: per facet key, the number of accepted rows and the
+--          paths of the first MetadataSource.FIRST_PATHS of them (cached,
+--          read-only)
 --   MetadataSource.getFolderSeries(bim, dir)
 --       -> { [filename] = {series=, series_index=}, ... } | nil
 --   MetadataSource.sortFiles(files, active_dimension)  -- mutates in place
@@ -39,6 +42,7 @@
 
 local logger      = require("logger")
 local ffiUtil     = require("ffi/util")
+local LRU         = require("infra/sui_lru")
 local FilterState = require("features/library/sui_filter_state")
 local BimStamp    = require("features/library/sui_bim_stamp")
 
@@ -48,12 +52,26 @@ local MetadataSource = {}
 -- Caches
 -- ---------------------------------------------------------------------------
 
-local _scope_rows_cache     = {} -- [base_dir]  = resolved rows for the whole subtree
-local _matching_files_cache = {} -- [cache_key] = rows matching a trail
-local _facet_values_cache   = {} -- [cache_key .. "\31" .. dimension] = { {value, count, key=, _first=row}, ... }
-local _calibre_index_cache  = {} -- [base_dir]  = index table | false
-local _valid_rows_cache     = {} -- [cache_key .. "\29" .. variant] = rows accepted by the caller
-local _valid_facets_cache   = {} -- [cache_key .. "\31" .. dimension .. "\29" .. variant] = { counts, reprs }
+-- Folders whose whole-subtree data is kept at once: the rows of a large
+-- library are the biggest item here, and browsing rarely spans more folders.
+local MAX_BASE_DIRS = 4
+-- Per-trail results kept at once. They only hold references to the shared
+-- rows, so a few dozen entries stay small while covering a long drill-down.
+local MAX_DERIVED_ENTRIES = 24
+
+-- Keyed by normalized base_dir:
+local _scope_rows_cache     = LRU.new{ max_entries = MAX_BASE_DIRS }  -- resolved rows for the whole subtree
+local _calibre_index_cache  = LRU.new{ max_entries = MAX_BASE_DIRS }  -- index table | false
+-- Scoped by normalized base_dir, keyed by the serialized trail plus a suffix:
+local _matching_files_cache = LRU.new{ max_entries = MAX_DERIVED_ENTRIES } -- [trail] = rows matching it
+local _facet_values_cache   = LRU.new{ max_entries = MAX_DERIVED_ENTRIES } -- [trail .. "\31" .. dimension] = { {value, count, key=, _first=row}, ... }
+local _valid_rows_cache     = LRU.new{ max_entries = MAX_DERIVED_ENTRIES } -- [trail .. "\29" .. variant] = rows accepted by the caller
+local _valid_facets_cache   = LRU.new{ max_entries = MAX_DERIVED_ENTRIES } -- [trail .. "\31" .. dimension .. "\29" .. variant] = { counts, reprs }
+
+local _all_caches = {
+    _scope_rows_cache, _calibre_index_cache, _matching_files_cache,
+    _facet_values_cache, _valid_rows_cache, _valid_facets_cache,
+}
 
 local function normalizeBaseDir(dir)
     while #dir > 1 and dir:sub(-1) == "/" do dir = dir:sub(1, -2) end
@@ -69,21 +87,8 @@ local function serializeTrail(filter_state)
     return table.concat(parts, "\31")
 end
 
--- Every cache key starts with its base_dir, terminated by "\30" when a trail
--- or dimension follows.
-local function cacheKey(base_dir, filter_state)
-    return normalizeBaseDir(base_dir) .. "\30" .. serializeTrail(filter_state)
-end
-
 local function isWithin(base_dir, prefix)
     return base_dir == prefix or base_dir:sub(1, #prefix + 1) == prefix .. "/"
-end
-
--- Drops every entry of `cache` whose base_dir is `prefix` or below it.
-local function evictWithin(cache, prefix)
-    for key in pairs(cache) do
-        if isWithin(key:match("^[^\30]*"), prefix) then cache[key] = nil end
-    end
 end
 
 -- Clears every cache entry whose base_dir is `base_dir` or a subdirectory
@@ -91,20 +96,12 @@ end
 -- it). base_dir == nil clears everything.
 function MetadataSource.clearCache(base_dir)
     if not base_dir then
-        for _, cache in ipairs({ _scope_rows_cache, _matching_files_cache,
-                                 _facet_values_cache, _valid_rows_cache,
-                                 _valid_facets_cache, _calibre_index_cache }) do
-            for key in pairs(cache) do cache[key] = nil end
-        end
+        for _, cache in ipairs(_all_caches) do cache:clear() end
         return
     end
     local prefix = normalizeBaseDir(base_dir)
-    evictWithin(_scope_rows_cache, prefix)
-    evictWithin(_matching_files_cache, prefix)
-    evictWithin(_facet_values_cache, prefix)
-    evictWithin(_valid_rows_cache, prefix)
-    evictWithin(_valid_facets_cache, prefix)
-    _calibre_index_cache[prefix] = nil
+    local function belowPrefix(key, scope) return isWithin(scope or key, prefix) end
+    for _, cache in ipairs(_all_caches) do cache:removeWhere(belowPrefix) end
 end
 
 -- Stamp of the book-info database the caches were filled from.
@@ -128,12 +125,12 @@ end
 -- series, series_index, keywords}, ... }. Returns false when none exists.
 -- Cached for the session (per base_dir actually queried).
 local function loadCalibreIndex(dir)
-    local cached = _calibre_index_cache[dir]
+    local cached = _calibre_index_cache:get(dir)
     if cached ~= nil then return cached end
 
     local ok_cm, CalibreMetadata = pcall(require, "metadata")
     if not ok_cm or not CalibreMetadata or type(CalibreMetadata.loadBookList) ~= "function" then
-        _calibre_index_cache[dir] = false
+        _calibre_index_cache:put(dir, false)
         return false
     end
 
@@ -144,7 +141,7 @@ local function loadCalibreIndex(dir)
     local ok_init, result = pcall(function() return cm:init(dir, true) end)
     if not ok_init or not result then
         cm:clean()
-        _calibre_index_cache[dir] = false
+        _calibre_index_cache:put(dir, false)
         return false
     end
 
@@ -174,12 +171,9 @@ local function loadCalibreIndex(dir)
     end
     cm:clean()
 
-    if next(index) then
-        _calibre_index_cache[dir] = index
-        return index
-    end
-    _calibre_index_cache[dir] = false
-    return false
+    index = next(index) and index or false
+    _calibre_index_cache:put(dir, index)
+    return index
 end
 
 -- ---------------------------------------------------------------------------
@@ -306,10 +300,9 @@ end
 
 local function getScopeRows(bim, base_dir)
     base_dir = normalizeBaseDir(base_dir)
-    local rows = _scope_rows_cache[base_dir]
+    local rows = _scope_rows_cache:get(base_dir)
     if not rows then
-        rows = fetchScopeRows(bim, base_dir)
-        _scope_rows_cache[base_dir] = rows
+        rows = _scope_rows_cache:put(base_dir, fetchScopeRows(bim, base_dir))
     end
     return rows
 end
@@ -323,8 +316,9 @@ end
 -- The cached rows matching the trail. Internal: the array is shared, so
 -- callers must not mutate it.
 local function matchingRows(bim, base_dir, filter_state)
-    local key = cacheKey(base_dir, filter_state)
-    local cached = _matching_files_cache[key]
+    base_dir = normalizeBaseDir(base_dir)
+    local trail_key = serializeTrail(filter_state)
+    local cached = _matching_files_cache:get(trail_key, base_dir)
     if cached then return cached end
 
     local rows = getScopeRows(bim, base_dir)
@@ -337,8 +331,7 @@ local function matchingRows(bim, base_dir, filter_state)
         end
         rows = filtered
     end
-    _matching_files_cache[key] = rows
-    return rows
+    return _matching_files_cache:put(trail_key, rows, 0, base_dir)
 end
 
 -- Returns a COPY of the (internally cached) matching-files array. Callers
@@ -371,7 +364,7 @@ end
 -- sort) — cheap for a single call, but this function is called on every
 -- author/series/tags tab switch, so without memoization it re-pays that
 -- cost every time even when the matching rows are a cache hit. Cached under
--- the same key scheme as _matching_files_cache, with the dimension appended,
+-- the same coordinates as _matching_files_cache, with the dimension appended,
 -- and invalidated by the same MetadataSource.clearCache(base_dir).
 --
 -- Values are grouped by their comparison key; the entry displays the
@@ -398,21 +391,27 @@ local function computeFacetValues(rows, definition)
     return out
 end
 
-function MetadataSource.getFacetValues(bim, base_dir, dimension, filter_state)
+function MetadataSource.getFacetValues(bim, base_dir, dimension, filter_state, include_empty)
     if not FilterState.isDimension(dimension) then return {} end
     syncWithDatabase()
 
-    local key = cacheKey(base_dir, filter_state) .. "\31" .. dimension
-    local cached = _facet_values_cache[key]
+    local scope = normalizeBaseDir(base_dir)
+    local key = serializeTrail(filter_state) .. "\31" .. dimension
+    local cached = _facet_values_cache:get(key, scope)
     if not cached then
-        cached = computeFacetValues(matchingRows(bim, base_dir, filter_state),
-                                    FilterState.DIMENSIONS[dimension])
-        _facet_values_cache[key] = cached
+        cached = _facet_values_cache:put(key, computeFacetValues(
+            matchingRows(bim, base_dir, filter_state), FilterState.DIMENSIONS[dimension]), 0, scope)
     end
     -- Return a shallow copy: cheap (copies entry refs, not rows), and keeps
     -- callers free to sort/mutate what they receive without corrupting the
-    -- cache — same contract as getMatchingFiles.
-    return copyArray(cached)
+    -- cache — same contract as getMatchingFiles. The cache always holds the
+    -- full list; the "no value" group is dropped from the copy only.
+    if include_empty then return copyArray(cached) end
+    local values = {}
+    for i = 1, #cached do
+        if cached[i].key ~= false then values[#values + 1] = cached[i] end
+    end
+    return values
 end
 
 -- ---------------------------------------------------------------------------
@@ -428,40 +427,51 @@ function MetadataSource.getValidRows(bim, base_dir, filter_state, variant, accep
     if not bim or not base_dir then return {} end
     syncWithDatabase()
 
-    local key = cacheKey(base_dir, filter_state) .. "\29" .. variant
-    local valid = _valid_rows_cache[key]
+    local scope = normalizeBaseDir(base_dir)
+    local key = serializeTrail(filter_state) .. "\29" .. variant
+    local valid = _valid_rows_cache:get(key, scope)
     if not valid then
         valid = {}
         for _, row in ipairs(matchingRows(bim, base_dir, filter_state)) do
             if accept(row) then valid[#valid + 1] = row end
         end
-        _valid_rows_cache[key] = valid
+        _valid_rows_cache:put(key, valid, 0, scope)
     end
     return valid
 end
 
+-- Books kept per facet: enough to fill a folder cover and look past books
+-- without cover art.
+MetadataSource.FIRST_PATHS = 8
+
 -- Per facet key (entry.key of getFacetValues): the number of accepted rows
--- and the path of the first one. Same caching contract as getValidRows.
+-- and the paths of the first FIRST_PATHS of them. Same caching contract as
+-- getValidRows.
 function MetadataSource.getValidFacetCounts(bim, base_dir, dimension, filter_state, variant, accept)
     if not FilterState.isDimension(dimension) then return {}, {} end
 
     local rows = MetadataSource.getValidRows(bim, base_dir, filter_state, variant, accept)
-    local key = cacheKey(base_dir, filter_state) .. "\31" .. dimension .. "\29" .. variant
-    local cached = _valid_facets_cache[key]
+    local scope = normalizeBaseDir(base_dir)
+    local key = serializeTrail(filter_state) .. "\31" .. dimension .. "\29" .. variant
+    local cached = _valid_facets_cache:get(key, scope)
     if not cached then
-        local counts, reprs = {}, {}
+        local counts, firsts = {}, {}
         local current_path
         local function count(facet_key)
             counts[facet_key] = (counts[facet_key] or 0) + 1
-            if not reprs[facet_key] then reprs[facet_key] = current_path end
+            local first = firsts[facet_key]
+            if not first then
+                firsts[facet_key] = { current_path }
+            elseif #first < MetadataSource.FIRST_PATHS then
+                first[#first + 1] = current_path
+            end
         end
         local definition = FilterState.DIMENSIONS[dimension]
         for _, row in ipairs(rows) do
             current_path = row[1]
             FilterState.eachFacetValue(row, definition, count)
         end
-        cached = { counts, reprs }
-        _valid_facets_cache[key] = cached
+        cached = _valid_facets_cache:put(key, { counts, firsts }, 0, scope)
     end
     return cached[1], cached[2]
 end

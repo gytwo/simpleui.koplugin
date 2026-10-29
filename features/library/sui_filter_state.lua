@@ -28,6 +28,9 @@
 --   FilterState.addFilter(state, dimension, value)   -- mutates + returns state
 --   FilterState.withoutDimension(state, dimension)   -- returns a new state
 --   FilterState.isEmpty(state)
+--   FilterState.entryDimension(state)                -- dimension of the view a state belongs to
+--   FilterState.subgroupDimension(state)             -- dimension a leaf is split by
+--   FilterState.selectGroups(sizes, total)           -- group keys shown as folders
 --   FilterState.parseSeries(raw)                     -- name, suffix index
 --   FilterState.seriesKey(name)                      -- comparison key
 --   FilterState.matcher(trail)                       -- row predicate
@@ -52,7 +55,7 @@ function FilterState.parseSeries(raw)
     raw = raw:gsub("\u{00A0}", " ")
     local name, suffix = raw:match("^(.-)%s+#(%d+)%s*$")
     name = (name or raw):gsub("%s+", " ")
-    name = name:match("^ *(.-) *$")
+    name = util.trim(name)
     if name == "" then return nil end
     return name, tonumber(suffix)
 end
@@ -84,6 +87,9 @@ end
 --               value; values are matched and grouped by key, and the
 --               displayed spelling is the first one seen.
 --   key         (optional) function producing that key from a value.
+--   subgroup_by (optional) single-valued dimension a leaf of this dimension
+--               is split by: its books are listed as one folder per value,
+--               followed by the books left ungrouped.
 --
 -- value == false means "no value for this dimension" (e.g. books with no
 -- series). It is a valid, filterable state — not "no filter".
@@ -93,6 +99,7 @@ FilterState.DIMENSIONS = {
         multi_value = true,
         -- "and": picking a second author narrows further (co-authored books).
         repeat_mode = "and",
+        subgroup_by = "series",
     },
     series = {
         column      = "series",
@@ -106,6 +113,7 @@ FilterState.DIMENSIONS = {
         column      = "keywords",
         multi_value = true,
         repeat_mode = "and",
+        subgroup_by = "series",
     },
 }
 
@@ -192,6 +200,47 @@ function FilterState.withoutDimension(state, dimension)
         end
     end
     return clone
+end
+
+-- ---------------------------------------------------------------------------
+-- Sub-grouping
+-- ---------------------------------------------------------------------------
+
+-- Smallest number of books worth a folder of their own.
+FilterState.MIN_GROUP_SIZE = 2
+
+-- Dimension of the view `state` was entered through: the first of its trail,
+-- which stays fixed while the state is narrowed further. nil for an empty state.
+function FilterState.entryDimension(state)
+    local first = state and state.trail[1]
+    return first and first.dimension
+end
+
+-- Dimension the leaf reached by `state` is split by, or nil when the leaf is
+-- not split: its last dimension defines no sub-grouping, or the trail already
+-- fixes the sub-grouping dimension.
+function FilterState.subgroupDimension(state)
+    local last = state and state.trail[#state.trail]
+    local definition = last and FilterState.DIMENSIONS[last.dimension]
+    local dimension = definition and definition.subgroup_by
+    if dimension and not state.selected[dimension] then return dimension end
+end
+
+-- Chooses which groups are listed as folders. `sizes` maps a group key to its
+-- book count and `total` is the number of books listed. A group needs at
+-- least MIN_GROUP_SIZE books, and a single group holding every book is not
+-- worth an extra level. Returns the set of chosen keys.
+function FilterState.selectGroups(sizes, total)
+    local chosen, chosen_count, covered = {}, 0, 0
+    for key, size in pairs(sizes) do
+        if size >= FilterState.MIN_GROUP_SIZE then
+            chosen[key] = true
+            chosen_count = chosen_count + 1
+            covered = covered + size
+        end
+    end
+    if chosen_count == 1 and covered == total then return {} end
+    return chosen
 end
 
 -- ---------------------------------------------------------------------------

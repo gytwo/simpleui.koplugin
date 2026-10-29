@@ -148,9 +148,9 @@ function _InnerChooser:_applyCurrentFilter()
         items = self._all_items
     else
         items = {}
-        local pattern = filter_text:lower()
+        local pattern = util.stringLower(filter_text)
         for _, item in ipairs(self._all_items) do
-            if item.is_go_up or (item.text and item.text:lower():find(pattern, 1, true)) then
+            if item.is_go_up or (item.text and util.stringLower(item.text):find(pattern, 1, true)) then
                 table.insert(items, item)
             end
         end
@@ -333,6 +333,8 @@ end
 function AssetBrowser:getFocusableWidgetXY()
     return nil, nil
 end
+
+function AssetBrowser:moveFocusTo() end
 
 function AssetBrowser:onClose()
     if self._filter_input then

@@ -1,8 +1,9 @@
 -- module_heatmap.lua — Simple UI
--- Homescreen card for the reading heatmap: either the calendar grid (one
--- cell per day, last N weeks) or the time-of-day grid (one cell per
--- weekday x hour-of-day), picked via the "Type" menu item — a card only
--- has room for one grid at a time, unlike the full-screen popup. Tapping
+-- Homescreen card for the reading heatmap: the calendar grid (one cell per
+-- day, last N weeks), the time-of-day grid (one cell per weekday x
+-- hour-of-day) or the hours-of-day bars (reading per hour, all weekdays
+-- together), picked via the "Type" menu item — a card only has room for one
+-- view at a time, unlike the full-screen popup. Tapping
 -- the card opens the full-screen popup (screens/sui_heatmap_popup.lua),
 -- which shows both grids together and lets the user page back through
 -- earlier blocks.
@@ -27,6 +28,8 @@ local SUISettings = require("infra/sui_store")
 local SUIStyle    = require("features/sui_style")
 local HD          = require("engines/sui_heatmap_data")
 local HW          = require("engines/sui_heatmap_widgets")
+local Charts      = require("engines/sui_stats_charts")
+local Chrome      = require("features/sui_module_chrome")
 local PAD         = UI.PAD
 
 local SETTING_WEEKS          = "heatmap_weeks"
@@ -36,6 +39,7 @@ local MIN_WEEKS, MAX_WEEKS   = 6, 26
 local SETTING_MODE  = "heatmap_view_mode"
 local MODE_CALENDAR = "calendar"
 local MODE_DAYPART  = "time_of_day"
+local MODE_HOURS    = "hours_of_day"
 local DEFAULT_MODE  = MODE_CALENDAR
 
 local SETTING_SHOW_LEGEND  = "heatmap_show_legend"
@@ -51,15 +55,21 @@ local function setWeeks(pfx, weeks)
     SUISettings:saveSetting(pfx .. SETTING_WEEKS, math.max(MIN_WEEKS, math.min(MAX_WEEKS, math.floor(weeks))))
 end
 
--- Which grid the card shows: the calendar heatmap (one cell per day) or
--- the time-of-day heatmap (one cell per weekday x hour-of-day) — the same
--- two grids the full-screen popup shows together, offered here as
--- alternate single-grid card views since a card doesn't have room for both.
+-- Which view the card shows: the calendar heatmap (one cell per day), the
+-- time-of-day heatmap (one cell per weekday x hour-of-day) — the two grids
+-- the full-screen popup shows together, offered here as alternate
+-- single-view card modes since a card doesn't have room for both — or the
+-- hours-of-day bars.
 local function getMode(pfx)
     local v = SUISettings:readSetting(pfx .. SETTING_MODE)
-    if v == MODE_DAYPART then return MODE_DAYPART end
+    if v == MODE_DAYPART or v == MODE_HOURS then return v end
     return DEFAULT_MODE
 end
+
+-- Hour numbers under the bars of the hours-of-day view; the other bars have
+-- no label.
+local HOUR_AXIS = {}
+for hour = 0, 23 do HOUR_AXIS[hour + 1] = hour % 6 == 0 and tostring(hour) or "" end
 
 local function setMode(pfx, mode)
     SUISettings:saveSetting(pfx .. SETTING_MODE, mode)
@@ -114,14 +124,6 @@ local function computeLayout(w, ctx)
     local raw_scale = math.min(1.0, Config.getModuleScaleRaw("heatmap", pfx))
     local scale     = raw_scale * lf
 
-    -- Frame border / solid background — same optional box every other
-    -- homescreen module offers (module_currently.lua, module_reading_goals.lua):
-    -- a border, a filled background, or both, each adding PAD to every edge.
-    -- Computed up front so avail_w below already reserves room for the
-    -- border, keeping the box's real outer width equal to `w`.
-    -- Chrome applied by ModuleChrome on the homescreen.
-    local box = { inset_h = 0, inset_v = 0, outer_margin = 0 }
-
     -- Layout font: only used to size the weekday-label column and, from
     -- that, the grid's own cell size (below) — kept at its original tiny,
     -- scale-linked size so the calendar cells stay the size they've
@@ -135,12 +137,11 @@ local function computeLayout(w, ctx)
     -- module's own Scale setting, so card and popup read the same.
     local display_fonts = { small = Font:getFace(SUIStyle.FACE_REGULAR, UI.SZ(SUIStyle.FS_CAPTION)) }
 
-    local avail_w = w - box.inset_h
     local start_t, end_t = HD.getWeekBlockRange(weeks, 0)
 
     local mode = getMode(pfx)
     local num_cols
-    if mode == MODE_DAYPART then
+    if mode == MODE_DAYPART or mode == MODE_HOURS then
         num_cols = 24
     else
         local _cols, cal_cols = HW.buildRangeGrid({}, start_t, end_t)
@@ -152,7 +153,7 @@ local function computeLayout(w, ctx)
     -- fonts). Using the tiny layout face here made cells overflow avail_w
     -- once the wider display labels were drawn.
     local wd_label_w = HW.getWeekdayLabelWidth(display_fonts)
-    local grid_w     = avail_w - wd_label_w - gap
+    local grid_w     = w - wd_label_w - gap
     -- Half of the original 8px target floor; the hard 2px (half of the
     -- original 4px) underneath it is a legibility backstop, not a
     -- "default size" — it only bites at the very bottom of the Scale range.
@@ -186,27 +187,28 @@ local function computeLayout(w, ctx)
     local body_h = label_h + Screen:scaleBySize(6)
                  + 7 * cell_size + 6 * Screen:scaleBySize(2)
                  + gap_v + legend_h
-
-    body_h = body_h + box.inset_v
+    -- The bars have no legend: they take the height of the grid views.
+    if mode == MODE_HOURS then
+        show_legend, legend_h, gap_v = false, 0, 0
+    end
 
     return {
         pfx = pfx, weeks = weeks, mode = mode, fonts = display_fonts,
-        avail_w = avail_w, start_t = start_t, end_t = end_t,
+        avail_w = w, start_t = start_t, end_t = end_t,
         cell_size = cell_size, body_h = body_h, gap_v = gap_v,
         legend_h = legend_h, legend_cell = legend_cell, show_legend = show_legend,
-        box = box,
     }
 end
 
 local function openPopup()
-    local ok, Popup = pcall(require, "screens/sui_heatmap_popup")
-    if ok and Popup then Popup.show() end
+    require("screens/sui_stats_launcher").open("heatmap")
 end
 
 local M = {}
 
 M.id          = "heatmap"
 M.name        = _("Reading Heatmap")
+M.category    = "stats"
 M.label       = _("Reading Heatmap")
 M.enabled_key = "heatmap_enabled"
 M.default_on  = false
@@ -220,24 +222,38 @@ M.default_on  = false
 function M.label_right_func(ctx)
     local pfx  = (ctx and ctx.pfx) or "simpleui_hs_"
     local mode = getMode(pfx)
-    return (mode == MODE_DAYPART)
-        and _("Time of day")
-        or  T(_("%1 weeks"), getWeeks(pfx))
+    if mode == MODE_DAYPART then return _("Time of day") end
+    if mode == MODE_HOURS then return _("Hours of day") end
+    return T(_("%1 weeks"), getWeeks(pfx))
 end
 
 function M.build(w, ctx)
     local L = computeLayout(w, ctx)
+    -- Labels follow the content colours over the module fill.
+    local label_fg = (ctx and ctx.ink or Chrome.PLAIN_INK).sub
 
     local grid_widget
-    if L.mode == MODE_DAYPART then
+    if L.mode == MODE_HOURS then
+        local wd_hour_map, fatal = HD.getWeekdayHourReadingData(L.start_t, L.end_t, ctx and ctx.db_conn)
+        if fatal and ctx then ctx.db_conn_fatal = true end
+        local hours, peak_hour = HD.hourTotals(wd_hour_map)
+        local bar_w, gap = Charts.fitBars(#hours, L.avail_w, L.cell_size)
+        grid_widget = bar_w and Charts.bars{
+            values = hours, bar_w = bar_w, gap = gap, avail_h = L.body_h,
+            color = (ctx and ctx.ink or Chrome.PLAIN_INK).blk, highlight = peak_hour and peak_hour + 1,
+            labels = HOUR_AXIS, label_face = L.fonts.small, label_color = label_fg,
+        } or VerticalSpan:new{ width = L.body_h }
+    elseif L.mode == MODE_DAYPART then
         local wd_hour_map, fatal = HD.getWeekdayHourReadingData(L.start_t, L.end_t, ctx and ctx.db_conn)
         if fatal and ctx then ctx.db_conn_fatal = true end
         local is_12h = G_reader_settings:isTrue("twelve_hour_clock")
-        grid_widget = HW.buildDayPartHeatmap(wd_hour_map, L.fonts, L.avail_w, is_12h, { cell_size = L.cell_size })
+        grid_widget = HW.buildDayPartHeatmap(wd_hour_map, L.fonts, L.avail_w, is_12h,
+            { cell_size = L.cell_size, label_fg = label_fg })
     else
         local daily_map, fatal = HD.getDailyReadingData(L.start_t, L.end_t, ctx and ctx.db_conn)
         if fatal and ctx then ctx.db_conn_fatal = true end
-        grid_widget = HW.buildRangeHeatmap(daily_map, L.start_t, L.end_t, L.fonts, L.avail_w, { cell_size = L.cell_size })
+        grid_widget = HW.buildRangeHeatmap(daily_map, L.start_t, L.end_t, L.fonts, L.avail_w,
+            { cell_size = L.cell_size, label_fg = label_fg })
     end
 
     -- Wrapped the same way as the legend below: below 100% Scale the grid's
@@ -251,20 +267,14 @@ function M.build(w, ctx)
 
     local body = VerticalGroup:new{ align = "left", grid_box }
     if L.show_legend then
-        local legend = HW.buildLegend(L.fonts, L.legend_cell)
+        local legend = HW.buildLegend(L.fonts, L.legend_cell, label_fg)
         table.insert(body, VerticalSpan:new{ width = L.gap_v })
         table.insert(body, CenterContainer:new{ dimen = Geom:new{ w = L.avail_w, h = legend:getSize().h }, legend })
     end
 
-    -- Content sits at avail_w (w minus the box's own insets); the box below
-    -- supplies the left/right gutter via padding rather than by centering
-    -- inside a full-w wrapper, so its real outer width — content + 2*padding
-    -- + 2*bordersize — lands on exactly `w`, matching the section label.
-    local box = body
-
     local tappable = InputContainer:new{
-        dimen = Geom:new{ w = w, h = box:getSize().h },
-        [1]   = box,
+        dimen = Geom:new{ w = w, h = body:getSize().h },
+        [1]   = body,
     }
     tappable.ges_events = {
         TapHeatmap = { GestureRange:new{ ges = "tap", range = function() return tappable.dimen end } },
@@ -322,31 +332,19 @@ local function _makeScaleItem(ctx_menu)
     }
 end
 
--- Builds one radio-button item for the view-mode setting — mirrors the
--- _makeStyleRadioItem helper module_currently.lua uses for its own
--- persisted-string-setting radio choices.
-local function _makeViewModeRadioItem(text, pfx, mode, refresh)
-    return {
-        text           = text,
-        radio          = true,
-        keep_menu_open = true,
-        checked_func   = function() return getMode(pfx) == mode end,
-        callback       = function()
-            setMode(pfx, mode)
-            refresh()
-        end,
-    }
-end
-
 local function _makeViewItem(ctx_menu)
     local pfx = ctx_menu.pfx
     local _lc = ctx_menu._
-    return {
-        text           = _lc("Type"),
-        sub_item_table = {
-            _makeViewModeRadioItem(_lc("Calendar"), pfx, MODE_CALENDAR, ctx_menu.refresh),
-            _makeViewModeRadioItem(_lc("Time of day"), pfx, MODE_DAYPART, ctx_menu.refresh),
+    return Config.makeRadioSubmenuItem{
+        text    = _lc("Type"),
+        options = {
+            { value = MODE_CALENDAR, label = _lc("Calendar") },
+            { value = MODE_DAYPART,  label = _lc("Time of day") },
+            { value = MODE_HOURS,    label = _lc("Hours of day") },
         },
+        get     = function() return getMode(pfx) end,
+        set     = function(v) setMode(pfx, v) end,
+        refresh = ctx_menu.refresh,
     }
 end
 
@@ -357,6 +355,7 @@ local function _makeAppearanceItem(ctx_menu)
         text_func      = function() return _lc("Appearance") end,
         sub_item_table = {
             Config.makeLabelToggleItem("heatmap", ctx_menu.refresh, _lc),
+            Config.makeLabelPlacementItem("heatmap", ctx_menu.refresh, _lc),
             {
                 text           = _lc("Show legend"),
                 checked_func   = function() return getShowLegend(pfx) end,
@@ -371,7 +370,6 @@ local function _makeAppearanceItem(ctx_menu)
 end
 
 function M.getMenuItems(ctx_menu)
-    local Config = require("infra/sui_config")
     local appearance = _makeAppearanceItem(ctx_menu)
     local extra = appearance and appearance.sub_item_table or { appearance }
     return Config.buildModuleMenu({

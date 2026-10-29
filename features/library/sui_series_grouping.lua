@@ -5,7 +5,8 @@
 -- switchItemTable — it stays "inside" the same real folder (scroll position,
 -- back-button target, and breadcrumb are all the real folder's), unlike the
 -- full author/series/tags browse mode in sui_library_browse.lua which
--- navigates to an actual virtual path.
+-- navigates to an actual virtual path. Lists of that virtual tree are not
+-- touched here: sui_library_browse sub-groups its own leaves.
 --
 -- The grouping algorithm below deliberately does NOT go through
 -- sui_metadata_source: it reuses the item_table FileChooser already built
@@ -23,7 +24,7 @@
 -- Books are grouped by FilterState's series key, so spelling variants of one
 -- series name (case, spacing, a trailing " #n") share a single group.
 --
--- Depends on sui_foldercovers for: isEnabled(), getSeriesGrouping(),
+-- Depends on sui_foldercovers for: isEnabled(), getSeriesGrouping(mode),
 -- resolveStyle(), invalidateItemTableCache() (the FileChooser item-table
 -- cache is a cross-cutting concern that lives with the strip-patch install).
 --
@@ -36,6 +37,7 @@
 --   SeriesGrouping.openCoverPicker(vpath, fc, BookInfoManager)
 --   SeriesGrouping.createCollection(vpath, series_name)
 --   SeriesGrouping.hasGroup(vpath)  -- true if vpath is a known series-group path
+--   SeriesGrouping.isEnabled()      -- true if grouping is on for the filesystem view
 
 local _             = require("infra/sui_i18n").translate
 local FileChooser    = require("ui/widget/filechooser")
@@ -43,9 +45,17 @@ local CoverOverrides = require("features/library/sui_cover_overrides")
 local GroupActions   = require("features/library/sui_group_actions")
 local FolderCovers   = require("features/library/sui_foldercovers")
 local FilterState    = require("features/library/sui_filter_state")
+local VirtualPath    = require("features/library/sui_virtual_path")
 local MetadataSource = require("features/library/sui_metadata_source")
 
 local SeriesGrouping = {}
+
+-- Browse mode of the real-folder view this module groups.
+local MODE = "normal"
+
+function SeriesGrouping.isEnabled()
+    return FolderCovers.getSeriesGrouping(MODE)
+end
 
 -- _sg_current holds state while the user is inside a virtual series folder:
 --   series_name:    used to re-find the group item on return to parent.
@@ -76,7 +86,8 @@ end
 -- Shared actions (previously duplicated with sui_library_browse.lua)
 -- ---------------------------------------------------------------------------
 
-function SeriesGrouping.openCoverPicker(vpath, fc, BookInfoManager)
+-- `sheet` (optional): flow sheet to show the picker on, as a page.
+function SeriesGrouping.openCoverPicker(vpath, fc, BookInfoManager, sheet)
     local series_items = _sg_items_cache[vpath]
     local picker_items = {}
     for _, item in ipairs(series_items or {}) do
@@ -94,10 +105,12 @@ function SeriesGrouping.openCoverPicker(vpath, fc, BookInfoManager)
         items         = picker_items,
         menu          = fc,
         empty_message = _("No books found in this series."),
+        parent        = sheet,
     }
 end
 
-function SeriesGrouping.createCollection(vpath, series_name)
+-- `sheet` (optional): flow sheet to show the name prompt on, as a page.
+function SeriesGrouping.createCollection(vpath, series_name, sheet)
     local series_items = _sg_items_cache[vpath]
     local paths = {}
     for _, item in ipairs(series_items or {}) do
@@ -107,6 +120,7 @@ function SeriesGrouping.createCollection(vpath, series_name)
         suggested_name = series_name or "",
         paths          = paths,
         empty_message  = _("No books found in this series."),
+        parent         = sheet,
     }
 end
 
@@ -133,10 +147,11 @@ local function seriesPropsOf(BookInfoManager, folder_cache, item)
 end
 
 local function sgProcessItemTable(item_table, file_chooser)
-    if not FolderCovers.getSeriesGrouping()   then return end
-    if not file_chooser or not item_table     then return end
-    if item_table._sg_is_series_view          then return end
+    if not SeriesGrouping.isEnabled() then return end
+    if not file_chooser or not item_table then return end
+    if item_table._sg_is_series_view then return end
     if file_chooser.show_current_dir_for_hold then return end
+    if VirtualPath.isVirtual(file_chooser.path) then return end
 
     -- Evict stale _sg_items_cache entries for the current directory.
     local current_path = file_chooser.path
@@ -152,11 +167,10 @@ local function sgProcessItemTable(item_table, file_chooser)
     local ok_bim, BookInfoManager = pcall(require, "bookinfomanager")
     if not ok_bim or not BookInfoManager then return end
 
-    local folder_cache    = {}
-    local series_map      = {}
-    local processed       = {}
-    local book_count      = 0
-    local no_series_count = 0
+    local folder_cache = {}
+    local series_map   = {}
+    local processed    = {}
+    local book_count   = 0
 
     for _, item in ipairs(item_table) do
         if item.is_go_up then
@@ -211,35 +225,28 @@ local function sgProcessItemTable(item_table, file_chooser)
                         si[#si + 1] = item
                     end
                     handled = true
-                else
-                    no_series_count = no_series_count + 1
                 end
             end
             if not handled then processed[#processed + 1] = item end
         end
     end
 
-    -- If every book is in the same single series the folder is already
-    -- organised — skip grouping to avoid a redundant nesting level.
-    local series_count = 0
-    for _ in pairs(series_map) do
-        series_count = series_count + 1
-        if series_count > 1 then break end
-    end
-    if series_count == 1 and no_series_count == 0 and book_count > 0 then return end
+    local sizes = {}
+    for skey, group in pairs(series_map) do sizes[skey] = #group.series_items end
+    local grouped = FilterState.selectGroups(sizes, book_count)
+    if next(grouped) == nil then return end
 
-    -- Ungroup singleton series; sort and cache multi-book groups.
-    for _, group in pairs(series_map) do
+    -- Sort and cache the groups kept; the others go back to loose books.
+    for skey, group in pairs(series_map) do
         local items = group.series_items
-        if #items == 1 then
-            local idx = group._sg_list_index
-            if idx and processed[idx] == group then processed[idx] = items[1] end
-        else
+        if grouped[skey] then
             table.sort(items, function(a, b)
                 return (a._sg_series_index or 0) < (b._sg_series_index or 0)
             end)
             group.mandatory             = tostring(#items) .. " \u{F016}"
             _sg_items_cache[group.path] = items
+        else
+            processed[group._sg_list_index] = items[1]
         end
     end
 
@@ -297,6 +304,7 @@ local function sgOpenGroup(file_chooser, group_item)
     local items = group_item.series_items
     _sg_current = {
         series_name = group_item.text,
+        group_path  = group_item.path,
         parent_page = file_chooser.page or 1,
     }
     items._sg_is_series_view = true
@@ -351,20 +359,18 @@ function SeriesGrouping.install()
     end
 
     FileChooser.onMenuSelect = function(fc, item)
-        if item and item.is_series_group and FolderCovers.getSeriesGrouping() then
+        if item and item.is_series_group and SeriesGrouping.isEnabled() then
             sgOpenGroup(fc, item)
             return true
         end
         return _sg_orig_onMenuSelect(fc, item)
     end
 
-    -- Long-press on a series-group shows a dialog with cover picker and
-    -- "Create collection". Cover picker is hidden in quad mode.
+    -- Long-press on a series group opens a sheet with the cover picker and
+    -- "Create collection". The cover picker is hidden in quad mode.
     FileChooser.onMenuHold = function(fc, item)
-        if item and item.is_series_group and FolderCovers.getSeriesGrouping() then
+        if item and item.is_series_group and SeriesGrouping.isEnabled() then
             if not FolderCovers.isEnabled() then return true end
-            local UIManager    = require("ui/uimanager")
-            local ButtonDialog = require("ui/widget/buttondialog")
 
             local in_list_view    = fc and fc.display_mode_type == "list"
             local cover_available = not (
@@ -373,41 +379,42 @@ function SeriesGrouping.install()
 
             local series_name = (item.text or ""):gsub("/$", "")
             local vpath       = item.path
-            local dialog
-            local buttons     = {}
+            local items       = {}
+            local sheet
 
             if cover_available then
-                buttons[#buttons + 1] = {{
-                    text = _("Set folder cover"),
-                    callback = function()
-                        UIManager:close(dialog)
+                items[#items + 1] = {
+                    text      = _("Set folder cover"),
+                    sui_icon  = "cover",
+                    keep_open = true,
+                    chevron   = true,
+                    callback  = function()
                         local ok_bim, BookInfoManager = pcall(require, "bookinfomanager")
                         if ok_bim and BookInfoManager then
-                            SeriesGrouping.openCoverPicker(vpath, fc, BookInfoManager)
+                            SeriesGrouping.openCoverPicker(vpath, fc, BookInfoManager, sheet)
+                        else
+                            sheet:close()
                         end
                     end,
-                }}
+                }
             end
-
-            buttons[#buttons + 1] = {{
-                text = _("Create collection"),
-                callback = function()
-                    UIManager:close(dialog)
-                    SeriesGrouping.createCollection(vpath, series_name)
-                end,
-            }}
-
-            buttons[#buttons + 1] = {{
-                text     = _("Cancel"),
-                callback = function() UIManager:close(dialog) end,
-            }}
-
-            dialog = ButtonDialog:new{
-                title       = series_name,
-                title_align = "center",
-                buttons     = buttons,
+            items[#items + 1] = {
+                text      = _("Create collection"),
+                sui_icon  = "collections",
+                keep_open = true,
+                chevron   = true,
+                callback  = function() SeriesGrouping.createCollection(vpath, series_name, sheet) end,
             }
-            UIManager:show(dialog)
+
+            local ActionSheet = require("engines/sui_action_sheet")
+            sheet = ActionSheet.show{
+                name       = "sui_win_series_actions",
+                title      = series_name,
+                icon       = "folder",
+                flow       = true,
+                auto_close = true,
+                sections   = { ActionSheet.list(items) },
+            }
             return true
         end
         return _sg_orig_onMenuHold(fc, item)
@@ -416,11 +423,7 @@ function SeriesGrouping.install()
     FileChooser.onFolderUp = function(fc)
         if fc.item_table and fc.item_table._sg_is_series_view then
             local parent = fc.item_table._sg_parent_path
-            if parent then
-                -- Clear the series view flag IMMEDIATELY so _resolveIsSub will work correctly
-                fc.item_table._sg_is_series_view = false
-                fc:changeToPath(parent)
-            end
+            if parent then fc:changeToPath(parent) end
             return true
         end
         return _sg_orig_onFolderUp(fc)
@@ -438,8 +441,8 @@ function SeriesGrouping.install()
             if path == parent then
                 if _sg_current then
                     _sg_current.should_restore = true
-                    local saved_page = _sg_current.parent_page
-                    if saved_page and saved_page > 1 then fc.page = saved_page end
+                    -- The core focuses this item in the parent listing.
+                    fc.focused_path = _sg_current.group_path
                 end
             else
                 _sg_current = nil
@@ -469,7 +472,10 @@ function SeriesGrouping.install()
         end
 
         _sg_orig_refreshPath(fc)
-        if FolderCovers.getSeriesGrouping() and _sg_current then
+        if _sg_current and _sg_current.should_restore then
+            -- Leaving the group for its parent: it must stay closed.
+            _sg_current = nil
+        elseif SeriesGrouping.isEnabled() and _sg_current then
             local sname      = _sg_current.series_name
             local saved_page = _sg_current.parent_page
             for _, item in ipairs(fc.item_table or {}) do
@@ -484,28 +490,11 @@ function SeriesGrouping.install()
         _sg_refreshPath_depth = _sg_refreshPath_depth - 1
     end
 
-    -- Restore focus to the series group item when returning from a virtual folder.
+    -- Drops the group state when series grouping is turned off.
     FileChooser.updateItems = function(fc, ...)
-        if not FolderCovers.getSeriesGrouping() then
+        if not SeriesGrouping.isEnabled() then
             _sg_current = nil
             return _sg_orig_updateItems(fc, ...)
-        end
-        if fc.item_table and fc.item_table._sg_is_series_view then
-            return _sg_orig_updateItems(fc, ...)
-        end
-        if _sg_current and _sg_current.should_restore
-                and fc.item_table and #fc.item_table > 0 then
-            local sname = _sg_current.series_name
-            for idx, item in ipairs(fc.item_table) do
-                if item.is_series_group and item.text == sname then
-                    fc.page = math.ceil(idx / fc.perpage)
-                    local select_num = ((idx - 1) % fc.perpage) + 1
-                    if fc.path_items and fc.path then fc.path_items[fc.path] = idx end
-                    _sg_current = nil
-                    return _sg_orig_updateItems(fc, select_num)
-                end
-            end
-            _sg_current = nil
         end
         return _sg_orig_updateItems(fc, ...)
     end

@@ -13,7 +13,6 @@ build:
 		--exclude "$(ROOT_DIR)/.DS_Store" \
 		--exclude "$(ROOT_DIR)/.gitignore" \
 		--exclude "$(ROOT_DIR)/CONTRIBUTING.md" \
-		--exclude "$(ROOT_DIR)/LICENSE" \
 		--exclude "$(ROOT_DIR)/README.md" \
 		--exclude "$(ROOT_DIR)/$(ZIP_NAME)" \
 		--exclude "$(ROOT_DIR)/icons/custom/*" \

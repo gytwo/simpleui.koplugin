@@ -839,8 +839,31 @@ function Providers.install()
 
     if type(orig_getBookInfo) == "function" then
         local healed = newCache()
+
+        -- A corrupt cache DB (or a statement left mid-step by an earlier
+        -- failure) is dropped and recreated empty instead of crashing.
+        local function isDbFault(err)
+            local msg = tostring(err)
+            return msg:find("malformed", 1, true) or msg:find("corrupt", 1, true)
+                or msg:find("misuse", 1, true) or msg:find("not a database", 1, true)
+        end
+
+        local function safeGetBookInfo(bim, filepath, ...)
+            local ok, res = pcall(orig_getBookInfo, bim, filepath, ...)
+            if ok then return res end
+            if not isDbFault(res) then error(res, 0) end
+            logger.warn("simpleui: bookinfo cache DB faulty, recreating:", tostring(res))
+            pcall(bim.closeDbConnection, bim)
+            bim.db_conn, bim.get_stmt, bim.set_stmt, bim.in_progress_stmt = nil, nil, nil, nil
+            bim.db_created = false
+            for _, suffix in ipairs({ "", "-wal", "-shm" }) do
+                os.remove(bim.db_location .. suffix)
+            end
+            return nil
+        end
+
         function BookInfoManager:getBookInfo(filepath, ...)
-            local bookinfo = orig_getBookInfo(self, filepath, ...)
+            local bookinfo = safeGetBookInfo(self, filepath, ...)
 
             if bookinfo then
                 local snap = snapshotMeta(bookinfo)
@@ -853,7 +876,7 @@ function Providers.install()
                     if incomplete then
                         cacheSet(healed, filepath, true)
                         if enrichBookInfoFromComic(self, filepath) then
-                            bookinfo = orig_getBookInfo(self, filepath, ...)
+                            bookinfo = safeGetBookInfo(self, filepath, ...)
                             if bookinfo then
                                 local snap2 = snapshotMeta(bookinfo)
                                 if snap2 then cacheSet(display_cache, filepath, snap2) end

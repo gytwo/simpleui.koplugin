@@ -14,12 +14,12 @@
 --
 -- Icon override mechanics
 -- ───────────────────────
--- Tab-bar icons: FileManagerMenu.onShowMenu and ReaderMenu.onShowMenu are
--- patched so every (re)open replaces tab icons with the user's choices
--- before TouchMenu is built. Matching uses `tab.id` (stamped by KOReader's
+-- Tab-bar icons: a step registered in the shared menu hooks
+-- (infra/sui_menu_hooks.lua) replaces tab icons with the user's choices every
+-- time a FileManagerMenu or ReaderMenu table is built or opened, before
+-- TouchMenu is created. Matching uses `tab.id` (stamped by KOReader's
 -- MenuSorter onto every tab entry) — NOT `tab.key`, which native tabs never
--- have. Patches are installed by installTabIconPatch()/
--- installReaderTabIconPatch() and removed on teardown.
+-- have. The step is registered by installTabIconPatch().
 --
 -- Titlebar / search / back icons: sui_titlebar.lua calls
 -- SUIStyle.getIcon(slot_id) when assigning image.file to each button, and
@@ -35,8 +35,7 @@
 --   SUIStyle.resetAll() / .performResetAllSystemIcons(plugin) — clear overrides
 --   SUIStyle.applyTabIcons(fm_or_ui_or_table)  — push overrides into a live
 --                                                 FM/Reader tab_item_table
---   SUIStyle.install/removeTabIconPatch()        — persistent FM-menu patch
---   SUIStyle.install/removeReaderTabIconPatch()  — persistent Reader-menu patch
+--   SUIStyle.installTabIconPatch()         — persistent FM/Reader menu step
 --   SUIStyle.refreshLiveTabBars()          — reapply + repaint any open
 --                                             FM/Reader tab bar right now
 --   SUIStyle.makeMenuItems(plugin)         — sub_item_table for the settings menu
@@ -53,15 +52,18 @@
 --               .applyPack(path)
 
 local SUISettings     = require("infra/sui_store")
+local MenuHooks       = require("infra/sui_menu_hooks")
+local SUIFonts        = require("infra/sui_fonts")
 local logger          = require("logger")
+local Text            = require("infra/sui_text")
 local _               = require("infra/sui_i18n").translate
 local Blitbuffer      = require("ffi/blitbuffer")
+local Accent          = require("infra/sui_accent")
 local Device          = require("device")
-local FrameContainer   = require("ui/widget/container/framecontainer")
 local RenderText       = require("ui/rendertext")
-local HorizontalGroup  = require("ui/widget/horizontalgroup")
-local HorizontalSpan   = require("ui/widget/horizontalspan")
+local ffiutil          = require("ffi/util")
 local Screen          = Device.screen
+local BD              = require("ui/bidi")
 
 -- ---------------------------------------------------------------------------
 -- Slot catalogue
@@ -72,6 +74,7 @@ local Screen          = Device.screen
 --   group       "sui_titlebar" | "bm_icons"
 --   default_ko  KOReader built-in name (used only as documentation / preview)
 --   default_icon  optional icon reference (e.g. "nerd:EA48") used while no override is stored
+--   default_icon_rtl  optional counterpart of default_icon for mirrored (RTL) layouts
 -- ---------------------------------------------------------------------------
 
 local M = {}
@@ -82,7 +85,8 @@ M.SLOTS = {
         id        = "sui_menu",
         label     = function() return _("Menu Button") end,
         group     = "sui_titlebar",
-        default_ko = "icons/more-options.svg",
+        default_ko = "appbar.menu",
+        default_icon = "nerd:E8D7",
     },
     {
         id        = "sui_search",
@@ -95,34 +99,36 @@ M.SLOTS = {
         id        = "sui_back",
         label     = function() return _("Back Button") end,
         group     = "sui_titlebar",
-        default_ko = "icons/back.svg",   -- matches the default back icon used at runtime
+        default_ko = "chevron.left",
+        default_icon = "nerd:E840",
+        default_icon_rtl = "nerd:E841",
     },
     -- ── Browse Meta titlebar icons ───────────────────────────────────────
-    -- These override the four icons used by the Browse button in the FM
-    -- titlebar (normal/author/series/tags mode).
+    -- The four icons of the Browse button in the FM titlebar (normal/author/
+    -- series/tags mode); the browse mode dialog shows the same ones.
     {
         id        = "sui_browse_normal",
         label     = function() return _("Browse Button (default)") end,
         group     = "sui_browse_icons",
-        default_ko = "icons/default.svg",
+        default_icon = "nerd:E955",
     },
     {
         id        = "sui_browse_author",
         label     = function() return _("Browse Button (author)") end,
         group     = "sui_browse_icons",
-        default_ko = "icons/author.svg",
+        default_icon = "nerd:E712",
     },
     {
         id        = "sui_browse_series",
         label     = function() return _("Browse Button (series)") end,
         group     = "sui_browse_icons",
-        default_ko = "icons/series.svg",
+        default_icon = "nerd:E7BA",
     },
     {
         id        = "sui_browse_tags",
         label     = function() return _("Browse Button (tags)") end,
         group     = "sui_browse_icons",
-        default_ko = "icons/tags.svg",
+        default_icon = "nerd:EBF8",
     },
     -- ── Native pagination bar chevrons ───────────────────────────────────
     -- Override the four chevron Buttons in KOReader's native pagination row
@@ -133,24 +139,32 @@ M.SLOTS = {
         label     = function() return _("Pagination: Previous Page") end,
         group     = "sui_pager_icons",
         default_ko = "chevron.left",
+        default_icon = "nerd:E840",
+        default_icon_rtl = "nerd:E841",
     },
     {
         id        = "sui_pager_next",
         label     = function() return _("Pagination: Next Page") end,
         group     = "sui_pager_icons",
         default_ko = "chevron.right",
+        default_icon = "nerd:E841",
+        default_icon_rtl = "nerd:E840",
     },
     {
         id        = "sui_pager_first",
         label     = function() return _("Pagination: First Page") end,
         group     = "sui_pager_icons",
         default_ko = "chevron.first",
+        default_icon = "nerd:F100",
+        default_icon_rtl = "nerd:F101",
     },
     {
         id        = "sui_pager_last",
         label     = function() return _("Pagination: Last Page") end,
         group     = "sui_pager_icons",
         default_ko = "chevron.last",
+        default_icon = "nerd:F101",
+        default_icon_rtl = "nerd:F100",
     },
     -- ── Navpager arrows (bottom bar) ─────────────────────────────────────
     {
@@ -158,12 +172,16 @@ M.SLOTS = {
         label     = function() return _("Navpager: Previous") end,
         group     = "sui_navpager_icons",
         default_ko = "chevron.left",
+        default_icon = "nerd:E840",
+        default_icon_rtl = "nerd:E841",
     },
     {
         id        = "sui_navpager_next",
         label     = function() return _("Navpager: Next") end,
         group     = "sui_navpager_icons",
         default_ko = "chevron.right",
+        default_icon = "nerd:E841",
+        default_icon_rtl = "nerd:E840",
     },
     -- ── Collections back button ──────────────────────────────────────────
     -- Overrides the page_return_arrow ("appbar.back") in Collections /
@@ -173,6 +191,18 @@ M.SLOTS = {
         label     = function() return _("Collections: Back Button") end,
         group     = "sui_coll_icons",
         default_ko = "appbar.back",
+        default_icon = "nerd:E840",
+        default_icon_rtl = "nerd:E841",
+    },
+    -- ── Quick Settings panel ─────────────────────────────────────────────
+    -- Icon of the Exit Book button of the reader's Book layout. Read each
+    -- time the panel is built through M.resolveIcon().
+    {
+        id        = "sui_qs_exit",
+        label     = function() return _("Exit Book Button") end,
+        group     = "sui_qs_icons",
+        default_ko = "exit",
+        default_icon = "nerd:F08B",
     },
     -- ── Quick Actions Defaults ───────────────────────────────────────────
     {
@@ -180,24 +210,28 @@ M.SLOTS = {
         label     = function() return _("Default: Folder") end,
         group     = "sui_qa_defaults",
         default_ko = "icons/custom.svg",
+        default_icon = "nerd:E955",  -- folder (outline), same as SUIStyle.ICON.folder
     },
     {
         id        = "sui_qa_plugin",
         label     = function() return _("Default: Plugin") end,
         group     = "sui_qa_defaults",
         default_ko = "icons/plugin.svg",
+        default_icon = "nerd:EB30",  -- puzzle piece, same as SUIStyle.ICON.plugin
     },
     {
         id        = "sui_qa_system",
         label     = function() return _("Default: System") end,
         group     = "sui_qa_defaults",
         default_ko = "appbar.settings",
+        default_icon = "nerd:F013",  -- cog
     },
     {
         id        = "sui_qa_group",
         label     = function() return _("Default: Group") end,
         group     = "sui_qa_defaults",
         default_ko = "icons/group.svg",
+        default_icon = "nerd:E73A",  -- 3x3 grid, same as SUIStyle.ICON.group
     },
     -- ── Folder Covers ────────────────────────────────────────────────────
     {
@@ -205,6 +239,7 @@ M.SLOTS = {
         label     = function() return _("Folder Covers: Empty Folder") end,
         group     = "sui_fc_icons",
         default_ko = "icons/custom.svg",
+        default_icon = "nerd:F114",
     },
     -- ── Touch menu tab bar ───────────────────────────────────────────────
     -- Overrides the icons shown on the native KOReader touch-menu tabs
@@ -293,13 +328,6 @@ function M.getIcon(id)
     return (type(v) == "string" and v ~= "") and v or nil
 end
 
---- Returns the icon in effect for `id`: the stored override, else the slot's
---- `default_icon`, else nil (the button keeps its built-in icon).
-function M.getEffectiveIcon(id)
-    local slot = _SLOT_BY_ID[id]
-    return M.getIcon(id) or (slot and slot.default_icon)
-end
-
 --- Saves `path` as the icon for `id`.  Pass nil to reset to default.
 function M.setIcon(id, path)
     if type(path) == "string" and path ~= "" then
@@ -318,9 +346,9 @@ end
 
 local _ICON_NIGHT_COLORS_KEY = "simpleui_style_icons_night_colors"
 
-function M.keepIconColorsInNight()
+M.keepIconColorsInNight = SUISettings.memoize(function()
     return SUISettings:isTrue(_ICON_NIGHT_COLORS_KEY)
-end
+end)
 
 function M.setKeepIconColorsInNight(on)
     SUISettings:set(_ICON_NIGHT_COLORS_KEY, on and true or false)
@@ -332,16 +360,16 @@ end
 -- Book covers can cast a drop shadow down and to the right, switched on
 -- separately for each surface (scope). The shadow lives inside the cover's
 -- own slot: the cover is drawn coverShadowOffset() px smaller on each axis,
--- so layouts keep their size.
+-- so layouts keep their size. The shadow is on until a surface is switched off.
 
 M.SHADOW_LIBRARY = "library"   -- the Library grid
 M.SHADOW_MODULES = "modules"   -- the Home Screen modules
 
 local _COVER_SHADOW_KEY_PREFIX = "simpleui_style_cover_shadow_"
-local _COVER_SHADOW_BASE       = math.max(2, Screen:scaleBySize(4))
+local _COVER_SHADOW_BASE       = math.max(2, Screen:scaleBySize(7))
 
 function M.coverShadowEnabled(scope)
-    return SUISettings:isTrue(_COVER_SHADOW_KEY_PREFIX .. scope)
+    return SUISettings:nilOrTrue(_COVER_SHADOW_KEY_PREFIX .. scope)
 end
 
 function M.setCoverShadowEnabled(scope, on)
@@ -353,6 +381,32 @@ end
 function M.coverShadowOffset(scope, scale)
     if not M.coverShadowEnabled(scope) then return 0 end
     return math.max(2, math.floor(_COVER_SHADOW_BASE * (scale or 1)))
+end
+
+-- ---------------------------------------------------------------------------
+-- Folder book stack style
+-- ---------------------------------------------------------------------------
+-- What is drawn behind folder and collection covers when the stack is shown:
+-- "default" is a pile of cards peeking out below and to the right of the
+-- cover, "classic" is a pair of vertical edge lines to its left. One setting
+-- drives every surface that draws such covers.
+
+M.FOLDER_STACK_DEFAULT = "default"
+M.FOLDER_STACK_CLASSIC = "classic"
+
+-- Setting key of the stack style, shared with the cover elements registry.
+M.FOLDER_STACK_STYLE_KEY = "simpleui_style_folder_stack_style"
+local _FOLDER_STACK_STYLE_KEY = M.FOLDER_STACK_STYLE_KEY
+
+function M.getFolderStackStyle()
+    if SUISettings:readSetting(_FOLDER_STACK_STYLE_KEY) == M.FOLDER_STACK_CLASSIC then
+        return M.FOLDER_STACK_CLASSIC
+    end
+    return M.FOLDER_STACK_DEFAULT
+end
+
+function M.setFolderStackStyle(style)
+    SUISettings:saveSetting(_FOLDER_STACK_STYLE_KEY, style)
 end
 
 -- ---------------------------------------------------------------------------
@@ -414,6 +468,24 @@ function M.safeIconPath(path, fallback, slot_id)
     end
 
     return path
+end
+
+--- Default symbol glyph of `slot` for the current layout direction: its
+--- `default_icon_rtl` in a mirrored layout when it has one, else `default_icon`.
+--- nil when the slot has no default glyph.
+local function _defaultIcon(slot)
+    if not slot then return nil end
+    if slot.default_icon_rtl and BD.mirroredUILayout() then
+        return slot.default_icon_rtl
+    end
+    return slot.default_icon
+end
+
+--- Renderable icon reference for `id`: the stored override when it is valid,
+--- else the slot's default glyph. nil when the slot has no default glyph
+--- and no valid override. An invalid override is dropped from the settings.
+function M.resolveIcon(id)
+    return M.safeIconPath(M.getIcon(id), _defaultIcon(_SLOT_BY_ID[id]), id)
 end
 
 --- Clears every system icon override.
@@ -479,6 +551,13 @@ end
 -- Setting btn[w_key] alone is not enough: the render tree still points at
 -- the old widget until these slots are patched too.
 local function _syncButtonRenderSlot(btn, w_key, new_w)
+    -- Button:hide() may already have run (Menu:init hides the chevrons before
+    -- they are restyled). Button.hidden stays set, so later hide() calls are
+    -- no-ops: carry the flag over or the new widget paints anyway.
+    local old_w = btn[w_key]
+    if old_w and old_w.hide ~= nil and new_w.hide == nil then
+        new_w.hide = old_w.hide
+    end
     btn[w_key] = new_w
 
     local hg = btn.horizontal_group
@@ -506,16 +585,42 @@ local function _syncButtonRenderSlot(btn, w_key, new_w)
     end
 end
 
+-- Makes `widget` paint in a w x h slot whatever its own size: centered, so an
+-- icon larger than its slot grows evenly on every side. When `edge()` returns
+-- "left" or "right" for a symbol glyph, its ink is drawn flush against that
+-- side of the slot instead, whatever the glyph's side bearings. `edge` follows
+-- the layout direction, like LeftContainer/RightContainer.
+local function _placeInSlot(widget, w, h, edge)
+    local paint = widget.paintTo
+    widget.paintTo = function(self, bb, x, y)
+        -- Button:hide() only sets .hide, which ImageWidget honours but a
+        -- symbol glyph's TextWidget does not.
+        if self.hide then return end
+        local sz = self:getSize()
+        local dx = math.floor((w - sz.w) / 2)
+        local side = edge and edge()
+        local ink  = side and M.glyphInk(self.face, self.text)
+        if ink then
+            local to_left = (side == "left") ~= (BD.mirroredUILayout() == true)
+            dx = to_left and -ink.left or w - ink.left - ink.width
+        end
+        paint(self, bb, x + dx, y + math.floor((h - sz.h) / 2))
+    end
+end
+
 --- Replaces image.file on a live button widget with the icon in effect for
 --- `id` (stored override or slot default).  Does nothing when neither is set
 --- or the button has no image.  Returns true when an icon was applied.
+--- `btn.sui_icon_scale` (default 1) sizes the icon relative to the button for
+--- symbol glyphs and image icons alike. The icon stays centered in its slot,
+--- except a symbol glyph with `btn.sui_icon_edge` ("left" | "right") set: its
+--- ink is drawn flush against that side of the slot. The field is read at
+--- paint time, so it may be set or changed after the icon is applied.
 function M.applyIconToBtn(id, btn)
-    local raw = M.getEffectiveIcon(id)
-    if not raw then return false end
     if not btn then return false end
-    local path = M.safeIconPath(raw, nil, id)
+    local path = M.resolveIcon(id)
     if not path then return false end
-    
+
     local Config = require("infra/sui_config")
     local is_nerd = Config.isNerdIcon(path)
 
@@ -523,34 +628,27 @@ function M.applyIconToBtn(id, btn)
         local w = btn[w_key]
         if not w then return end
 
+        local w_width  = btn.width  or w.width
+        local w_height = btn.height or w.height
+        local scale    = btn.sui_icon_scale or 1
+        local box      = math.floor(math.min(w_width, w_height) * scale)
+
         if is_nerd then
             local nerd_char = Config.nerdIconChar(path)
-            local Font = require("ui/font")
             local TextWidget = require("ui/widget/textwidget")
 
             pcall(w.free, w)
 
-            local w_width  = btn.width  or w.width
-            local w_height = btn.height or w.height
-            local font_size = math.floor(math.min(w_width, w_height) * 0.65)
-
             local new_w = TextWidget:new{
                 text    = nerd_char,
-                face    = Font:getFace(M.FACE_ICONS, font_size),
+                face    = M.glyphFace(box),
                 fgcolor = btn.icon_color or require("ffi/blitbuffer").COLOR_BLACK,
                 padding = 0,
             }
             new_w.width  = w_width
             new_w.height = w_height
             new_w.is_sui_wrapper = true
-
-            local orig_paintTo = new_w.paintTo
-            new_w.paintTo = function(self_w, bb, x, y)
-                local sz = self_w:getSize()
-                local ox = x + math.floor((w_width - sz.w) / 2)
-                local oy = y + math.floor((w_height - sz.h) / 2)
-                orig_paintTo(self_w, bb, ox, oy)
-            end
+            _placeInSlot(new_w, w_width, w_height, function() return btn.sui_icon_edge end)
 
             _syncButtonRenderSlot(btn, w_key, new_w)
 
@@ -559,14 +657,18 @@ function M.applyIconToBtn(id, btn)
                 bb_mod.patchDimmedIcon(btn)
             end
         else
-            if w.is_sui_wrapper then
+            if w.is_sui_wrapper or scale ~= 1 then
                 pcall(w.free, w)
                 local IconWidget = require("ui/widget/iconwidget")
                 local new_w = IconWidget:new{
                     file   = path,
-                    width  = btn.width,
-                    height = btn.height,
+                    width  = box,
+                    height = box,
                 }
+                if scale ~= 1 then
+                    new_w.is_sui_wrapper = true
+                    _placeInSlot(new_w, w_width, w_height)
+                end
                 _syncButtonRenderSlot(btn, w_key, new_w)
 
                 local bb_mod = package.loaded["screens/sui_bottombar"]
@@ -694,6 +796,12 @@ end
 --- Returns true when an override was applied.
 function M.applyCollBackIcon(widget)
     if not widget then return false end
+    -- Title bar owns back navigation on sub pages; the native bottom-left
+    -- return arrow is suppressed and must not be restyled back into view.
+    local ok_tb, TB = pcall(require, "screens/sui_titlebar")
+    if ok_tb and TB and TB.isEnabled and TB.isEnabled() then
+        return false
+    end
     local btn = widget.page_return_arrow
     if not btn then return false end
     return M.applyIconToBtn("sui_coll_back", btn)
@@ -728,14 +836,9 @@ end
 -- Assigning a full custom path straight into `tab.icon` therefore always
 -- resolves to icon-not-found.
 --
--- The same trick sui_quicksettings_bar.lua already uses to make
--- "simpleui_settings" resolve applies here too: REGISTER the custom icon under
--- a stable bare name:
---   1. Copy the file to DataStorage/icons/<name>.<ext> (disk-based lookup;
---      ICONS_DIRS always searches the user icons dir first, so this alone
---      is enough, and survives restarts).
---   2. Also poke IconWidget's runtime ICONS_PATH cache so the change is
---      visible immediately, without waiting for a fresh process.
+-- The icon is therefore REGISTERED under a stable bare name through
+-- infra/sui_icon_registry.lua, which copies the file to the user icons
+-- directory and updates IconWidget's lookup so the change applies at once.
 -- Only .svg/.png are supported here because those are the only two
 -- extensions IconWidget's by-name search ever tries.
 local _TAB_ICON_NAME_CACHE = {} -- slot_id -> { src = last-registered source path, name = registered name }
@@ -770,41 +873,12 @@ function M.registerTabIconName(slot_id, path)
         return name -- already registered for this exact source
     end
 
-    local ok_ds, DataStorage = pcall(require, "datastorage")
-    local ok_lfs, lfs        = pcall(require, "libs/libkoreader-lfs")
-    local ok_fu, ffiutil     = pcall(require, "ffi/util")
-    if not (ok_ds and ok_lfs and ok_fu) then return nil end
-
-    local user_dir = DataStorage:getDataDir() .. "/icons"
-    if lfs.attributes(user_dir, "mode") ~= "directory" then
-        pcall(lfs.mkdir, user_dir)
-    end
-    local dst = user_dir .. "/" .. name .. "." .. ext
-
-    -- Always (re)copy — the user may have picked a different source file
-    -- for the same slot since the last time this ran.
-    local copy_ok = pcall(ffiutil.copyFile, path, dst)
-    if not copy_ok or lfs.attributes(dst, "mode") ~= "file" then
+    -- Always (re)copy: the user may have picked a different source file for
+    -- the same slot since the last time this ran.
+    if not require("infra/sui_icon_registry").register(name, path) then
         logger.warn("simpleui/style: failed to register tab icon for " .. slot_id)
         return nil
     end
-
-    -- Keep IconWidget's runtime name-cache in sync so the change applies
-    -- immediately, without a restart (same approach as
-    -- sui_quicksettings_bar.lua's icon-registration Layer 2).
-    pcall(function()
-        local iw = require("ui/widget/iconwidget")
-        local iw_init = iw._simpleui_orig_init_for_scan or rawget(iw, "init")
-        if type(iw_init) ~= "function" then return end
-        for i = 1, 64 do
-            local uname, uval = debug.getupvalue(iw_init, i)
-            if uname == nil then break end
-            if uname == "ICONS_PATH" and type(uval) == "table" then
-                uval[name] = dst
-                break
-            end
-        end
-    end)
 
     _TAB_ICON_NAME_CACHE[slot_id] = { src = path, name = name }
     return name
@@ -853,97 +927,19 @@ function M.applyTabIcons(fm_or_table)
 end
 
 -- ---------------------------------------------------------------------------
--- Persistent tab-bar icon patches (FileManagerMenu + ReaderMenu)
+-- Persistent tab-bar icon patch (FileManagerMenu + ReaderMenu)
 -- ---------------------------------------------------------------------------
--- Both patches hook `onShowMenu` rather than `setUpdateItemTable`.
---
--- Why onShowMenu: FileManagerMenu/ReaderMenu:onShowMenu only calls
--- setUpdateItemTable() when `self.tab_item_table == nil` (build-once, cache
--- forever per instance). Patching onShowMenu instead of setUpdateItemTable
--- guarantees our override runs on *every* menu opening, and — critically —
--- runs it by forcing the table to be built (via a dynamic `menu_self:
--- setUpdateItemTable()` call, which resolves to whatever version is
--- currently installed, including sui_quicksettings_bar's own tab-injection
--- wrap) *before* delegating to the untouched native onShowMenu that
--- actually constructs the TouchMenu widget. This sidesteps any ordering
--- dependency between this patch and sui_quicksettings_bar's own patches:
--- by the time TouchMenu:new{} runs, every tab (native + injected) already
--- has its final icon.
---
--- The SimpleUI-injected Quick Settings tab (_sui_qs_panel) is additionally
--- kept in sync directly by QSBar.refreshPanelTabIcon() (see
--- sui_quicksettings_bar.lua), since that tab is a single shared table
--- object reused by reference in both FM and Reader — mutating its `.icon`
--- field once is sufficient and avoids relying on injection-vs-override
--- ordering altogether. applyTabIcons() below still matches it too, as a
--- harmless no-op confirmation once it's present in a given tab_item_table.
+-- Registers a menu hook step that re-applies the icon overrides to the tab
+-- table whenever it is built or opened. Re-applying on every opening is
+-- required because the tab table is cached between openings.
 
--- Descriptors for the two patch targets: module path, the plugin-instance
--- flag name (read/cleared by sui_patches.lua on teardown), and a log label.
-local _TAB_PATCH_TARGETS = {
-    fm = {
-        module_path  = "apps/filemanager/filemanagermenu",
-        plugin_flag  = "_sysicon_fmmenu_patched",
-        log_label    = "FM",
-    },
-    reader = {
-        module_path  = "apps/reader/modules/readermenu",
-        plugin_flag  = "_sysicon_rdmenu_patched",
-        log_label    = "Reader",
-    },
-}
-
--- installed[target] tracks whether _installTabPatch has already run for
--- that target, so repeated calls (e.g. on plugin re-init) are no-ops.
-local _tab_patch_installed = { fm = false, reader = false }
-
-local function _installTabPatch(target, plugin)
-    if _tab_patch_installed[target] then return end
-    local t = _TAB_PATCH_TARGETS[target]
-    local Menu = package.loaded[t.module_path]
-    if not Menu then
-        local ok, m = pcall(require, t.module_path)
-        Menu = ok and m or nil
-    end
-    if not Menu then return end
-    if Menu._simpleui_sysicon_patched then return end
-
-    local orig = Menu.onShowMenu
-    Menu._simpleui_sysicon_orig    = orig
-    Menu._simpleui_sysicon_patched = true
-    if plugin then plugin[t.plugin_flag] = true end
-
-    Menu.onShowMenu = function(menu_self, ...)
-        if menu_self.tab_item_table == nil then
-            menu_self:setUpdateItemTable()
-        end
-        if menu_self.tab_item_table then
-            M.applyTabIcons(menu_self.tab_item_table)
-        end
-        return orig(menu_self, ...)
-    end
-
-    _tab_patch_installed[target] = true
-    logger.dbg("simpleui/style: " .. t.log_label .. " tab icon patch installed")
+function M.installTabIconPatch()
+    MenuHooks.register{
+        id      = "tab_icons",
+        order   = MenuHooks.ORDER.TAB_ICONS,
+        prepare = function(menu) M.applyTabIcons(menu.tab_item_table) end,
+    }
 end
-
-local function _removeTabPatch(target)
-    if not _tab_patch_installed[target] then return end
-    local t = _TAB_PATCH_TARGETS[target]
-    local Menu = package.loaded[t.module_path]
-    if Menu and Menu._simpleui_sysicon_patched then
-        Menu.onShowMenu                = Menu._simpleui_sysicon_orig
-        Menu._simpleui_sysicon_orig    = nil
-        Menu._simpleui_sysicon_patched = nil
-    end
-    _tab_patch_installed[target] = false
-    logger.dbg("simpleui/style: " .. t.log_label .. " tab icon patch removed")
-end
-
-function M.installTabIconPatch(plugin)       _installTabPatch("fm", plugin) end
-function M.removeTabIconPatch()              _removeTabPatch("fm") end
-function M.installReaderTabIconPatch(plugin) _installTabPatch("reader", plugin) end
-function M.removeReaderTabIconPatch()        _removeTabPatch("reader") end
 
 -- ---------------------------------------------------------------------------
 -- Live tab-bar icon refresh
@@ -1097,9 +1093,11 @@ function M.makeMenuItems(plugin)
             end,
             keep_menu_open = true,
             callback = function()
-                QA.showIconPicker(
-                    M.getIcon(slot.id),
-                    function(new_path)
+                QA.showIconPicker{
+                    icon          = M.getIcon(slot.id),
+                    default_label = type(slot.label) == "function" and slot.label() or slot.label,
+                    allow_nerd    = true,
+                    on_select     = function(new_path)
                         -- Guard: validate format/existence before persisting.
                         -- nil = "reset to default", always valid.
                         if new_path == nil then
@@ -1115,11 +1113,7 @@ function M.makeMenuItems(plugin)
                             require("infra/sui_core").Notify.toast(_("Unsupported icon format.\nPlease use a PNG or SVG file."))
                         end
                     end,
-                    type(slot.label) == "function" and slot.label() or slot.label,
-                    plugin,
-                    "_sysicon_picker_" .. slot.id,
-                    true
-                )
+                }
             end,
         }
     end
@@ -1168,88 +1162,14 @@ function M.makeMenuItems(plugin)
     _addGroupRows("sui_pager_icons")
     _addGroupRows("sui_navpager_icons")
     _addGroupRows("sui_fc_icons")
+    _addGroupRows("sui_qs_icons")
     _addGroupRows("sui_tabbar_icons")
 
     return items
 end
 
 function M.sui_build_system_icons(plugin, ctx_menu, ctx)
-    local Device = require("device")
-    local Screen = Device.screen
-    local FrameContainer = require("ui/widget/container/framecontainer")
-    local CenterContainer = require("ui/widget/container/centercontainer")
-    local ImageWidget = require("ui/widget/imagewidget")
-    local TextWidget = require("ui/widget/textwidget")
-    local IconWidget = require("ui/widget/iconwidget")
-    local Font = require("ui/font")
-    local Geom = require("ui/geometry")
-    
-    local btn_size = Screen:scaleBySize(36)
-    local icon_size = math.floor(btn_size * 0.7)
-    local border_sz = Screen:scaleBySize(1)
-    
-    local function makeIconPreview(icon_path, ko_native, fallback_label)
-        local icon_widget
-        local Config = require("infra/sui_config")
-        local is_nerd = icon_path and Config.isNerdIcon(icon_path)
-        
-        if is_nerd then
-            local nerd_char = Config.nerdIconChar(icon_path)
-            if nerd_char then
-                icon_widget = TextWidget:new{
-                    text    = nerd_char,
-                    face    = Font:getFace(M.FACE_ICONS, math.floor(icon_size * 0.8)),
-                    fgcolor = M.COLOR.text_primary,
-                    padding = 0,
-                }
-            end
-        elseif icon_path then
-            local safe_path = M.safeIconPath(icon_path, nil)
-            if safe_path then
-                local iw = ImageWidget:new{
-                    file    = safe_path,
-                    width   = icon_size,
-                    height  = icon_size,
-                    is_icon = true,
-                    alpha   = true,
-                }
-                if pcall(function() iw:_render() end) then
-                    icon_widget = iw
-                else
-                    iw:free()
-                end
-            end
-        end
-        
-        if not icon_widget and ko_native then
-            icon_widget = IconWidget:new{
-                icon    = ko_native,
-                width   = icon_size,
-                height  = icon_size,
-            }
-        end
-
-        if not icon_widget then
-            icon_widget = TextWidget:new{
-                text    = fallback_label and fallback_label:sub(1, 1):upper() or "?",
-                face    = Font:getFace("cfont", math.floor(icon_size * 0.7)),
-                fgcolor = M.COLOR.text_primary,
-            }
-        end
-        
-        return FrameContainer:new{
-            dimen      = Geom:new{ w = btn_size, h = btn_size },
-            radius     = Screen:scaleBySize(8),
-            bordersize = border_sz,
-            background = M.COLOR.surface,
-            color      = M.COLOR.gray,
-            padding    = 0,
-            [1]        = CenterContainer:new{
-                dimen = Geom:new{ w = btn_size - border_sz * 2, h = btn_size - border_sz * 2 },
-                [1]   = icon_widget,
-            }
-        }
-    end
+    local preview_size = Screen:scaleBySize(36)
 
     local function get_rows()
         local rows = {}
@@ -1262,7 +1182,9 @@ function M.sui_build_system_icons(plugin, ctx_menu, ctx)
                             text = group_name:upper(),
                             is_divider = true,
                             sui_build = function(ctx)
-                                return require("engines/sui_window").SectionLabel{ text = group_name:upper(), inner_w = ctx.inner_w }
+                                return require("engines/sui_window").SectionLabel{
+                                    text = group_name, inner_w = ctx.inner_w,
+                                }
                             end
                         }
                         added_title = true
@@ -1271,7 +1193,7 @@ function M.sui_build_system_icons(plugin, ctx_menu, ctx)
                     local path = M.getIcon(slot.id)
                     local label = type(slot.label) == "function" and slot.label() or slot.label
                     
-                    local effective_path = path or slot.default_icon
+                    local effective_path = path or _defaultIcon(slot)
                     local ko_native = nil
                     if not effective_path then
                         if slot.default_ko and slot.default_ko:match("%.svg$") then
@@ -1286,15 +1208,19 @@ function M.sui_build_system_icons(plugin, ctx_menu, ctx)
                             ko_native = slot.default_ko
                         end
                     end
-                    
+
                     rows[#rows + 1] = {
                         text = label .. (path and "  \u{270E}" or ""),
                         show_chevron = true,
-                        right_widget = makeIconPreview(effective_path, ko_native, label),
+                        right_widget = M.buildIconPreview(preview_size, {
+                            icon = effective_path, ko_native = ko_native, label = label,
+                        }),
                         on_hold = function() end,
                         on_tap = function()
                             local QA = require("features/sui_quickactions")
-                            QA.showIconPicker(path, function(new_path)
+                            QA.showIconPicker{ icon = path, default_label = label,
+                              allow_nerd = slot.group ~= "sui_tabbar_icons",
+                              on_select = function(new_path)
                                 local function _guardedSetIcon(ipath, on_valid)
                                     if ipath == nil then on_valid(nil); return end
                                     local safe = M.safeIconPath(ipath, nil)
@@ -1338,7 +1264,7 @@ function M.sui_build_system_icons(plugin, ctx_menu, ctx)
                                     end
                                     ctx.repaint()
                                 end)
-                            end, label, plugin, "_sysicon_picker_" .. slot.id, slot.group ~= "sui_tabbar_icons")
+                            end }
                         end
                     }
                 end
@@ -1350,6 +1276,7 @@ function M.sui_build_system_icons(plugin, ctx_menu, ctx)
         addGroup("sui_pager_icons", _("Pagination Bar"))
         addGroup("sui_navpager_icons", _("Navpager"))
         addGroup("sui_fc_icons", _("Folder Covers"))
+        addGroup("sui_qs_icons", _("Quick Settings"))
         addGroup("sui_tabbar_icons", _("Tab Bar"))
         return rows
     end
@@ -1360,8 +1287,8 @@ function M.sui_build_system_icons(plugin, ctx_menu, ctx)
         footer_text = _("Reset All"),
         footer_icon = "update",
         footer_action = function(ctx2)
-            local ConfirmBox = require("ui/widget/confirmbox")
-            ctx_menu.UIManager:show(ConfirmBox:new{
+            local Dialogs = require("features/dialogs/sui_dialogs")
+            Dialogs.confirm{
                 text = _("Reset all system icons to default?"),
                 ok_text = _("Reset"),
                 cancel_text = _("Cancel"),
@@ -1369,7 +1296,7 @@ function M.sui_build_system_icons(plugin, ctx_menu, ctx)
                     M.performResetAllSystemIcons(plugin)
                     ctx2.repaint()
                 end,
-            })
+            }
         end,
     })
 end
@@ -1377,7 +1304,7 @@ end
 -- ---------------------------------------------------------------------------
 -- SUI Typographic Scale
 -- ---------------------------------------------------------------------------
--- Five semantic font-size levels used across all SimpleUI modules.
+-- Semantic font-size levels used across all SimpleUI modules.
 -- Change values only here — every module derives its sizes from these.
 --
 --  FS_TITLE    (22)  — primary title, placeholder, cover heading, dir label
@@ -1385,6 +1312,7 @@ end
 --  FS_BODY     (18)  — standard row text, quote body, section label
 --  FS_DETAIL   (15)  — metadata, percentages, collection labels, stats label
 --  FS_CAPTION  (12)  — minimum readable label, pagination xs, goal sub-label
+--  FS_ICON     (30)  — symbol-font action glyphs in window rows and headers
 --
 --  Badge overlays (module_collections, sui_foldercovers) are calculated
 --  proportionally to their container size and intentionally bypass this scale.
@@ -1414,6 +1342,7 @@ M.FS_SUBTITLE = _fs(20)
 M.FS_BODY     = _fs(18)
 M.FS_DETAIL   = _fs(15)
 M.FS_CAPTION  = _fs(12)
+M.FS_ICON     = _fs(30)
 
 -- ---------------------------------------------------------------------------
 -- SUI Color Palette
@@ -1423,11 +1352,16 @@ M.FS_CAPTION  = _fs(12)
 -- Usage: fgcolor = SUIStyle.COLOR.text_dim
 --
 --  text_primary         — primary text, active icons/borders (black).
---  text_secondary       — secondary text (e.g. onboarding subtitles).
---  text_dim             — inactive/dim text or icons (e.g. opts.dim
---                         variants, chart axis labels).
+--  text_dim             — text or icons of an inactive control (e.g. opts.dim
+--                         variants). Text is never gray otherwise.
 --  surface              — solid light background / "eraser" fill.
---  surface_flat         — flat dark background (flat-style cards, bars).
+--  surface_flat         — flat background of surfaces that offer no tone
+--                         choice (action sheets, stats windows): the
+--                         secondary colour when one is on screen, else
+--                         surface_gray.
+--  surface_gray         — light gray background: the gray tone of every
+--                         surface (cards, buttons, bars, modules). Plain
+--                         gray; never follows the secondary colour.
 --  gray                 — medium-weight gray: card and frame borders, the
 --                         bottom bar separator, the book cover spine/edge
 --                         line, accent borders on active controls (progress
@@ -1435,117 +1369,178 @@ M.FS_CAPTION  = _fs(12)
 --  gray_strong          — darker gray: menu and list separator lines, light
 --                         circular fills, the placeholder background behind
 --                         book covers, and muted icon fills.
+--  text_dim_inverse     — inactive text or icons over a dark fill (light gray,
+--                         where text_dim would be too dark to read).
 --  gray_soft            — lighter gray, used where gray_strong would be too
---                         heavy (e.g. onboarding, cover widgets) — also the
---                         border color for library/book-grid badges.
---  track                — progress bar / badge track background.
+--                         heavy (e.g. onboarding, cover widgets).
+--  track                — progress bar / badge track background. Follows
+--                         the secondary colour's track tint when on screen.
 --  disabled             — disabled control/icon state.
 --  debug                — debug-only visual overlays.
 M.COLOR = {
     text_primary         = Blitbuffer.COLOR_BLACK,
-    text_secondary       = Blitbuffer.COLOR_DARK_GRAY,
     text_dim             = Blitbuffer.gray(0.45),
+    text_dim_inverse     = Blitbuffer.Color8(0x99),
     surface              = Blitbuffer.COLOR_WHITE,
-    surface_flat         = Blitbuffer.gray(0.08),
+    surface_gray         = Blitbuffer.gray(Accent.INK.flat),
     gray                 = Blitbuffer.gray(0.72),
     gray_strong          = Blitbuffer.gray(0.85),
     gray_soft            = Blitbuffer.gray(0.33),
-    track                = Blitbuffer.gray(0.15),
     disabled             = Blitbuffer.gray(0.25),
     debug                = Blitbuffer.COLOR_RED,
 }
 
+-- Tokens that follow the secondary colour: its live colour, else the plain gray
+-- of the same blackness. Resolved on every read so they follow the setting and
+-- night mode.
+local SECONDARY_TOKENS = {
+    surface_flat = { gray = M.COLOR.surface_gray,              live = Accent.secondaryColor },
+    track        = { gray = Blitbuffer.gray(Accent.INK.track), live = Accent.trackColor },
+}
+setmetatable(M.COLOR, { __index = function(_, name)
+    local token = SECONDARY_TOKENS[name]
+    return token and (token.live() or token.gray)
+end })
+
+-- Fill colour of an active control: the user's accent colour when one is set,
+-- else `fallback` (COLOR.text_primary by default). Read it at build or paint
+-- time, never at load time, so it follows the setting and night mode.
+function M.accent(fallback)
+    return Accent.color() or fallback or M.COLOR.text_primary
+end
+
+-- Colour of text or glyphs drawn on an `accent` fill, else `fallback`
+-- (COLOR.surface by default).
+function M.accentFg(fallback)
+    return Accent.foreground() or fallback or M.COLOR.surface
+end
+
+-- Fill colour of a secondary surface: the user's secondary colour when one is
+-- on screen, else `fallback` (COLOR.surface_flat by default).
+function M.secondary(fallback)
+    return Accent.secondaryColor() or fallback or M.COLOR.surface_flat
+end
+
+-- True when `color` is the plain surface colour. Safe on nil and non-colours:
+-- any `==`/`~=` involving a colour calls its `__eq`, which raises on nil, so
+-- the type is tested first.
+function M.isSurface(color)
+    return type(color) == "cdata" and color == M.COLOR.surface
+end
+
+-- The palette colours a stored choice can name: how to read the colour and the
+-- text colour that reads on it.
+local PALETTE_CHOICES = {
+    accent    = { color = Accent.color,          foreground = Accent.foreground },
+    secondary = { color = Accent.secondaryColor, foreground = Accent.secondaryForeground },
+}
+
+-- Whether `choice` names a palette colour.
+function M.isPaletteChoice(choice)
+    return PALETTE_CHOICES[choice] ~= nil
+end
+
+-- Whether `choice` names a palette colour that is on screen: not on a black and
+-- white screen, and not while that colour is unset.
+function M.paletteChoiceAvailable(choice)
+    local palette = PALETTE_CHOICES[choice]
+    return palette ~= nil and palette.color() and true or false
+end
+
+-- Radio options for the palette colours that are on screen, in menu order.
+function M.paletteOptions(_lc)
+    local options = {}
+    if M.paletteChoiceAvailable("accent") then
+        options[#options + 1] = { value = "accent", label = _lc("Accent") }
+    end
+    if M.paletteChoiceAvailable("secondary") then
+        options[#options + 1] = { value = "secondary", label = _lc("Secondary") }
+    end
+    return options
+end
+
+-- Colour of a stored colour choice. "accent" and "secondary" give their palette
+-- colour; any other choice, or a palette colour that is not active (black and
+-- white screen, nothing set), gives `fallback`.
+function M.resolveColor(choice, fallback)
+    local palette = PALETTE_CHOICES[choice]
+    return palette and palette.color() or fallback
+end
+
+-- Text colour that reads on the palette colour `choice` painted at `strength`
+-- percent (default 100); nil when `choice` has no colour (see resolveColor).
+function M.resolveForeground(choice, strength)
+    local palette = PALETTE_CHOICES[choice]
+    return palette and palette.foreground(strength)
+end
+
+-- True when a setting stores the palette choice `choice`: a surface tone or a
+-- badge or label colour. Tells whether a change of that colour has anything to
+-- redraw.
+function M.usesColor(choice)
+    for _key, value in SUISettings:iterateKeys() do
+        if value == choice then return true end
+    end
+    return false
+end
+
+-- Stored values of a badge colour option; "dark" and "light" are the plain
+-- fill, "accent" and "secondary" follow the palette colour.
+local BADGE_CHOICES = { dark = true, light = true, accent = true, secondary = true }
+
+-- `stored` when it is a badge colour choice, else `default`.
+function M.badgeChoice(stored, default)
+    return BADGE_CHOICES[stored] and stored or default
+end
+
+-- `choice` as the radio of a badge colour setting shows it: a palette choice
+-- whose colour is not on screen is not offered and reads as "dark", the fill
+-- badgeColors gives it.
+function M.badgeChoiceShown(choice)
+    if M.isPaletteChoice(choice) and not M.paletteChoiceAvailable(choice) then return "dark" end
+    return choice
+end
+
+-- Radio options of a badge colour setting. "Accent" and "Secondary" are offered
+-- only while their colour is on screen. `follow_label` adds the leading "unset"
+-- entry of the per-module overrides.
+function M.badgeColorOptions(_lc, follow_label)
+    local options = {}
+    if follow_label then options[#options + 1] = { value = nil, label = follow_label } end
+    options[#options + 1] = { value = "dark",  label = _lc("Dark") }
+    options[#options + 1] = { value = "light", label = _lc("Light") }
+    for _i, option in ipairs(M.paletteOptions(_lc)) do options[#options + 1] = option end
+    return options
+end
+
+-- Fill and text colours of a count/status badge for a stored choice: "light"
+-- is white with black text, a palette choice its colour with the text colour
+-- that reads on it, anything else black with white text. "accent" is black
+-- while no accent colour is on screen.
+function M.badgeColors(choice)
+    if choice == "light" then return M.COLOR.surface, M.COLOR.text_primary end
+    local fill = M.resolveColor(choice)
+    if fill then return fill, M.resolveForeground(choice) end
+    return M.COLOR.text_primary, M.COLOR.surface
+end
+
 -- Global border thickness for all frames and elements
 M.BORDER_SZ   = math.max(1, Screen:scaleBySize(1))
 
--- ---------------------------------------------------------------------------
--- computeBox(show_frame, solid_bg, scale, pad) — style and sizing for the
--- optional Frame/Background box offered by every homescreen card that has
--- one.
---
--- `outer_margin` keeps the box's own visible edge — border and/or solid
--- background — aligned with sectionLabel's own left/right text inset
--- (engines/sui_screen_engine.lua), instead of flush against the module's
--- true outer edges. `inner_pad` is the breathing room between that edge
--- and the content, reserved only while the box is actually shown; with no
--- frame and no background there's nothing to leave room between, so
--- content sits directly at outer_margin, matching the label above it.
---
--- inset_h always reserves outer_margin on both sides — the label's own
--- inset is unconditional too, so this keeps content aligned with it
--- whether or not the box is currently shown. inset_v has no outer_margin
--- term: there's no label edge to align against vertically.
--- ---------------------------------------------------------------------------
-function M.computeBox(show_frame, solid_bg, scale, pad, backdrop_strength)
-    -- backdrop_strength 0–100: 0 transparent, 1–99 scrim, 100 solid.
-    -- solid_bg remains supported: true ≡ strength 100.
-    local strength = require("features/sui_wallpaper").clampBackdropStrength(backdrop_strength)
-    if strength == nil then
-        strength = solid_bg and 100 or 0
-    end
-    local opaque    = strength >= 100
-    local has_scrim = strength > 0 and strength < 100
-    local has_box   = show_frame or opaque or has_scrim
-    local border_sz = show_frame and M.BORDER_SZ or 0
-    local inner_pad = has_box and pad or 0
-    return {
-        has_box           = has_box,
-        border_sz         = border_sz,
-        radius            = has_box and math.floor(Screen:scaleBySize(12) * (scale or 1)) or 0,
-        border_color      = M.COLOR.gray,
-        bg_color          = opaque and M.COLOR.surface or nil,
-        backdrop_strength = strength,
-        -- Outer margin is applied by module chrome (single source of truth
-        -- for label alignment). computeBox only contributes inner pad/border.
-        outer_margin      = 0,
-        inner_pad         = inner_pad,
-        inset_h = inner_pad * 2 + border_sz * 2,
-        inset_v = inner_pad * 2 + border_sz * 2,
-    }
-end
-
--- ---------------------------------------------------------------------------
--- wrapBox(content, box) — wraps `content` (already sized to fit within
--- box.inset_h/inset_v less than the module's own w) in the optional Frame/
--- Background box computed by computeBox(). The box's own edge sits inset
--- by box.outer_margin on the left and right, so it lines up with
--- sectionLabel's text above it instead of extending past it to the
--- column's true edges. The returned widget's total width is exactly the
--- w originally passed to computeBox.
--- ---------------------------------------------------------------------------
-function M.wrapBox(content, box)
-    local inner = FrameContainer:new{
-        bordersize     = box.border_sz,
-        radius         = box.radius,
-        color          = box.border_color,
-        background     = box.bg_color,
-        padding        = box.inner_pad,
-        padding_top    = box.has_box and box.inner_pad or 0,
-        padding_bottom = box.has_box and box.inner_pad or 0,
-        content,
-    }
-    -- Scrim / solid module backdrop is painted by the homescreen module
-    -- wrapper (screen engine) so every module type shares one path.
-    if box.outer_margin <= 0 then return inner end
-    return HorizontalGroup:new{
-        align = "top",
-        HorizontalSpan:new{ width = box.outer_margin },
-        inner,
-        HorizontalSpan:new{ width = box.outer_margin },
-    }
-end
-
--- Thinner border and specific color for library badges and book covers
+-- Border of every badge (and thickness of the book cover borders)
 M.BADGE_BORDER_SZ  = require("ui/size").border.thin
-M.BADGE_BORDER_CLR = M.COLOR.gray_soft
+M.BADGE_BORDER_CLR = M.COLOR.text_primary
+
+-- Height of the progress bars shown by the modules and the Quick Settings panel
+M.PROGRESS_BAR_H = Screen:scaleBySize(8)
 
 -- Global size trim applied on top of every corner-badge scale (progress
--- pentagon, pages, series index, new book) — both the Library grid's own
--- badges (features/library/sui_foldercovers.lua's M.getBadgeScale) and the
+-- pentagon, pages, series index, new book) — both the Style badges
+-- (features/sui_cover_elements.lua's getScale) and the
 -- book-grid modules' badges (engines/sui_book_grid.lua's
 -- GridRenderer.getBadgeScale). Baked in here, instead of into either
 -- badge-scale setting's default value, so the user-facing "100%" in both
--- the Library "Badge Size" and the Home Screen "Badge Size" spinners keeps
+-- the Style "Size" and the Home Screen "Badge Size" spinners keeps
 -- meaning "this control's own baseline" — the baseline itself is just 10%
 -- smaller everywhere than it used to be. Not applied to module_collections.lua's
 -- own count badge, which isn't part of this shared four-badge family.
@@ -1578,6 +1573,215 @@ M.FACE_BOLD    = "tfont"
 M.FACE_MONO    = "infont"
 M.FACE_ICONS   = "symbols"
 
+-- Fraction of its box that a symbol-font glyph's em square occupies. Glyph ink
+-- spans ~0.83 em (median) and bundled SVG icons ~0.81 of their box, so an em
+-- close to the box renders both at the same visual size.
+M.GLYPH_RATIO  = 0.95
+
+-- Fraction of its box that an initial-letter fallback's em square occupies.
+M.LETTER_RATIO = 0.65
+
+--- Returns a face whose em is `px` real pixels.
+--- Font:getFace() expects density-independent units and applies
+--- Screen:scaleBySize() itself, so the target size is converted back first.
+--- The unpatched getFace is used when available so the Global Text Size scale
+--- never resizes text that lives in a fixed box.
+--- @param face string  font alias (e.g. M.FACE_ICONS)
+--- @param px   number  em size in pixels
+--- @return table       font face
+function M.pxFace(face, px)
+    local Font    = require("ui/font")
+    local getFace = Font._simpleui_native_getface or Font.getFace
+    local unit    = Screen:scaleBySize(1000) / 1000
+    -- The half-pixel offset keeps the ceil() in scaleBySize() from rounding up.
+    return getFace(Font, face, (math.max(1, math.floor(px)) - 0.5) / unit)
+end
+
+--- Face for a symbol glyph drawn inside a square box of `box_px` pixels.
+function M.glyphFace(box_px)
+    return M.pxFace(M.FACE_ICONS, box_px * M.GLYPH_RATIO)
+end
+
+--- Horizontal extent of the ink of a single character, relative to the pen
+--- origin it is drawn from: `left` is the offset of its leftmost pixel and
+--- `width` the ink width. Glyphs sit inside side bearings, so aligning ink to
+--- an edge means shifting the glyph by these values rather than by its
+--- advance width. Returns nil when the font engine cannot render `char`.
+--- @param face table   font face
+--- @param char string  one UTF-8 encoded character
+--- @return table|nil   { left, width }
+function M.glyphInk(face, char)
+    local ok, ink = pcall(function()
+        local glyph = RenderText:getGlyph(face, ffiutil.utf8charcode(char))
+        return { left = glyph.l, width = glyph.bb:getWidth() }
+    end)
+    return ok and ink or nil
+end
+
+--- Face for an initial letter drawn inside a square box of `box_px` pixels.
+--- @param face string|nil  font alias, defaults to M.FACE_REGULAR
+function M.letterFace(box_px, face)
+    return M.pxFace(face or M.FACE_REGULAR, box_px * M.LETTER_RATIO)
+end
+
+-- Corner radius of an icon tile, relative to its side.
+local PREVIEW_RADIUS_RATIO = 0.22
+-- Icon side inside the tile, relative to the tile side.
+local PREVIEW_ICON_RATIO   = 0.7
+
+-- Square tile of `size` pixels with a rounded border, `content` centred
+-- inside it.
+local function frameTile(size, content)
+    local CenterContainer = require("ui/widget/container/centercontainer")
+    local Geom            = require("ui/geometry")
+
+    local inner = size - M.BORDER_SZ * 2
+    return require("infra/sui_backdrop").RoundedFrame:new{
+        radius     = math.floor(size * PREVIEW_RADIUS_RATIO + 0.5),
+        bordersize = M.BORDER_SZ,
+        background = M.COLOR.surface,
+        color      = M.accent(M.COLOR.gray),
+        CenterContainer:new{
+            dimen = Geom:new{ w = inner, h = inner },
+            content,
+        },
+    }
+end
+
+--- Colour preview: a pill of `w` x `h` pixels filled with `color`, a circle when
+--- the sides are equal. `selected` draws the heavier, black border. Without a
+--- colour the chip is an empty outline. The border is an anti-aliased fill
+--- under the inner one, so both edges blend once.
+--- @param w number
+--- @param h number
+--- @param color table|nil     Blitbuffer colour
+--- @param selected boolean|nil
+--- @param label table|nil     widget centred on the chip
+--- @return table              widget
+function M.buildColorChip(w, h, color, selected, label)
+    local Backdrop        = require("infra/sui_backdrop")
+    local CenterContainer = require("ui/widget/container/centercontainer")
+    local OverlapGroup    = require("ui/widget/overlapgroup")
+    local Geom            = require("ui/geometry")
+
+    local border = selected and M.BORDER_SZ * 3 or M.BORDER_SZ
+    local inner_w, inner_h = math.max(1, w - 2 * border), math.max(1, h - 2 * border)
+    local dimen = Geom:new{ w = w, h = h }
+    local chip = OverlapGroup:new{
+        allow_mirroring = false,
+        dimen           = dimen,
+        Backdrop.BackdropFill:new{
+            width    = w,
+            height   = h,
+            strength = Backdrop.STRENGTH_MAX,
+            radius   = math.floor(math.min(w, h) / 2),
+            color    = selected and M.COLOR.text_primary or M.COLOR.gray,
+            dimen    = dimen,
+        },
+        CenterContainer:new{
+            dimen = dimen,
+            Backdrop.BackdropFill:new{
+                width    = inner_w,
+                height   = inner_h,
+                strength = Backdrop.STRENGTH_MAX,
+                radius   = math.floor(math.min(inner_w, inner_h) / 2),
+                color    = color or M.COLOR.surface,
+            },
+        },
+    }
+    if label then chip[#chip + 1] = CenterContainer:new{ dimen = dimen, label } end
+    return chip
+end
+
+--- Framed square tile around the symbol glyph `key` (an M.icon key).
+--- @param size number  tile side in pixels
+--- @param key string
+--- @return table       widget
+function M.buildGlyphTile(size, key)
+    return frameTile(size, require("infra/sui_core").makeAccentText({
+        text    = M.icon(key),
+        face    = M.glyphFace(math.floor(size * PREVIEW_ICON_RATIO)),
+        padding = 0,
+    }, M.COLOR.text_primary))
+end
+
+--- Widget showing the icon of slot `id` at `size` px: the one the slot's own
+--- button shows, so a menu entry can match it. Symbol glyphs are tinted with
+--- `fgcolor`. Returns nil when the slot has nothing to draw.
+--- @param id string       slot id
+--- @param size number     icon side in pixels
+--- @param fgcolor table?  glyph colour (default: primary text)
+--- @return table|nil      widget
+function M.slotIconWidget(id, size, fgcolor)
+    local icon = M.resolveIcon(id)
+    if not icon then return nil end
+
+    local glyph = require("infra/sui_config").nerdIconChar(icon)
+    if glyph then
+        return require("ui/widget/textwidget"):new{
+            text    = glyph,
+            face    = M.glyphFace(size),
+            fgcolor = fgcolor or M.COLOR.text_primary,
+            padding = 0,
+        }
+    end
+    return require("ui/widget/iconwidget"):new{ file = icon, width = size, height = size }
+end
+
+--- Framed square preview of an icon. The content is, in order of preference:
+--- the image file or symbol glyph `opts.icon` refers to, the native icon named
+--- by `opts.ko_native`, or the initial of `opts.label`.
+--- @param size number  frame side in pixels
+--- @param opts table   { icon, ko_native, label }
+--- @return table       widget
+function M.buildIconPreview(size, opts)
+    local Config     = require("infra/sui_config")
+    local TextWidget = require("ui/widget/textwidget")
+
+    local icon      = opts.icon
+    local icon_size = math.floor(size * PREVIEW_ICON_RATIO)
+    local content
+
+    local glyph = Config.nerdIconChar(icon)
+    if glyph then
+        content = require("infra/sui_core").makeAccentText({
+            text    = glyph,
+            face    = M.glyphFace(icon_size),
+            padding = 0,
+        }, M.COLOR.text_primary)
+    elseif icon then
+        local path = M.safeIconPath(icon, nil)
+        if path then
+            local iw = require("ui/widget/imagewidget"):new{
+                file    = path,
+                width   = icon_size,
+                height  = icon_size,
+                is_icon = true,
+                alpha   = true,
+            }
+            if pcall(iw._render, iw) then content = iw else iw:free() end
+        end
+    end
+
+    if not content and opts.ko_native then
+        content = require("ui/widget/iconwidget"):new{
+            icon   = opts.ko_native,
+            width  = icon_size,
+            height = icon_size,
+        }
+    end
+
+    if not content then
+        content = TextWidget:new{
+            text    = opts.label and Text.cut(opts.label, 1):upper() or "?",
+            face    = M.letterFace(icon_size),
+            fgcolor = M.COLOR.text_primary,
+        }
+    end
+
+    return frameTile(size, content)
+end
+
 -- ---------------------------------------------------------------------------
 -- SUI Icon Glyphs (Nerd Fonts / Material Symbols codepoints)
 -- ---------------------------------------------------------------------------
@@ -1587,41 +1791,145 @@ M.FACE_ICONS   = "symbols"
 --
 -- Categories:
 --   Navigation — chevron, back, more
---   Actions    — check, uncheck, delete, edit, add, drag
---   State      — goal, stats
+--   Actions    — check, uncheck, radio_on, radio_off, delete, edit, add, drag
+--   State      — goal
+--   Book       — book_open, reset, collections, open_with, info, cover, ...
+--   File       — select, cut, copy, paste, convert, export, terminal
+--   Folder     — folder, home, shortcut, storage, import
+--   Browsing   — search, filter, sort, arrange, history, random
+--   Windows    — close, streak, bars, library, style, quick_actions
+--   Collection — collection_add, link, unlink, remove
+--   System     — power, restart, sleep, logout
+--   Status bar — wifi, bluetooth, brightness, disk, ram (battery: SUIStyle.batteryIcon)
 
 M.ICON = {
     -- Navigation
     chevron  = "\u{F105}",   -- nf-fa-angle_right
+    chevron_left = "\u{F104}", -- nf-fa-angle_left
+    chevron_down = "\u{F107}", -- nf-fa-angle_down
     back     = "\u{E5C4}",   -- arrow_back
     more     = "\u{E8D7}",   -- more_horiz / three dots (the card's "…" button)
 
     -- Actions
-    check    = "\u{E832}",   -- check_box (checked)
-    uncheck  = "\u{E82F}",   -- check_box_outline_blank
+    tick     = "\u{F00C}",   -- nf-fa-check (selected option mark)
+    check    = "\u{E831}",   -- checkbox-marked (square, ticked)
+    uncheck  = "\u{E830}",   -- checkbox-blank-outline (square, empty)
+    radio_on  = "\u{EB3D}",  -- radiobox-marked (circle, dotted)
+    radio_off = "\u{EB3C}",  -- radiobox-blank (circle, empty)
     delete   = "\u{F014}",   -- trash / delete (NerdFonts)
     edit     = "\u{F040}",   -- pencil / edit (NerdFonts)
     add      = "\u{E145}",   -- add / plus
+    add_book = "\u{EB14}",   -- add book (NerdFonts)
     drag     = "\u{E25D}",   -- drag_handle
     arrow_up   = "\u{E75C}", -- arrow up (NerdFonts)
     arrow_down = "\u{E744}", -- arrow down (NerdFonts)
     move_page  = "\u{F0EC}", -- exchange / move
+    layout     = "\u{F07E}", -- nf-fa-arrows_h (module width and position)
+    stack      = "\u{EC69}", -- view-agenda (two blocks one above the other)
+    width      = "\u{EE5F}", -- unfold-more-vertical (chevrons pointing outwards sideways)
+    percent    = "\u{EAEF}", -- percent sign
     update     = "\u{E769}", -- update / sync
     hide       = "\u{E908}", -- eye-off / hide (NerdFonts)
     show       = "\u{E907}", -- eye / show (NerdFonts)
 
     -- State / Content
     goal     = "\u{E153}",   -- flag (reading goals)
-    stats    = "\u{E24B}",   -- bar_chart
     clock    = "\u{E385}",
     page     = "\u{F40E}",
     book     = "\u{F401}",
-    calendar = "\u{F490}",
+    calendar_select = "\u{ED77}", -- calendar with date picker (NerdFonts)
     trophy   = "\u{EC3B}",
     highlights = "\u{EE6B}",
     notes    = "\u{EAEC}",
     arrow_right = "\u{F178}",
+
+    -- Book actions
+    book_open   = "\u{E28B}",  -- open book (outline)
+    reset       = "\u{EB52}",  -- circular arrow
+    collections = "\u{E257}",  -- stacked layers
+    open_with   = "\u{EACB}",  -- square with outgoing arrow
+    info        = "\u{F449}",  -- circled "i"
+    cover       = "\u{F03E}",  -- framed picture
+    description = "\u{F40E}",  -- text document
+    bookmark    = "\u{F097}",  -- bookmark (outline)
+    chart       = "\u{E829}",  -- chart-line
+    settings    = "\u{F462}",  -- settings
+    author      = "\u{E712}",  -- person (outline)
+    series      = "\u{E7BA}",  -- stacked books
+    tags        = "\u{EBF8}",  -- tag
+    plugin      = "\u{EB30}",  -- puzzle piece
+    group       = "\u{E73A}",  -- 3x3 grid of squares
+
+    -- Folder actions
+    folder      = "\u{E955}",  -- folder (outline)
+    new_folder  = "\u{E956}",  -- folder with plus
+    home        = "\u{ED9F}",  -- house outline
+    home_set    = "\u{ECF7}",  -- house with map marker
+    shortcut    = "\u{EBD1}",  -- star (outline)
+    shortcut_off = "\u{EBD0}", -- crossed star
+    storage     = "\u{EB78}",  -- memory card
+    import      = "\u{E27D}",  -- document with incoming arrow
+
+    -- File actions
+    select      = "\u{EB84}",  -- dotted selection box
+    cut         = "\u{F0C4}",  -- scissors
+    copy        = "\u{F0C5}",  -- overlapping documents
+    paste       = "\u{E891}",  -- clipboard
+    convert     = "\u{EBE0}",  -- swap arrows
+    export      = "\u{E27C}",  -- document with outgoing arrow
+    terminal    = "\u{F120}",  -- prompt
+    select_all  = "\u{EB85}",  -- full selection box
+    deselect    = "\u{EB87}",  -- crossed selection box
+    exit        = "\u{E905}",  -- door with outgoing arrow
+    list        = "\u{E978}",  -- bulleted list
+
+    -- Browsing
+    search      = "\u{F422}",  -- magnifier
+    filter      = "\u{E932}",  -- funnel (outline)
+    sort        = "\u{EBB9}",  -- sorted lines
+    arrange     = "\u{E8DA}",  -- drag handle
+    history     = "\u{E9D9}",  -- clock with arrow
+    random      = "\u{EB30}",  -- random
+
+    -- Windows
+    close       = "\u{E855}",  -- cross
+    streak      = "\u{F490}",  -- flame
+    freeze      = "\u{F2DC}",  -- snowflake
+    bars        = "\u{EDF9}",  -- page layout with footer
+    library     = "\u{F405}",  -- book
+    style       = "\u{EAD7}",  -- paint palette
+    quick_actions = "\u{EDD3}", -- lightning bolt (outline)
+    critter     = "\u{EAE8}",  -- paw
+
+    -- Collections
+    collection_add = "\u{EA33}", -- library with plus
+    link        = "\u{EA36}",  -- chain link
+    unlink      = "\u{F127}",  -- broken chain link
+    remove      = "\u{E859}",  -- crossed circle (outline)
+
+    -- System
+    power       = "\u{EB24}",  -- power symbol
+    restart     = "\u{EE07}",  -- circular arrow around a play mark
+    sleep       = "\u{EBB1}",  -- crescent with z
+    logout      = "\u{EA42}",  -- door with outgoing arrow
+
+    -- Status bar
+    wifi          = "\u{ECA8}",  -- wifi
+    wifi_off      = "\u{ECA9}",  -- crossed wifi
+    bluetooth     = "\u{E7AE}",  -- bluetooth rune
+    bluetooth_off = "\u{E7B1}",  -- crossed bluetooth rune
+    brightness    = "\u{ECA7}",  -- sun
+    disk          = "\u{E9C9}",  -- hard disk
+    ram           = "\u{EA5A}",  -- memory chip
 }
+
+-- Battery glyphs by charge in steps of ten: index 1 is 0-9 %, index 11 is
+-- 100 %. While charging, a single level-independent glyph is used.
+local BATTERY_ICONS = {
+    "\u{E782}", "\u{E779}", "\u{E77A}", "\u{E77B}", "\u{E77C}", "\u{E77D}",
+    "\u{E77E}", "\u{E77F}", "\u{E780}", "\u{E781}", "\u{E778}",
+}
+local BATTERY_CHARGING_ICON = "\u{E783}"
 
 --- Returns the icon glyph named `name`, or "" if it doesn't exist.
 --- Usage: TextWidget:new{ text = SUIStyle.icon("chevron"), face = ... }
@@ -1632,11 +1940,34 @@ function M.icon(name)
     return M.ICON[name] or ""
 end
 
+--- Selection mark glyph: a circle for a single-choice (radio) row, a square
+--- for a checkbox row; filled when `on` is truthy.
+--- @param radio boolean
+--- @param on    boolean
+--- @return string
+function M.selectionIcon(radio, on)
+    local name = radio and (on and "radio_on" or "radio_off")
+                       or  (on and "check"    or "uncheck")
+    return M.ICON[name]
+end
+
+--- Battery glyph for a charge level.
+--- @param capacity number  charge, 0-100
+--- @param charging boolean true while the battery charges
+--- @param charged  boolean true once it is full on the charger
+--- @return string
+function M.batteryIcon(capacity, charging, charged)
+    if charged then return BATTERY_ICONS[#BATTERY_ICONS] end
+    if charging then return BATTERY_CHARGING_ICON end
+    local step = math.max(1, math.min(#BATTERY_ICONS, math.floor(capacity / 10) + 1))
+    return BATTERY_ICONS[step]
+end
+
 -- ---------------------------------------------------------------------------
 -- UI Font face picker
 -- ---------------------------------------------------------------------------
 -- Allows the user to replace KOReader's built-in UI font with any font
--- installed on the system.
+-- installed on the system or bundled with the plugin.
 --
 -- Settings keys (all via SUISettings):
 --   simpleui_ui_font_name     string   — selected font family name
@@ -1647,18 +1978,21 @@ end
 --
 -- Public API:
 --   M.applyUIFont()          — restore saved font (called from main.lua init)
+--   M.restoreUIFont()        — undo applyUIFont (called on plugin teardown)
 --   M.makeFontMenuItems()    — returns sub_item_table for Style ▸ UI Font
 -- ---------------------------------------------------------------------------
 
 -- Settings keys
-local _FONT_KEY_NAME    = "simpleui_ui_font_name"
-local _FONT_KEY_ENABLED = "simpleui_ui_font_enabled"
+local _FONT_KEY_NAME    = SUIFonts.KEY_NAME
+local _FONT_KEY_ENABLED = SUIFonts.KEY_ENABLED
 local _FONT_DEFAULT     = "Noto Sans"
 
 -- Module-level lazy caches — populated once by _initFonts().
 local _font_list     = nil   -- ordered list of font family names (strings)
 local _fonts         = nil   -- map: family name → { regular=path }
 local _replaced      = nil   -- map: Font.fontmap slot → "regular"|"bold"
+local _saved_fontmap = nil   -- map: Font.fontmap slot → file it held before _applyFont()
+local _linked_bold   = {}    -- map: regular file → bold file linked in Font's variant tables
 local _by_stem       = {}    -- lowercase file stem → font file path
 local _by_family     = {}    -- family name .. "\0" .. variant → font file path
 local _variant_cache = {}    -- file .. "\0" .. variant → variant file, or false
@@ -1763,6 +2097,7 @@ end
 
 -- Builds _font_list, _fonts, _replaced and the variant index.
 local function _initFonts()
+    SUIFonts.register()
     local Font     = _reqFont()
     local FontList = _reqFontList()
     local cre      = _reqCRE()
@@ -1890,6 +2225,16 @@ local function _refreshTitleBarFaces()
     end
 end
 
+-- Makes Font:getFace() treat `bold` as the real bold of `regular`, so bold
+-- text drawn with the regular face is not emboldened a second time. Pairs
+-- KOReader or the bundled family already registered are left untouched.
+local function _linkBoldVariant(Font, regular, bold)
+    if bold == regular or Font.bold_font_variant[regular] then return end
+    Font.bold_font_variant[regular] = bold
+    Font.regular_font_variant[bold] = regular
+    _linked_bold[regular] = bold
+end
+
 -- Writes the chosen font paths into Font.fontmap.
 local function _applyFont(name)
     local Font = _reqFont()
@@ -1899,9 +2244,12 @@ local function _applyFont(name)
     if not (_fonts and _fonts[name]) then return end
     local regular = _fonts[name].regular
     local bold    = variantFile(regular, true, false) or regular
+    _saved_fontmap = _saved_fontmap or {}
     for slot, typ in pairs(_replaced) do
+        if _saved_fontmap[slot] == nil then _saved_fontmap[slot] = Font.fontmap[slot] end
         Font.fontmap[slot] = typ == "bold" and bold or regular
     end
+    _linkBoldVariant(Font, regular, bold)
     logger.dbg("simpleui/style: UI font applied →", name)
     -- Refresh TitleBar class defaults so new instances use the updated font.
     _refreshTitleBarFaces()
@@ -1909,15 +2257,52 @@ end
 
 --- Restore the saved font preference.  Called from main.lua at plugin init.
 function M.applyUIFont()
+    if not SUISettings:isTrue(_FONT_KEY_ENABLED) then return end
     _ensureFonts()
-    if SUISettings:isTrue(_FONT_KEY_ENABLED) then
-        local name = SUISettings:get(_FONT_KEY_NAME) or _FONT_DEFAULT
-        if _fonts and _fonts[name] then
-            _applyFont(name)
-        else
-            logger.warn("simpleui/style: active UI font not found on disk, disabling custom font:", name)
-            SUISettings:set(_FONT_KEY_ENABLED, false)
+    local name = SUISettings:get(_FONT_KEY_NAME) or _FONT_DEFAULT
+    if _fonts and _fonts[name] then
+        _applyFont(name)
+    elseif name == SUIFonts.FAMILY then
+        -- The bundled family ships with the plugin: keep the setting so the
+        -- next start retries instead of switching the font off for good.
+        logger.warn("simpleui/style: bundled UI font unavailable, using the default font")
+    else
+        logger.warn("simpleui/style: active UI font not found on disk, disabling custom font:", name)
+        SUISettings:set(_FONT_KEY_ENABLED, false)
+    end
+end
+
+-- Restores the Font.fontmap slots and variant links written by _applyFont(),
+-- so new widgets use the system font again.
+local function _restoreFontmap()
+    local Font = _reqFont()
+    if Font and _saved_fontmap then
+        for slot, file in pairs(_saved_fontmap) do
+            Font.fontmap[slot] = file
         end
+        for regular, bold in pairs(_linked_bold) do
+            Font.bold_font_variant[regular] = nil
+            Font.regular_font_variant[bold] = nil
+        end
+        _refreshTitleBarFaces()
+    end
+    _saved_fontmap, _linked_bold = nil, {}
+end
+
+--- Hands the UI font back to the system default and unregisters the bundled
+--- family. Called on plugin teardown.
+function M.restoreUIFont()
+    _restoreFontmap()
+    SUIFonts.unregister()
+end
+
+-- Offers a restart so the new UI font applies everywhere.
+local function askFontRestart()
+    local text = _("Restart to fully apply the UI font change.")
+    if Device:canRestart() then
+        require("features/dialogs/sui_dialogs").askRestart{ text = text }
+    else
+        require("infra/sui_core").Notify.toast(text)
     end
 end
 
@@ -1952,10 +2337,8 @@ function M.makeFontMenuItems()
         callback     = function()
             local new_val = not _isEnabled()
             SUISettings:set(_FONT_KEY_ENABLED, new_val)
-            if new_val then _applyFont(_currentName()) end
-            if UIManager then
-                UIManager:askForRestart(_("Restart to fully apply the UI font change."))
-            end
+            if new_val then _applyFont(_currentName()) else _restoreFontmap() end
+            askFontRestart()
         end,
     }
 
@@ -1993,9 +2376,7 @@ function M.makeFontMenuItems()
                     SUISettings:set(_FONT_KEY_NAME, _name)
                     SUISettings:set(_FONT_KEY_ENABLED, true)
                     _applyFont(_name)
-                    if UIManager then
-                        UIManager:askForRestart(_("Restart to fully apply the UI font change."))
-                    end
+                    askFontRestart()
                 end,
             }
         end
@@ -2041,6 +2422,12 @@ end
 function M.getTextFace(style, size, add_bold)
     local variant = add_bold and M.emphasize(style.variant) or style.variant
     return M.getStyledFace(style.family, size, variant)
+end
+
+--- Colour of a text element: the palette colour its style chose when `palette`
+--- (see ModuleChrome.palette) offers it, else `default`.
+function M.textColor(style, palette, default)
+    return style.color and palette and palette[style.color] or default
 end
 
 --- True when `family` (nil = default UI font) can draw `variant` faithfully.
