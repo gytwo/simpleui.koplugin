@@ -1446,18 +1446,19 @@ local function _applyTabs(fm_self, tb)
     fm_self._titlebar_tab_strip = strip
 
     -- 路径名现在是主 strip 的前置 tab：由 strip 自己渲染、下划线、间距。
-    _installBackController(fm_self, back_icon, up_x, function(fc, _, _, path, back_visible)
+    _installBackController(fm_self, up_x, function(fc, _, _, path, back_visible)
         local x = back_visible and strip_x_back or strip_x_flush
         strip:setSpan(x, menu_x - x)
 
-        local is_root = _isLibraryRoot(fc, path)
+        local view = { path = path, series = _seriesViewOf(fc) }
+        local is_root = _isLibraryRoot(view)
         if is_root then
             strip:setPathLabel(nil)
             local BM = _BrowseMeta()
-            strip:setActive(BM and BM.getPathMode(view.path) or "normal")
+            strip:setActive(BM and BM.getPathMode(path) or "normal")
         else
             -- 真实子目录：路径项显示并高亮，不落在任何 browse tab。
-            strip:setPathLabel(_innerViewLabel(fc, path))
+            strip:setPathLabel(_innerViewLabel(view))
             strip:setActive("__path__")
         end
 
