@@ -16,6 +16,8 @@
 
 local Blitbuffer     = require("ffi/blitbuffer")
 
+local util = require("util")
+
 local Device         = require("device")
 
 
@@ -913,6 +915,10 @@ local function controlLineBreaks(text, face, max_w)
 end
 
 local function buildWidget(inner_w, text_str, attr_str, fonts, vspan_gap, text_alpha, clr_quote, clr_attr, alignment)
+    
+    -- 防乱码：先修掉非法 UTF-8，再做测宽 / 换行控制
+    text_str = util.fixUtf8(text_str or "", "")
+    attr_str = attr_str and util.fixUtf8(attr_str, "") or attr_str
 
     local function makeTBW(text, face, fgcolor, bold)
         return UI.makeTextBox({
@@ -1511,9 +1517,5 @@ function M.getMenuItems(ctx_menu)
         },
     }, ctx_menu)
 end
-
-
-
-
 
 return M

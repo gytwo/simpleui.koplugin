@@ -401,7 +401,8 @@ function SUIWindow:new(opts)
     -- "center"  — centred vertically in the usable area (default)
     -- "top"     — flush to the top of the usable area
     -- "bottom"  — flush to the bottom of the usable area (just above navbar)
-    o._position      = opts.position or "center"
+    --o._position      = opts.position or "center"
+    o._position      =  "center"
     o._has_settings_btn = opts.has_settings_btn == true
     o._icon          = opts.icon or (o._has_settings_btn and "settings" or nil)
     o._action_btn    = opts.action_btn

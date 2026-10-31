@@ -555,7 +555,7 @@ end
 -- in night mode so each setting keeps its on-screen meaning.
 function M.paintTint(bb, x, y, w, h)
     local lighten, darken = _readTint(KEY_LIGHTEN), _readTint(KEY_DARKEN)
-    if Screen.night_mode then lighten, darken = darken, lighten end
+    -- 蒙版不参与夜间反相，不需要互换
     if lighten > 0 then bb:lightenRect(x, y, w, h, lighten / 100) end
     if darken  > 0 then bb:darkenRect(x, y, w, h, darken / 100) end
 end

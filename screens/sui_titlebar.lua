@@ -84,19 +84,20 @@ M.STYLE_TABS    = "tabs"
 
 local _VIS_DEFAULTS = {
     fm_menu       = true,
+    fm_home       = true, 
     fm_back       = true,
     fm_title      = true,
     fm_search     = true,
     fm_browse     = false,
     sub_menu      = true,
-    sub_close     = false,
+    sub_close     = true,
     sub_back      = true,
 }
 
 -- Default side/order configs for FM and injected widgets.
 local _FM_DEFAULTS = {
-    side        = { fm_menu = "right", fm_back = "left", fm_search = "left", fm_browse = "right" },
-    order_left  = { "fm_back", "fm_search" },
+    side        = { fm_menu = "right", fm_back = "left", fm_home = "left", fm_search = "left", fm_browse = "right" },
+    order_left  = { "fm_back", "fm_home", "fm_search" },
     order_right = { "fm_browse", "fm_menu" },
 }
 local _SUB_DEFAULTS = {
@@ -111,6 +112,7 @@ local _SUB_DEFAULTS = {
 
 M.ITEMS = {
     { id = "fm_menu",       label = function() return _("Menu")              end, ctx = "fm"  },
+    { id = "fm_home",       label = function() return _("Home")              end, ctx = "fm"  },
     { id = "fm_back",       label = function() return _("Back")              end, ctx = "fm"  },
     { id = "fm_search",     label = function() return _("Search")            end, ctx = "fm"  },
     { id = "fm_browse",     label = function() return _("Browse")            end, ctx = "fm"  },
@@ -850,8 +852,7 @@ local function _installBackController(fm_self, shown_x, on_state)
             end
         end
 
-        if on_state then on_state(fc_self, { path = path, series = series }, visible) end
-        if fc_self._sui_tb_focus then _syncTitleFocus(fc_self) end
+        if on_state then on_state(fc_self, is_sub, page, fc_self.path, visible) end
 
         local tb = fm_self.title_bar
         if tb then
@@ -998,6 +999,7 @@ local function _applyClassic(fm_self, tb)
     local lp = _layoutParams(tb)
     local iw, pad, gap, sw = lp.iw, lp.pad, lp.gap, lp.sw
 
+    local show_home   = M.isItemVisible("fm_home")
     local show_menu   = M.isItemVisible("fm_menu")
     local show_up     = M.isItemVisible("fm_back")
     local show_search = M.isItemVisible("fm_search")
@@ -1009,6 +1011,7 @@ local function _applyClassic(fm_self, tb)
 
     local cfg     = M.getFMConfig()
     local visible = {}
+    if show_home   then visible["fm_home"]   = true end
     if show_menu   then visible["fm_menu"]   = true end
     if show_up     then visible["fm_back"]   = true end
     if show_search then visible["fm_search"] = true end
@@ -1052,6 +1055,8 @@ local function _applyClassic(fm_self, tb)
                         widget = fm_self._titlebar_search_btn
                     elseif id == "fm_browse" then
                         widget = fm_self._titlebar_browse_btn
+                    elseif id == "fm_home" then
+                        widget = fm_self._titlebar_home_btn
                     end
                     if widget then list[#list + 1] = { btn = widget, slot = sl.slot } end
                 end
@@ -1070,6 +1075,48 @@ local function _applyClassic(fm_self, tb)
         end)
     end
 
+    -- Home button ------------------------------------------------------------
+    if show_home then
+        local ok_ib, IconButton = pcall(require, "ui/widget/iconbutton")
+        if ok_ib and IconButton then
+            local s = slot_map["fm_home"]
+            if s then
+                local btn_padding = tb.button_padding or require("device").screen:scaleBySize(11)
+                local home_btn = IconButton:new{
+                    icon        = "home",
+                    width       = iw,
+                    height      = iw,
+                    padding     = btn_padding,
+                    show_parent = tb.show_parent or fm_self,
+                    callback = function()
+                        local home = G_reader_settings:readSetting("home_dir")
+                        if home and fm_self.file_chooser then
+                            fm_self._navbar_suppress_path_change = true
+                            fm_self.file_chooser:changeToPath(home)
+                            fm_self._navbar_suppress_path_change = nil
+                            if fm_self.updateTitleBarPath then
+                                pcall(function() fm_self:updateTitleBarPath(home, true) end)
+                            end
+                        end
+                    end,
+                }
+                _resizeAndStrip(home_btn, iw)
+                home_btn.overlap_align  = nil
+                home_btn.overlap_offset = { _buttonX(s.side, s.slot, iw, pad, gap, sw), 0 }
+                table.insert(tb, home_btn)
+                fm_self._titlebar_home_btn = home_btn
+                if s.side == "left" then
+                    local up_slot_h  = slot_map["fm_back"] and slot_map["fm_back"].slot or 0
+                    local dslot_h    = s.slot > up_slot_h and s.slot - 1 or s.slot
+                    local compact_x_h = _buttonX("left", dslot_h, iw, pad, gap, sw)
+                    if (not show_up) or _isAtRoot(fm_self.file_chooser) then
+                        home_btn.overlap_offset = { compact_x_h, 0 }
+                    end
+                end
+            end
+        end
+    end
+    
     -- Search button ----------------------------------------------------------
     -- Injected directly into the TitleBar OverlapGroup.
     -- All paddings (including top) are zeroed to align with the other buttons.
@@ -1370,8 +1417,27 @@ local function _applyTabs(fm_self, tb)
         tabs      = items,
         ink_fn    = _barInk,
         on_select = function(mode)
+            if mode == "__path__" then return end
             local BM = _BrowseMeta()
-            if BM then BM.activateMode(fm_self, mode) end
+            if not BM then return end
+
+            local fc = fm_self.file_chooser
+            -- 点 Library tab 时，如果当前不在书库根，强制回 home_dir
+            if mode == "normal" and fc then
+                local home = G_reader_settings:readSetting("home_dir")
+                if home and home ~= "" and _normPath(fc.path) ~= _normPath(home) then
+                    fm_self._navbar_suppress_path_change = true
+                    fc:changeToPath(home)
+                    fm_self._navbar_suppress_path_change = nil
+                    if fm_self.updateTitleBarPath then
+                        pcall(function() fm_self:updateTitleBarPath(home) end)
+                    end
+                    BM.setSavedMode("normal")
+                    return
+                end
+            end
+
+            BM.activateMode(fm_self, mode)
         end,
     }
     strip.overlap_align = nil
@@ -1379,18 +1445,23 @@ local function _applyTabs(fm_self, tb)
     table.insert(tb, strip)
     fm_self._titlebar_tab_strip = strip
 
-    -- Library root: tabs with the current mode highlighted. Inner view: its name.
-    _installBackController(fm_self, up_x, function(_, view, back_visible)
+    -- 路径名现在是主 strip 的前置 tab：由 strip 自己渲染、下划线、间距。
+    _installBackController(fm_self, up_x, function(fc, _, _, path, back_visible)
         local x = back_visible and strip_x_back or strip_x_flush
         strip:setSpan(x, menu_x - x)
-        setMenuVisible(_isFilesystemView(view))
-        if _isLibraryRoot(view) then
+
+        local view = { path = path, series = _seriesViewOf(fc) }
+        local is_root = _isLibraryRoot(view)
+        if is_root then
+            strip:setPathLabel(nil)
             local BM = _BrowseMeta()
-            strip:setActive(BM and BM.getPathMode(view.path) or "normal")
+            strip:setActive(BM and BM.getPathMode(path) or "normal")
         else
-            strip:setLabel(_innerViewLabel(view))
+            -- 真实子目录：路径项显示并高亮，不落在任何 browse tab。
+            strip:setPathLabel(_innerViewLabel(view))
+            strip:setActive("__path__")
         end
-        -- The search button sits in its cell; hidden with a label.
+
         if search_btn then
             local cell_x = strip:getCellX(SEARCH_ID)
             search_btn.overlap_offset = {
@@ -1479,7 +1550,7 @@ function M.restore(fm_self)
 
     -- Remove the injected widgets (back, search, browse buttons and tab strip)
     -- from the TitleBar OverlapGroup.
-    for _, key in ipairs({ "_titlebar_up_btn", "_titlebar_search_btn", "_titlebar_browse_btn", "_titlebar_tab_strip" }) do
+    for _, key in ipairs({ "_titlebar_home_btn", "_titlebar_up_btn", "_titlebar_search_btn", "_titlebar_browse_btn", "_titlebar_tab_strip"}) do
         local btn = fm_self[key]
         if btn then
             -- Free the C/FFI image memory
@@ -1603,7 +1674,7 @@ function M.applyToSub(widget)
     if tabs_m then iw = tabs_m.iw end
 
     local show_menu      = tabs_m ~= nil or M.isItemVisible("sub_menu")
-    local show_close     = tabs_m == nil and M.isItemVisible("sub_close")
+    local show_close     = M.isItemVisible("sub_close")
     local show_back      = tabs_m ~= nil or M.isItemVisible("sub_back")
 
     local cfg     = M.getSubConfig()
@@ -1613,12 +1684,19 @@ function M.applyToSub(widget)
     if show_back  then visible["sub_back"]  = true end
     local slot_map = _buildSlotMap(cfg.order_left, cfg.order_right, visible)
 
-    local menu_x = tabs_m and (sw - tabs_m.margin - iw - tabs_m.tap_pad_h)
-    local back_x = tabs_m and (tabs_m.margin - tabs_m.tap_pad_h)
+    -- tabs 风格右侧：最右是 close，close 左边是 menu。
+    -- 没有 close 时 menu 占最右；没有 menu 时 close 占最右。
+    local close_x = tabs_m and (sw - tabs_m.margin - iw - tabs_m.tap_pad_h)
+    local menu_x  = tabs_m and (close_x - ((show_close and (iw + tabs_m.back_gap)) or 0))
+    local back_x  = tabs_m and (tabs_m.margin - tabs_m.tap_pad_h)
 
     -- Horizontal position of a button; nil when it has no slot.
     local function slotX(id)
-        if tabs_m then return id == "sub_back" and back_x or menu_x end
+        if tabs_m then
+            if id == "sub_back"  then return back_x end
+            if id == "sub_close" then return close_x end
+            return menu_x   -- sub_menu 及默认
+        end
         local s = slot_map[id]
         return s and _buttonX(s.side, s.slot, iw, pad, gap, sw)
     end

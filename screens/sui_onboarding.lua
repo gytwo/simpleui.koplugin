@@ -97,8 +97,7 @@ end
 function Onboarding.show(on_finish)
     require("logger").info("simpleui[diag]: Onboarding.show called")
     local st = {
-        selected_preset = SUISettings:get("simpleui_hs_active_preset") or "builtin_at_a_glance",
-        home_choice     = "books",
+        selected_preset = SUISettings:get("simpleui_hs_active_preset") or "builtin_reading_nook"
     }
 
     local show_home = needsHomeFolderSetup()
@@ -147,8 +146,6 @@ function Onboarding.show(on_finish)
         local iw = ctx.inner_w
         local rows = {}
 
-        table.insert(rows, VerticalSpan:new{ width = ctx.SZ(Screen:scaleBySize(14)) })
-
         local preset_rows_args = { align = "left" }
         for _i, row in ipairs(SUIPresets.buildListRows{
             inner_w    = iw - ctx.SZ(Screen:scaleBySize(40)),
@@ -164,12 +161,6 @@ function Onboarding.show(on_finish)
         }) do
             table.insert(preset_rows_args, row)
         end
-        table.insert(rows, FrameContainer:new{
-            bordersize    = 0, padding = 0,
-            padding_left  = ctx.SZ(Screen:scaleBySize(20)),
-            padding_right = ctx.SZ(Screen:scaleBySize(20)),
-            VerticalGroup:new(preset_rows_args),
-        })
 
         return rows
     end
