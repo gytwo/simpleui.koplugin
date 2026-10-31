@@ -24,6 +24,7 @@ local SUISettings = require("infra/sui_store")
 local Backdrop    = require("infra/sui_backdrop")
 local SUIStyle    = require("features/sui_style")
 local Accent      = require("infra/sui_accent")
+local Bluetooth   = require("screens/sui_bluetooth")
 
 local M = {}
 
@@ -43,7 +44,6 @@ end
 -- ---------------------------------------------------------------------------
 local _hw_has_battery = nil
 local _hw_has_wifi    = nil
-local _hw_has_bt      = nil
 
 local function hwHasBattery()
     if _hw_has_battery == nil then
@@ -61,57 +61,9 @@ local function hwHasWifi()
     return _hw_has_wifi
 end
 
--- Kindle exposes BT state via LIPC (com.lab126.btfd) when the Device API
--- has no Bluetooth helpers. Returns the integer BTstate, or nil if unavailable.
-local function readKindleBtState()
-    local is_kindle = false
-    pcall(function() is_kindle = Device:isKindle() == true end)
-    if not is_kindle then return nil end
-
-    local value
-    local ok_lipc, lipc = pcall(require, "liblipclua")
-    if ok_lipc and lipc then
-        local handle = lipc.init("com.github.koreader.simpleui.bluetooth")
-        if handle then
-            local ok, state = pcall(handle.get_int_property, handle, "com.lab126.btfd", "BTstate")
-            pcall(handle.close, handle)
-            if ok and type(state) == "number" then value = state end
-        end
-    end
-    if value == nil then
-        local out = io.popen("lipc-get-prop -i com.lab126.btfd BTstate 2>/dev/null", "r")
-        if out then
-            value = out:read("*n")
-            out:close()
-        end
-    end
-    return type(value) == "number" and value or nil
-end
-
-local function hwHasBt()
-    if _hw_has_bt ~= nil then return _hw_has_bt end
-    local ok, v = pcall(function() return Device:hasBluetoothToggle() end)
-    if ok and v == true then
-        _hw_has_bt = true
-        return true
-    end
-    -- Probe the platform backend when Device does not advertise BT toggle.
-    _hw_has_bt = readKindleBtState() ~= nil
-    return _hw_has_bt
-end
-
-local function isBtOn()
-    local ok, v = pcall(function() return Device:isBluetoothOn() end)
-    if ok and type(v) == "boolean" then return v end
-    if ok and v ~= nil then return not not v end
-    local state = readKindleBtState()
-    if state ~= nil then return state ~= 0 end
-    return false
-end
-
--- True when the platform can report Bluetooth state (Device API or Kindle backend).
+-- True when the platform can report Bluetooth state.
 function M.isBluetoothAvailable()
-    return hwHasBt()
+    return Bluetooth.isAvailable()
 end
 
 -- ---------------------------------------------------------------------------
@@ -208,7 +160,7 @@ function M.invalidateDimCache()
     -- a plugin teardown+re-enable cycle (or device state change) gets a fresh read.
     _hw_has_battery = nil
     _hw_has_wifi    = nil
-    _hw_has_bt      = nil
+    Bluetooth.reset()
 end
 
 -- ---------------------------------------------------------------------------
@@ -292,8 +244,10 @@ function M.getTopbarInfo()
         info.wifi = false
     end
 
-    if hwHasBt() then
-        info.bluetooth = isBtOn()
+    -- Only read when the item is shown: some backends spawn a process.
+    if (getTopbarConfigCached().side["bluetooth"] or "hidden") ~= "hidden"
+            and Bluetooth.isAvailable() then
+        info.bluetooth = Bluetooth.isOn()
         info.has_bluetooth = true
     else
         info.bluetooth = false
@@ -628,17 +582,9 @@ local function _showTopbarSettingsWindow(plugin)
         }
     end
 
-    local function titleFn(ctx)
-        local cur = ctx.current()
-        local id  = cur and cur.id or "__root__"
-        if id == "nested_menu" then return cur.params.title or "" end
-        if id == "arrange"     then return cur.params.title or _("Arrange Items") end
-        return _("Top Bar")
-    end
-
     local win = SUIWindow:new{
         name           = "sui_win_context",
-        title          = titleFn,
+        title          = SUIWindow.makeSettingsTitle(_("Top Bar")),
         screens        = SUIWindow.makeSettingsScreens(buildRoot),
         navpager_mode  = Config.isNavpagerEnabled(),
         position       = "bottom",

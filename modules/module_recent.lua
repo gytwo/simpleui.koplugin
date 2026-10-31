@@ -26,7 +26,7 @@ local recent_module = GridRenderer.makeModule{
     default_on  = false,
     is_book_mod = true,   -- suppresses empty-state when active
     max_items   = 5,
-    -- Lets the user pick 4 or 5 visible covers (see GridRenderer.makeModule's
+    -- Lets the user pick 4 to 6 visible covers (see GridRenderer.makeModule's
     -- doc comment). The prefetch requested through `needs` is well above
     -- either choice.
     cols_choice = true,

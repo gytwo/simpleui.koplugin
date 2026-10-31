@@ -12,6 +12,10 @@
 --   local chart = bar_w and Charts.bars{ values = {...}, bar_w = bar_w, gap = gap,
 --                                        avail_h = h, color = c, highlight = i }
 --
+--   local faded = Charts.fade(color)   -- same hue, less intense
+--   local lines = Charts.lines{ series = { { values = {...}, color = c }, ... }, n = 12, count = 9,
+--                               w = avail_w, avail_h = h, line_w = px, dot_r = px }
+--
 --   local size, gap, cols, gap_x = Charts.fitGrid(7, 26, avail_w, avail_h, max_size, 12)
 --   local grid = size and Charts.heatmap{ levels = {...}, size = size, gap = gap,
 --                                         gap_x = gap_x, color = c, today = {col, row} }
@@ -19,15 +23,24 @@
 --   local share = Charts.share{ values = {...}, w = avail_w, avail_h = h, bar_h = max_h, color = c }
 --   local h = Charts.shareHeight(bar_h, label_h)   -- height of a share bar with labels
 --
+--   local drums = Charts.odometer{ digits = "001234", rolling = true, w = avail_w,
+--                                  avail_h = h, max_w = bar_max, color = c, digit_color = d }
+--
 -- Dot states: "read" (filled), "frozen" (ring) and anything else (faint).
 -- Heatmap levels: 0 (no reading) to 4, or false for a cell that does not exist.
 
 local AAPaint         = require("infra/sui_aa_paint")
 local Geom            = require("ui/geometry")
+local SUIStyle        = require("features/sui_style")
 local UI              = require("infra/sui_core")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
 local Charts = {}
+
+local MIN_LINE_H    = 12    -- px; a line chart area shorter than this is not legible
+local LINE_STEPS    = 8     -- segments per interval of a smoothed line
+local LAST_DOT_BOOST = 1.5  -- radius of the last point, relative to the others
+local FADE_STRENGTH  = 0.6  -- share of `color` kept by Charts.fade, the rest being surface
 
 local MIN_DOT_SIZE = 5     -- px; smaller dots are not legible
 local GAP_RATIO    = 0.7   -- gap between dots, relative to the dot size
@@ -49,6 +62,14 @@ local MIN_CELL        = 4     -- px; smaller heatmap cells are not legible
 local CELL_GAP_RATIO  = 0.25  -- gap between heatmap cells, relative to the cell size
 local CELL_RADIUS_PCT = 0.25  -- corner radius of a heatmap cell, relative to its size
 local LEVEL_ALPHA     = { [0] = 55, 105, 150, 205, 255 }  -- 0-255 ink per heatmap level
+
+local MIN_DRUM_W     = 8     -- px; narrower drums are not legible
+local DRUM_RATIO     = 1.4   -- drum height, relative to its width
+local DRUM_GAP_RATIO = 0.12  -- gap between drums, relative to the drum width
+local DRUM_RADIUS_PCT = 0.22 -- corner radius of a drum, relative to its width
+local DRUM_DIGIT_PCT = 0.62  -- digit size, relative to the drum height
+local DRUM_PITCH_PCT = 0.8   -- distance between two digits on a turning drum, relative to its height
+local DRUM_ROLL_PCT  = 0.3   -- how far the turning drum has moved to its next digit, relative to the pitch
 
 local MIN_SEGMENT_W = 3     -- px; narrowest share segment drawn for a non-zero value
 local SEGMENT_GAP   = 2     -- space between share segments (px)
@@ -268,6 +289,140 @@ function Charts.bars(opts)
     return widget
 end
 
+-- Points (x1, y1, x2, y2, ...) of a smooth curve through (xs[i], ys[i]) that
+-- never swings past its neighbouring values (monotone cubic, Fritsch-Carlson),
+-- so a value of zero stays on the axis instead of dipping below it.
+local function smoothPoints(xs, ys)
+    local n = #xs
+    if n == 1 then return { xs[1], ys[1] } end
+    local d, m, out = {}, {}, {}
+    for i = 1, n - 1 do d[i] = (ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]) end
+    m[1], m[n] = d[1], d[n - 1]
+    for i = 2, n - 1 do
+        m[i] = d[i - 1] * d[i] <= 0 and 0 or (d[i - 1] + d[i]) / 2
+    end
+    for i = 1, n - 1 do
+        if d[i] == 0 then
+            m[i], m[i + 1] = 0, 0
+        else
+            local a, b = m[i] / d[i], m[i + 1] / d[i]
+            local q = a * a + b * b
+            if q > 9 then
+                local t = 3 / math.sqrt(q)
+                m[i], m[i + 1] = t * a * d[i], t * b * d[i]
+            end
+        end
+    end
+    for i = 1, n - 1 do
+        local hx, y0, y1 = xs[i + 1] - xs[i], ys[i], ys[i + 1]
+        for k = (i == 1) and 0 or 1, LINE_STEPS do
+            local t = k / LINE_STEPS
+            local t2, t3 = t * t, t * t * t
+            out[#out + 1] = xs[i] + t * hx
+            out[#out + 1] = (2 * t3 - 3 * t2 + 1) * y0 + (t3 - 2 * t2 + t) * hx * m[i]
+                + (-2 * t3 + 3 * t2) * y1 + (t3 - t2) * hx * m[i + 1]
+        end
+    end
+    return out
+end
+
+-- The colour of a second line beside one drawn in `color`: the same hue, less
+-- intense (`color` mixed into the surface colour).
+function Charts.fade(color)
+    return SUIStyle.shade(color, FADE_STRENGTH)
+end
+
+-- Line chart: one smooth line per entry of `opts.series`, each scaled to its
+-- own largest value (the first series is drawn first, so the last one is on
+-- top), over `opts.n` evenly spaced slots on a faint baseline. Only the first
+-- `opts.count` slots (default all) are drawn, each with a dot, the last one
+-- larger.
+-- opts: series ({ values, color } each), n, count (optional), w, avail_h (px;
+--       the widget never exceeds it), line_w, dot_r (px) and, for the axis,
+--       labels (one string per slot, "" for none), label_face, label_color.
+-- Returns nil when avail_h cannot hold a legible chart. The axis is left out
+-- when it would not fit.
+function Charts.lines(opts)
+    local n, w = opts.n, opts.w
+    local upto = math.min(opts.count or n, n)
+    local dot_r = opts.dot_r
+    local pad = math.ceil(dot_r * LAST_DOT_BOOST)   -- room for the largest dot
+    local slot_w = n > 1 and (w - 2 * pad) / (n - 1) or 0
+
+    local labels, label_h
+    if opts.labels then
+        local widest, tallest
+        labels, widest, tallest = buildTexts(opts.labels, opts.label_face, opts.label_color)
+        if widest <= slot_w then
+            label_h = tallest + LABEL_GAP
+        else
+            freeLabels(labels)
+            labels = nil
+        end
+    end
+    label_h = label_h or 0
+    local area_h = opts.avail_h - label_h
+    if area_h < MIN_LINE_H then
+        freeLabels(labels)
+        return nil
+    end
+
+    -- Geometry relative to the widget's top-left corner.
+    local base_y = area_h - BASE_H
+    local top_y, bottom_y = pad, base_y - pad
+    local xs = {}
+    for i = 1, upto do xs[i] = pad + (i - 1) * slot_w end
+    local lines = {}
+    for s, series in ipairs(opts.series) do
+        local top = 0
+        for i = 1, upto do top = math.max(top, series.values[i]) end
+        local ys = {}
+        for i = 1, upto do
+            ys[i] = top > 0 and bottom_y - (bottom_y - top_y) * series.values[i] / top or bottom_y
+        end
+        lines[s] = { pts = smoothPoints(xs, ys), ys = ys, color = series.color }
+    end
+
+    local widget = WidgetContainer:new{}
+    widget.dimen = Geom:new{ w = w, h = area_h + label_h }
+
+    function widget:getSize()
+        return self.dimen
+    end
+
+    function widget:paintTo(bb, x, y)
+        self.dimen.x, self.dimen.y = x, y
+        local x1, y1 = x + w - 1, y + area_h - 1
+        AAPaint.fillRect(bb, x, y + base_y, w, BASE_H, lines[1].color, BASE_ALPHA)
+        for _, line in ipairs(lines) do
+            local pts = line.pts
+            for i = 1, #pts - 3, 2 do
+                AAPaint.strokeCapsule(bb, x + pts[i], y + pts[i + 1], x + pts[i + 2], y + pts[i + 3],
+                    opts.line_w, line.color, x, y, x1, y1)
+            end
+            for i = 1, upto do
+                local r = i == upto and dot_r * LAST_DOT_BOOST or dot_r
+                local d = math.floor(2 * r + 0.5)
+                AAPaint.fillPill(bb, math.floor(x + xs[i] - r + 0.5), math.floor(y + line.ys[i] - r + 0.5),
+                    d, d, line.color, FULL_ALPHA)
+            end
+        end
+        for i = 1, n do
+            local label = labels and labels[i]
+            if label then
+                label:paintTo(bb, math.floor(x + pad + (i - 1) * slot_w - label:getSize().w / 2 + 0.5),
+                    y + area_h + LABEL_GAP)
+            end
+        end
+    end
+
+    function widget:free()
+        freeLabels(labels)
+    end
+
+    return widget
+end
+
 -- Heatmap: a grid of rounded cells, one column per entry of `opts.levels` (oldest
 -- first) and one row per entry of each column (top first); each cell's ink
 -- follows its level. `opts.today` = { col, row } outlines the current cell.
@@ -392,6 +547,90 @@ function Charts.share(opts)
 
     function widget:free()
         freeLabels(labels)
+    end
+
+    return widget
+end
+
+-- Odometer: a row of drums, each holding one digit of `opts.digits`. The drums
+-- are filled with `opts.color` and their digits drawn in `opts.digit_color`; the
+-- last one is only outlined, and with `opts.rolling` it is caught between its
+-- digit and the next one. Drums are as wide as `opts.w` allows, up to
+-- `opts.max_w`, and keep their proportions within `opts.avail_h`.
+-- opts: digits (string), rolling (optional), w, avail_h, max_w (px), color,
+--       digit_color (the colour that reads on `color`).
+-- Returns nil when `opts.w` or `opts.avail_h` cannot hold legible drums.
+function Charts.odometer(opts)
+    local digits, count = opts.digits, #opts.digits
+    local drum_w = math.min(opts.max_w, math.floor(opts.w / (count + (count - 1) * DRUM_GAP_RATIO)))
+    local drum_h = math.min(opts.avail_h, math.floor(drum_w * DRUM_RATIO))
+    drum_w = math.min(drum_w, math.floor(drum_h / DRUM_RATIO))
+    if drum_w < MIN_DRUM_W then return nil end
+    local gap = math.max(1, math.floor(drum_w * DRUM_GAP_RATIO))
+    local border = math.max(1, math.floor(drum_w / 12))
+    local face = SUIStyle.pxFace(SUIStyle.FACE_BOLD, drum_h * DRUM_DIGIT_PCT)
+    local pitch = math.floor(drum_h * DRUM_PITCH_PCT)
+    local roll = opts.rolling and math.floor(pitch * DRUM_ROLL_PCT) or 0
+
+    local color, digit_color = opts.color, opts.digit_color
+    local radius = math.floor(drum_w * DRUM_RADIUS_PCT)
+    local widget = WidgetContainer:new{}
+    widget.dimen = Geom:new{ w = count * drum_w + (count - 1) * gap, h = drum_h }
+    -- Digit text widgets, built when first drawn: light ones for the filled
+    -- drums, outline ones for the last drum.
+    local filled_texts, outline_texts = {}, {}
+
+    function widget:getSize()
+        return self.dimen
+    end
+
+    local function digitText(cache, digit, ink)
+        local text = cache[digit]
+        if not text then
+            text = UI.makeColoredText{ text = tostring(digit), face = face, fgcolor = ink, padding = 0 }
+            cache[digit] = text
+        end
+        return text
+    end
+
+    -- Paints `digit` centred in the drum at `view`, `shift` px below centre.
+    local function paintDigit(view, text, shift)
+        local size = text:getSize()
+        text:paintTo(view, math.floor((view:getWidth() - size.w) / 2),
+            math.floor((view:getHeight() - size.h) / 2) + shift)
+    end
+
+    function widget:paintTo(bb, x, y)
+        self.dimen.x, self.dimen.y = x, y
+        for i = 1, count do
+            local dx = x + (i - 1) * (drum_w + gap)
+            local last = i == count
+            if last then
+                if not AAPaint.strokeRoundedRect(bb, dx, y, drum_w, drum_h, radius, border, color) then
+                    bb:paintBorder(dx, y, drum_w, drum_h, border, color)
+                end
+            elseif not AAPaint.fillRoundedRect(bb, dx, y, drum_w, drum_h, radius, color, FULL_ALPHA) then
+                AAPaint.fillRect(bb, dx, y, drum_w, drum_h, color, FULL_ALPHA)
+            end
+            -- The digit is clipped to the drum by painting it into a view of its inside.
+            local view = bb:viewport(dx + border, y + border, drum_w - 2 * border, drum_h - 2 * border)
+            local digit = tonumber(digits:sub(i, i))
+            if last then
+                paintDigit(view, digitText(outline_texts, digit, color), -roll)
+                if roll > 0 then
+                    paintDigit(view, digitText(outline_texts, (digit + 1) % 10, color), pitch - roll)
+                end
+            else
+                paintDigit(view, digitText(filled_texts, digit, digit_color), 0)
+            end
+        end
+    end
+
+    function widget:free()
+        for _, cache in ipairs{ filled_texts, outline_texts } do
+            for _, text in pairs(cache) do text:free() end
+        end
+        filled_texts, outline_texts = {}, {}
     end
 
     return widget

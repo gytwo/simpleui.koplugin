@@ -1,5 +1,5 @@
 -- Compatibility checks at plugin startup.
--- Detects conflicting plugins and verifies CoverBrowser.
+-- Detects conflicting plugins and patches and verifies CoverBrowser.
 
 local _ = require("gettext")
 
@@ -221,6 +221,16 @@ local function apply_compat_check()
             })
         end)
         return true
+    end
+
+    -- User patches that clash with Simple UI: offer to disable them and stop.
+    local ok_pc, PatchCompat = pcall(require, "features/sui_patch_compat")
+    if ok_pc and PatchCompat then
+        local ok_run, shown = pcall(PatchCompat.check)
+        if ok_run and shown then return true end
+        if not ok_run then
+            logger.warn("simpleui: patch compatibility check failed:", tostring(shown))
+        end
     end
 
     schedule_coverbrowser_check()

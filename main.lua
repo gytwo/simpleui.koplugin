@@ -1541,6 +1541,15 @@ function SimpleUIPlugin:onFrontlightStateChanged()
     Topbar.scheduleRefresh(self, 0)
 end
 
+function SimpleUIPlugin:onBluetoothStateChanged(args)
+    if self._simpleui_suspended then return end
+    if not SUISettings:nilOrTrue("simpleui_topbar_enabled") then return end
+    local state
+    if type(args) == "table" and type(args.state) == "boolean" then state = args.state end
+    require("screens/sui_bluetooth").setState(state)
+    Topbar.scheduleRefresh(self, 0)
+end
+
 function SimpleUIPlugin:onCharging()
     if self._simpleui_suspended then return end
     if not SUISettings:nilOrTrue("simpleui_topbar_enabled") then return end

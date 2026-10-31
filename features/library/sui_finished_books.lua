@@ -39,9 +39,10 @@ local DEFAULT_MODE = MODE.FADE
 -- Mode
 -- ---------------------------------------------------------------------------
 
-function Finished.getMode()
+-- Memoized: the file browser gate reads it once per listed file.
+Finished.getMode = SUISettings.memoize(function()
     return Config.readChoice(MODE_KEY, MODE_ORDER, DEFAULT_MODE)
-end
+end)
 
 function Finished.setMode(mode)
     SUISettings:saveSetting(MODE_KEY, Config.resolveChoice(mode, MODE_ORDER, DEFAULT_MODE))

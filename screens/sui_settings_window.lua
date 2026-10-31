@@ -917,14 +917,8 @@ local function makeScreenTitles(st)
             return st.screen_id == "hs" and _("Layout Editor")
                 or (st.screen_name or _("Layout Editor"))
         end,
-        module_picker = function(ctx)
-            local cur = ctx.current()
-            return cur and cur.params and cur.params.title or _("Add Module")
-        end,
-        item_picker = function(ctx)
-            local cur = ctx.current()
-            return cur and cur.params and cur.params.title or _("Add Item")
-        end,
+        module_picker          = SUI.paramsTitle(_("Add Module")),
+        item_picker            = SUI.paramsTitle(_("Add Item")),
         general_settings       = _("Behaviour"),
         presets                = _("Home Screen Presets"),
         -- Dynamic titles (function receives ctx):
@@ -938,18 +932,9 @@ local function makeScreenTitles(st)
             local mod_id = st.current_module_id or ""
             return LayoutService.getModuleName(mod_id)
         end,
-        nested_menu = function(ctx)
-            local cur = ctx.current()
-            return cur and cur.params and cur.params.title or ""
-        end,
-        arrange = function(ctx)
-            local cur = ctx.current()
-            return cur and cur.params and cur.params.title or _("Arrange Items")
-        end,
-        row_page = function(ctx)
-            local cur = ctx.current()
-            return cur and cur.params and cur.params.title or ""
-        end,
+        nested_menu            = SUI.paramsTitle(""),
+        arrange                = SUI.paramsTitle(_("Arrange Items")),
+        row_page               = SUI.paramsTitle(""),
     }
 end
 

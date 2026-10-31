@@ -8,8 +8,18 @@ local Games = {}
 
 Games.MOVES = { "rock", "paper", "scissors" }
 
--- Longest quote, in bytes, that is read or asked about: the bubble holds three lines.
-Games.MAX_QUOTE_LEN = 80
+-- Longest quote that is read or asked about, in characters of what is shown (the
+-- quote, its author and the words around them): the window holds five lines.
+Games.MAX_QUOTE_LEN = 100
+Games.QUOTE_LINES   = 5
+
+-- Characters the quote and author are framed with: the marks, the dash and "Who said".
+local QUOTE_FRAME_LEN = 12
+
+-- Length of `text` in UTF-8 characters.
+local function charCount(text)
+    return select(2, text:gsub("[^\128-\191]", ""))
+end
 
 -- What each move beats.
 local BEATS = { rock = "scissors", paper = "rock", scissors = "paper" }
@@ -32,7 +42,8 @@ end
 local function readable(quotes)
     local list = {}
     for i, entry in ipairs(quotes) do
-        if #entry.q <= Games.MAX_QUOTE_LEN then list[#list + 1] = i end
+        local shown = charCount(entry.q) + (entry.a and charCount(entry.a) or 0) + QUOTE_FRAME_LEN
+        if shown <= Games.MAX_QUOTE_LEN then list[#list + 1] = i end
     end
     if #list == 0 then
         for i = 1, #quotes do list[i] = i end

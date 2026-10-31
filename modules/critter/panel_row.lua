@@ -41,6 +41,32 @@ local function openBook(touch_menu, filepath)
     end)
 end
 
+-- Opens the settings of the row in a window: the row's own and, apart, the
+-- critter's. Closes the menu `touch_menu` first.
+local function openSettings(touch_menu)
+    local SUIWindow = require("engines/sui_window")
+    local function buildRoot(ctx)
+        local ctx_menu = SUIWindow.makeCtxMenu(ctx)
+        return SUIWindow.MenuTable{
+            items      = M.getMenuItems(ctx_menu.refresh, ctx_menu),
+            inner_w    = ctx.inner_w,
+            repaint    = function() ctx.repaint() end,
+            push_stack = function(id, params)
+                if type(id) == "string" then ctx.push(id, params) else ctx.push("nested_menu", params) end
+            end,
+            on_close   = function() end,
+        }
+    end
+    local win = SUIWindow:new{
+        name           = "sui_win_context",
+        title          = SUIWindow.makeSettingsTitle(_("Tiny Critter")),
+        screens        = SUIWindow.makeSettingsScreens(buildRoot),
+        position       = "bottom",
+    }
+    touch_menu:onClose()
+    win:show()
+end
+
 -- The row for a panel `width` wide, nil when it is off. Registers its tap
 -- target in `refs.buttons` and its focus stop in `refs.focus_rows`.
 function M.build(touch_menu, refs, width)
@@ -56,6 +82,7 @@ function M.build(touch_menu, refs, width)
         stats       = stats or {},
         stats_stale = stats == nil,
         open_fn     = function(filepath) openBook(touch_menu, filepath) end,
+        on_hold     = function() openSettings(touch_menu) end,
         kbStops     = function(_id, stops)
             cell = stops[1] and stops[1].widget
         end,
@@ -72,8 +99,10 @@ function M.build(touch_menu, refs, width)
 end
 
 -- Items of the bar's menu for the row: whether it shows, where the critter
--- stands and how big it is. `refresh` redraws the menu and the open panels.
-function M.getMenuItems(refresh)
+-- stands and how big it is, then the critter's own settings. `refresh` redraws
+-- the menu and the open panels; `outer_menu` is the context of the menu the
+-- items are shown in, if any.
+function M.getMenuItems(refresh, outer_menu)
     local Critter  = require("modules/critter/module_critter")
     local ctx_menu = { pfx = PFX, _ = _, refresh = refresh }
     local items = {
@@ -89,6 +118,7 @@ function M.getMenuItems(refresh)
     }
     for _i, item in ipairs(Critter.makePlacementItems(ctx_menu)) do items[#items + 1] = item end
     items[#items + 1] = Critter.makeScaleItem(ctx_menu)
+    table.insert(items, 1, require("modules/critter/menu").makeSettingsItem(outer_menu))
     return items
 end
 

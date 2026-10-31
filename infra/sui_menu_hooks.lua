@@ -20,6 +20,7 @@
 --                                                skipped when the menu is built
 --                                                without being shown
 -- `target` is M.TARGET.READER or M.TARGET.FM.
+-- M.refresh(menu, target) runs the `prepare` steps again on a built menu.
 
 local logger = require("logger")
 
@@ -28,7 +29,7 @@ local M = {}
 M.TARGET = { READER = "reader", FM = "fm" }
 
 -- Execution order of the steps (lower runs first).
-M.ORDER = { PANEL_TAB = 10, TAB_ICONS = 20 }
+M.ORDER = { MENU_HIDE = 5, PANEL_TAB = 10, TAB_ICONS = 20, TAB_LAYOUT = 30 }
 
 local MENU_MODULES = {
     [M.TARGET.READER] = "apps/reader/modules/readermenu",
@@ -119,6 +120,11 @@ function M.register(step)
     end
     table.insert(_steps, pos, step)
     for _, target in pairs(M.TARGET) do hook(target) end
+end
+
+--- Runs the `prepare` steps again on a menu whose tab table is already built.
+function M.refresh(menu, target)
+    runSteps("prepare", menu, target)
 end
 
 --- Restores the original menu methods and drops every registered step.

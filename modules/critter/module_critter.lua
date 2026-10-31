@@ -569,6 +569,15 @@ function M.build(w, ctx)
         cell.ges_events = {
             TapCritter = { GestureRange:new{ ges = "tap", range = function() return cell.dimen end } },
         }
+        if ctx.on_hold then
+            cell.ges_events.HoldCritter = {
+                GestureRange:new{ ges = "hold", range = function() return cell.dimen end },
+            }
+            function cell:onHoldCritter()
+                ctx.on_hold()
+                return true
+            end
+        end
     end
 
     -- The row for `current`: the group of decorations, critter and bubble, placed
@@ -769,10 +778,7 @@ M.makeScaleItem      = makeScaleItem
 function M.getMenuItems(ctx_menu)
     local pfx, refresh, _lc = ctx_menu.pfx, ctx_menu.refresh, ctx_menu._
     local content = makePlacementItems(ctx_menu)
-    table.insert(content, 1, {
-        text    = _lc("The critter, its decorations, its bubble and what it says are set in Settings > Tiny Critter."),
-        enabled = false,
-    })
+    table.insert(content, 1, require("modules/critter/menu").makeSettingsItem(ctx_menu))
     return Config.buildModuleMenu({
         content = content,
         appearance = {

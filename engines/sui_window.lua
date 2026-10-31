@@ -2381,14 +2381,22 @@ function SUIWindow.ListRow(opts)
         end
 
         if opts.checked ~= nil then
-            -- Both states take the accent colour.
+            -- Both states take the accent colour, or the inactive grey on a
+            -- disabled row.
+            local mark = {
+                text      = SUIStyle.selectionIcon(opts.radio == true, opts.checked),
+                face      = _faceIcon(),
+                alignment = "right",
+            }
+            if is_disabled then
+                mark.fgcolor = _clrInactive()
+                mark = UI.makeColoredText(mark)
+            else
+                mark = UI.makeAccentText(mark, _clrPrimary())
+            end
             table.insert(right_hg, RightContainer:new{
                 dimen = Geom:new{ w = _CHEVRON_W(), h = left_h },
-                UI.makeAccentText({
-                    text      = SUIStyle.selectionIcon(opts.radio == true, opts.checked),
-                    face      = _faceIcon(),
-                    alignment = "right",
-                }, _clrPrimary()),
+                mark,
             })
         elseif opts.right_icon and opts.right_icon ~= "" then
             table.insert(right_hg, RightContainer:new{
@@ -4463,6 +4471,34 @@ function SUIWindow.showArrange(opts)
     }
     win:show()
     return win
+end
+
+--- Title function of a screen titled by its `params.title`, `default` when it
+--- has none.
+--- @param default string
+--- @return function(ctx)→string
+function SUIWindow.paramsTitle(default)
+    return function(ctx)
+        local cur = ctx.current()
+        return cur and cur.params and cur.params.title or default
+    end
+end
+
+--- Title function of a settings window: the title of the sub-menu, arrange or
+--- item picker on top, `root_title` on the entry screen.
+--- @param root_title string
+--- @return function(ctx)→string
+function SUIWindow.makeSettingsTitle(root_title)
+    local by_screen = {
+        nested_menu = SUIWindow.paramsTitle(""),
+        arrange     = SUIWindow.paramsTitle(_("Arrange Items")),
+        item_picker = SUIWindow.paramsTitle(_("Add Item")),
+    }
+    return function(ctx)
+        local cur   = ctx.current()
+        local title = by_screen[cur and cur.id]
+        return title and title(ctx) or root_title
+    end
 end
 
 -- ===========================================================================

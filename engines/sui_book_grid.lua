@@ -1,6 +1,6 @@
 -- sui_book_grid.lua — Simple UI
 -- Shared factory for "cover grid with progress" modules (1 row by
--- default, up to 3 rows x 4-5 columns when spec.grid = true).
+-- default, up to 3 rows x 4-6 columns when spec.grid = true).
 --
 -- Two API layers:
 --   1. GridRenderer.build/getHeight/updateCovers/updateStats — low-level
@@ -333,14 +333,14 @@ local _BG_CORNER_BADGE_BASE_BOOST = 1.2
 
 -- ---------------------------------------------------------------------------
 -- Grid rows/cols — opt-in via spec.grid (see makeModule below). Rows: 1-3.
--- Cols: 4-5. Defaults (1 row, spec.max_items or 5 cols) reproduce the
+-- Cols: 4-6. Defaults (1 row, spec.max_items or 5 cols) reproduce the
 -- pre-grid single-row layout exactly, so consumers that don't set
 -- spec.grid never see a behaviour change.
 -- ---------------------------------------------------------------------------
 GridRenderer.GRID_ROWS_MIN = 1
 GridRenderer.GRID_ROWS_MAX = 3
 GridRenderer.GRID_COLS_MIN = 4
-GridRenderer.GRID_COLS_MAX = 5
+GridRenderer.GRID_COLS_MAX = 6
 
 -- Extra height reserved below the cover for the active progress bar/label,
 -- counting only what's actually drawn. draw_progress/draw_text are
@@ -614,7 +614,7 @@ end
 --                         multi-row grid — see getGridRows/Cols. When
 --                         grid_rows/grid_cols are passed, the effective
 --                         page size is grid_rows * grid_cols, not max_items.
---   grid_cols   number?  4-5 (default max_items or 5).
+--   grid_cols   number?  4-6 (default max_items or 5).
 -- ---------------------------------------------------------------------------
 
 -- ---------------------------------------------------------------------------
@@ -1685,12 +1685,12 @@ end
 --   enabled_key   string?  (default id.."_enabled")
 --   isEnabled     function? (pfx) -> bool — replaces enabled_key/default_on
 --   grid          bool?    (default false) — when true, exposes "Rows"
---       (1-3) and "Columns" (4-5) in the menu, read/saved via
+--       (1-3) and "Columns" (4-6) in the menu, read/saved via
 --       GridRenderer.getGridRows/getGridCols (settings pfx..id.."_grid_rows"/
 --       "_grid_cols"). When false, the module stays a single row with
 --       max_items columns.
 --   cols_choice   bool?    (default false) — lightweight sibling of
---       spec.grid: exposes a single "Number of Books" choice (4 or 5) in
+--       spec.grid: exposes a single "Number of Books" choice (4 to 6) in
 --       the menu, backed by the same GridRenderer.getGridCols/setGridCols
 --       storage (settings pfx..id.."_grid_cols"), but never reads/writes
 --       grid_rows — the module stays a single row, only the column count
@@ -1757,7 +1757,7 @@ function GridRenderer.makeModule(spec)
     -- user can change them at runtime via the "Rows"/"Columns" menu below.
     --
     -- spec.cols_choice is the lightweight sibling of spec.grid: it reuses
-    -- the same GRID_COLS_MIN/MAX (4-5) + getGridCols/setGridCols storage,
+    -- the same GRID_COLS_MIN/MAX (4-6) + getGridCols/setGridCols storage,
     -- but never touches grid_rows, so build()/getHeight() fall back to
     -- their own "grid_rows or 1" default — the module stays a single row,
     -- only the column count is user-editable. Use this instead of
@@ -1887,7 +1887,7 @@ function GridRenderer.makeModule(spec)
             -- Lightweight sibling of the "Grid size" double-stepper below:
             -- same single-value spin dialog
             -- (Config.makeStepperItem) for a consistent widget/feel across
-            -- the whole "Proportions" submenu, but only Columns (4-5) — no Rows —
+            -- the whole "Proportions" submenu, but only Columns (4-6) — no Rows —
             -- reusing the same GRID_COLS_MIN/MAX-backed storage. See
             -- _gridDims' doc comment above for why this doesn't also
             -- expose Rows.

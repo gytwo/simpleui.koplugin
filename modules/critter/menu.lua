@@ -173,11 +173,11 @@ local function makeReactionsItem(refresh)
     }
 end
 
--- Items of the menu. `rebuild` redraws the Home Screen; `ctx_menu`, when there
--- is one, also redraws the window the menu is shown in.
+-- Items of the menu. `rebuild`, when given, redraws the Home Screen; `ctx_menu`,
+-- when there is one, also redraws the window the menu is shown in.
 function M.getItems(ctx_menu, rebuild)
     local function refresh()
-        rebuild()
+        if rebuild then rebuild() end
         if ctx_menu and ctx_menu.refresh then ctx_menu.refresh() end
     end
     -- Picks up the decorations the user added since the last time.
@@ -195,6 +195,14 @@ function M.getItems(ctx_menu, rebuild)
         makeSourceItem(refresh),
         makeCategoriesItem(refresh),
         makeReactionsItem(refresh),
+    }
+end
+
+-- Entry that opens the menu above from the menu of a module or a panel.
+function M.makeSettingsItem(ctx_menu)
+    return {
+        text                = _("Tiny Critter Settings"),
+        sub_item_table_func = function() return M.getItems(ctx_menu) end,
     }
 end
 

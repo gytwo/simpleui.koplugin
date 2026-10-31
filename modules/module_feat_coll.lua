@@ -122,7 +122,7 @@ local function makeInstance(inst_id)
         -- intent expressed directly now (see GridRenderer.getProgressStyle).
         progress_style = { default = "none" },
 
-        -- Opt-in grid (up to 3 rows x 4-5 columns, configurable in "Rows"/
+        -- Opt-in grid (up to 3 rows x 4-6 columns, configurable in "Rows"/
         -- "Columns" in the module's menu). Default 1x5 replicates the previous
         -- behaviour byte-for-byte — it only changes when the user raises "Rows".
         grid          = true,

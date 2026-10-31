@@ -368,7 +368,7 @@ local source = Sources.bind("tbr")
 -- reset) — merged directly onto M below. `paged = true` removes the old
 -- 5-book cap: with more than max_items (5) in the list, the row paginates via
 -- swipe instead of cutting off the rest, just like Featured Collection. Grid is
--- opt-in (up to 3 rows x 4-5 columns, "Rows"/"Columns" in the module's menu) —
+-- opt-in (up to 3 rows x 4-6 columns, "Rows"/"Columns" in the module's menu) —
 -- default 1x5 replicates the previous behaviour byte-for-byte.
 -- ---------------------------------------------------------------------------
 local tbr_module = GridRenderer.makeModule{

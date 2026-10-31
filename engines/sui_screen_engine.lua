@@ -2049,15 +2049,6 @@ function ScreenWidget:_openModuleSettingsFor(mod)
             })
         end
 
-        local function titleFn(ctx)
-            local cur = ctx.current()
-            local id  = cur and cur.id or "__root__"
-            if id == "nested_menu"  then return cur.params.title or "" end
-            if id == "arrange"      then return cur.params.title or _("Arrange Items") end
-            if id == "item_picker"  then return cur.params and cur.params.title or _("Add Item") end
-            return mod.name or mod.id
-        end
-
         -- The layout sheet only applies to a module placed on a page.
         local Layout = require("infra/sui_layout")
         local placed = Layout.findPage(Layout.load(self._pfx, self._layout_key), mod.id) ~= nil
@@ -2065,7 +2056,7 @@ function ScreenWidget:_openModuleSettingsFor(mod)
         local win
         win = SUIWindow:new{
             name           = "sui_win_context",
-            title          = titleFn,
+            title          = SUIWindow.makeSettingsTitle(mod.name or mod.id),
             screens        = SUIWindow.makeSettingsScreens(buildRoot),
             navpager_mode  = Config.isNavpagerEnabled(),
             position       = "bottom",

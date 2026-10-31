@@ -785,17 +785,9 @@ local function _showNavbarSettingsWindow(plugin)
         }
     end
 
-    local function titleFn(ctx)
-        local cur = ctx.current()
-        local id  = cur and cur.id or "__root__"
-        if id == "nested_menu" then return cur.params.title or "" end
-        if id == "arrange"     then return cur.params.title or _("Arrange Items") end
-        return _("Navigation Bar")
-    end
-
     local win = SUIWindow:new{
         name           = "sui_win_context",
-        title          = titleFn,
+        title          = SUIWindow.makeSettingsTitle(_("Navigation Bar")),
         screens        = SUIWindow.makeSettingsScreens(buildRoot),
         navpager_mode  = Config.isNavpagerEnabled(),
         position       = "bottom",

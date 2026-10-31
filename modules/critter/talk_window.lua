@@ -14,6 +14,7 @@
 --
 --   TalkWindow.open{
 --       opener       = "Line of the critter", -- nil leaves the module's bubble as it is
+--       opener_lines = 3,                     -- most lines the opener takes, optional
 --       options      = { { text = "...", on_pick = function() end }, ... },
 --       other        = { text = "...", on_pick = function() end },  -- last row, optional
 --       anchor       = Geom,                  -- rectangle of the module's bubble
@@ -145,7 +146,7 @@ local function layout(opts)
     -- Bubble: the opening line, as the module's bubble shows its text. Without
     -- one the module's bubble stays and the window does not draw its own.
     l.opener    = opts.opener and textBox(opts.opener, faces.message, faces.message_bold, text_w,
-                                          COLOR.text_primary, OPENER_LINES)
+                                          COLOR.text_primary, opts.opener_lines or OPENER_LINES)
     l.content_h = l.opener and l.opener:getSize().h or 0
     l.bubble_y  = opts.anchor.y
     l.bubble_h  = l.opener and fit(math.max(opts.anchor.h, l.content_h + 2 * inset)) or opts.anchor.h

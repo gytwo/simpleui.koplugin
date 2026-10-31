@@ -19,7 +19,7 @@ local new_books_module = GridRenderer.makeModule{
     label       = Sources.label("new_books"),
     default_on  = false,  -- opt-in; users enable via Arrange Modules
     max_items   = 5,
-    -- Lets the user pick 4 or 5 visible covers (see GridRenderer.makeModule's
+    -- Lets the user pick 4 to 6 visible covers (see GridRenderer.makeModule's
     -- doc comment). The source provides more candidates than either choice.
     cols_choice = true,
 

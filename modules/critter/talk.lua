@@ -155,7 +155,11 @@ local function quizRound(opts)
             end,
         }
     end
-    TalkWindow.open(windowOpts(opts, { opener = GameLines.quizPrompt(quiz.quote), options = options }))
+    TalkWindow.open(windowOpts(opts, {
+        opener       = GameLines.quizPrompt(quiz.quote),
+        opener_lines = Games.QUOTE_LINES,
+        options      = options,
+    }))
 end
 
 -- The choice of games.
@@ -178,8 +182,9 @@ end
 local function readQuote(opts, skip)
     local entry, index = Games.pickQuote(quotes(opts), math.random, skip)
     TalkWindow.open(windowOpts(opts, {
-        opener  = GameLines.quoteText(entry),
-        options = {
+        opener       = GameLines.quoteText(entry),
+        opener_lines = Games.QUOTE_LINES,
+        options      = {
             { text = GameLines.anotherOne(), on_pick = function() readQuote(opts, index) end },
             { text = GameLines.thanks(), on_pick = function()
                 opts.on_reply(GameLines.comment(currentTier(), math.random))
