@@ -110,7 +110,7 @@ local rebuilding
 -- book is open.
 local function isDesktop()
     local reader = package.loaded["apps/reader/readerui"]
-    if reader and reader.instance then return false end
+    if reader and reader.instance then return true end
     local file_manager = package.loaded["apps/filemanager/filemanager"]
     return file_manager ~= nil and file_manager.instance ~= nil
 end
