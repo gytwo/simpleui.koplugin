@@ -185,7 +185,8 @@ local function toItem(spec)
 
     return {
         text          = label,
-        sui_icon      = DialogIcons.forText(label),
+        sui_icon          = spec.sui_icon or DialogIcons.forText(label),
+        sui_icon_explicit = spec.sui_icon ~= nil, 
         enabled       = enabled,
         checked       = checked,
         choice        = choice,
@@ -282,10 +283,22 @@ local function pruneIcons(rows)
     end
 end
 
+-- True when at least one item of the row carries an icon the caller asked
+-- for (spec.sui_icon), as opposed to one the interceptor mapped from the
+-- button text (DialogIcons). Only explicit icons justify reflowing a wide
+-- row two per line; auto-mapped ones would otherwise reflow rows the caller
+-- laid out as-is (e.g. a row of three plain action buttons).
+local function hasExplicitIcon(items)
+    for _i, item in ipairs(items) do
+        if item.sui_icon_explicit then return true end
+    end
+    return false
+end
+
 -- Rows of three or more actions: too narrow as cells, so their items are laid
 -- out two per row.
 local function isWideActionRow(items)
-    return #items >= 3 and hasIcon(items)
+    return #items >= 3 and hasExplicitIcon(items)
 end
 
 -- Replaces each gathered group in `sections` by its segment rows, ordered by
