@@ -491,6 +491,37 @@ local function sheetContent(proxy, widget)
     return { title = title, message = message, icon = widget.sui_icon, sections = sections }
 end
 
+-- ===========================================================================
+-- Host-driven rebuild — the dialog rebuilt itself in place
+-- ===========================================================================
+--
+-- A native dialog can rebuild its own contents from a button callback
+-- (ButtonDialog:reinit(), used by callers such as book_sync to refresh the
+-- list after a checkbox toggle, a folder change or a search). When a sheet
+-- stands in for that dialog, the dialog is not on the UI stack: its reinit()
+-- rebuilds a widget nobody sees, and the sheet keeps showing the old content
+-- — the action looks like it did nothing.
+--
+-- Wrapping ButtonDialog.reinit so that, after the native rebuild, the sheet
+-- that stands in for the dialog is refreshed from the dialog's new content,
+-- restores the expected behaviour with no change to the caller.
+local _button_dialog_reinit = ButtonDialog.reinit
+ButtonDialog.reinit = function(self, ...)
+    _button_dialog_reinit(self, ...)
+    local proxy = proxies[self]
+    if not (proxy and proxy.window) then return end
+    -- The rebuilt dialog may have lost its plain buttons (an edge case:
+    -- the dialog was eligible when first shown); leave the sheet as-is then.
+    if not hasPlainButtons(self.buttons) then return end
+    local ok, err = pcall(function()
+        proxy.window:update(sheetContent(proxy, self))
+    end)
+    if not ok then
+        logger.warn("simpleui/native_sheets: refresh after reinit failed:",
+            tostring(err))
+    end
+end
+
 local function present(widget)
     local proxy = { widget = widget, choices = active_choices }
     proxies[widget] = proxy
