@@ -3010,6 +3010,17 @@ function M.patchMenuForNavpager(plugin)
                 menu_self.page_info.dimen)
         end
 
+        -- Only the file chooser and the widgets that carry the bar get the page
+        -- subtitle and drive the bar arrows. Menus owned by anything else keep
+        -- their own title bar and must not trigger a bar refresh that overlaps
+        -- their own full-screen refresh.
+        local live_plugin = _live_plugin
+        local live_fm = live_plugin and live_plugin.ui
+        if not (menu_self._navbar_injected
+                or (live_fm and live_fm.file_chooser == menu_self)) then
+            return
+        end
+
         if not _subtitleEnabled() then return end
 
         -- Read page state synchronously, exactly as the native bar does:
@@ -3762,6 +3773,14 @@ function M.patchFontGetFace(plugin)
         local face = orig_getFace(self, font, sz, faceindex)
         if face and face.orig_size ~= requested then
             face.orig_size = requested
+        end
+        -- Cached bold clones keep their own orig_size, and sizes that scale to
+        -- the same pixel size share one clone: keep it in step with the face.
+        if face and face.hash then
+            for _i, suffix in ipairs({ "synthbold", "realbold" }) do
+                local clone = self.faces[face.hash .. suffix]
+                if clone then clone.orig_size = face.orig_size end
+            end
         end
         return face
     end
