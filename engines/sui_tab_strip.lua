@@ -115,6 +115,7 @@ local TabStrip = WidgetContainer:extend{
     _first        = 1,
     _view_key     = nil,
     _stops        = nil,
+    path_label = nil,
 }
 
 -- Tap container shared with the other SimpleUI tab/cell renderers.
@@ -169,15 +170,24 @@ function TabStrip:_buildTextCell(e, lead_pad, cell_w)
         underline.overlap_offset = { lead_pad, self.height - underline_h }
         cell[#cell + 1] = underline
     end
-    return _tapContainer(cell, cell_w, self.height, e.tab.id, self.on_select)
+    local on_tap = e.tab._no_tap and nil or self.on_select
+    return _tapContainer(cell, cell_w, self.height, e.tab.id, on_tap)
 end
 
 function TabStrip:_buildUnderlineTabs()
     local nominal_pad = Screen:scaleBySize(14)
     local tabs, lead, trail, lead_w, tabs_w = self:_openWindow(self.height, self.width, true)
 
+    -- 组装渲染源：路径项（若有）在最前，然后是普通 tabs。
+    -- 路径项是一个普通 text cell，id 固定 "__path__"，可被 setActive 高亮。
+    local source = {}
+    if self.path_label and self.path_label ~= "" then
+        source[#source + 1] = { id = "__path__", label = self.path_label, _no_tap = true}
+    end
+    for _i, tab in ipairs(self.tabs) do source[#source + 1] = tab end
+
     local text_count, spacer_total = 0, 0
-    for _i, tab in ipairs(tabs) do
+    for _i, tab in ipairs(source) do
         if tab.spacer_w then
             spacer_total = spacer_total + tab.spacer_w
         else
@@ -187,7 +197,7 @@ function TabStrip:_buildUnderlineTabs()
     local max_text_w = math.floor((tabs_w - spacer_total) / math.max(1, text_count))
 
     local entries, content_total = {}, spacer_total
-    for _i, tab in ipairs(tabs) do
+    for _i, tab in ipairs(source) do
         if tab.spacer_w then
             entries[#entries + 1] = { tab = tab, w = tab.spacer_w }
         else
@@ -457,12 +467,14 @@ function TabStrip:getCellX(id)
     return self._cell_x[id]
 end
 
--- Rebuilds the tabs or label on display when the colours they are painted in
--- have changed. Returns true when the content changed.
-function TabStrip:refresh()
-    if self._label then return self:setLabel(self._label) end
-    if #self.tabs == 0 then return false end
-    return self:_renderTabs()
+-- 设置/清除前置路径项。text 为 nil 或 "" 时移除。
+-- 只存字段并让下次 setActive 重建，不直接 render。
+function TabStrip:setPathLabel(text)
+    text = text or nil
+    if self.path_label == text then return false end
+    self.path_label = text
+    self._view_key  = nil          -- 强制下次 setActive/setLabel 重建
+    return true
 end
 
 function TabStrip:setLabel(text)

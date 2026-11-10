@@ -376,12 +376,12 @@ function M.resizePaginationButtons(widget, icon_size)
     end)
     -- Apply any user-defined icon overrides for the pagination chevrons.
     -- This is called at every layout/rotation so overrides survive rebuilds.
-    pcall(function()
-        local ok_ss, style = pcall(_SUIStyle)
-        if ok_ss and style and style.applyPaginationIcons then
-            style.applyPaginationIcons(widget)
-        end
-    end)
+    --pcall(function()
+    --    local ok_ss, style = pcall(_SUIStyle)
+    --    if ok_ss and style and style.applyPaginationIcons then
+    --        style.applyPaginationIcons(widget)
+     --   end
+    --end)
 end
 
 -- ---------------------------------------------------------------------------

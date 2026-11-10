@@ -110,7 +110,7 @@ local rebuilding
 -- book is open.
 local function isDesktop()
     local reader = package.loaded["apps/reader/readerui"]
-    if reader and reader.instance then return false end
+    if reader and reader.instance then return true end
     local file_manager = package.loaded["apps/filemanager/filemanager"]
     return file_manager ~= nil and file_manager.instance ~= nil
 end
@@ -185,7 +185,8 @@ local function toItem(spec)
 
     return {
         text          = label,
-        sui_icon      = DialogIcons.forText(label),
+        sui_icon          = spec.sui_icon or DialogIcons.forText(label),
+        sui_icon_explicit = spec.sui_icon ~= nil, 
         enabled       = enabled,
         checked       = checked,
         choice        = choice,
@@ -282,10 +283,22 @@ local function pruneIcons(rows)
     end
 end
 
+-- True when at least one item of the row carries an icon the caller asked
+-- for (spec.sui_icon), as opposed to one the interceptor mapped from the
+-- button text (DialogIcons). Only explicit icons justify reflowing a wide
+-- row two per line; auto-mapped ones would otherwise reflow rows the caller
+-- laid out as-is (e.g. a row of three plain action buttons).
+local function hasExplicitIcon(items)
+    for _i, item in ipairs(items) do
+        if item.sui_icon_explicit then return true end
+    end
+    return false
+end
+
 -- Rows of three or more actions: too narrow as cells, so their items are laid
 -- out two per row.
 local function isWideActionRow(items)
-    return #items >= 3 and hasIcon(items)
+    return #items >= 3 and hasExplicitIcon(items)
 end
 
 -- Replaces each gathered group in `sections` by its segment rows, ordered by
@@ -489,6 +502,37 @@ local function sheetContent(proxy, widget)
     local sections = buildSections(buttons)
     holdOpen(proxy, sections)
     return { title = title, message = message, icon = widget.sui_icon, sections = sections }
+end
+
+-- ===========================================================================
+-- Host-driven rebuild — the dialog rebuilt itself in place
+-- ===========================================================================
+--
+-- A native dialog can rebuild its own contents from a button callback
+-- (ButtonDialog:reinit(), used by callers such as book_sync to refresh the
+-- list after a checkbox toggle, a folder change or a search). When a sheet
+-- stands in for that dialog, the dialog is not on the UI stack: its reinit()
+-- rebuilds a widget nobody sees, and the sheet keeps showing the old content
+-- — the action looks like it did nothing.
+--
+-- Wrapping ButtonDialog.reinit so that, after the native rebuild, the sheet
+-- that stands in for the dialog is refreshed from the dialog's new content,
+-- restores the expected behaviour with no change to the caller.
+local _button_dialog_reinit = ButtonDialog.reinit
+ButtonDialog.reinit = function(self, ...)
+    _button_dialog_reinit(self, ...)
+    local proxy = proxies[self]
+    if not (proxy and proxy.window) then return end
+    -- The rebuilt dialog may have lost its plain buttons (an edge case:
+    -- the dialog was eligible when first shown); leave the sheet as-is then.
+    if not hasPlainButtons(self.buttons) then return end
+    local ok, err = pcall(function()
+        proxy.window:update(sheetContent(proxy, self))
+    end)
+    if not ok then
+        logger.warn("simpleui/native_sheets: refresh after reinit failed:",
+            tostring(err))
+    end
 end
 
 local function present(widget)
